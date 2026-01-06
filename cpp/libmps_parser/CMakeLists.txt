@@ -67,7 +67,8 @@ if(BUILD_TESTS)
   include(cmake/thirdparty/get_gtest.cmake)
 endif()
 
-add_library(mps_parser SHARED
+# Source files for mps_parser
+set(MPS_PARSER_SOURCES
   src/data_model_view.cpp
   src/mps_data_model.cpp
   src/mps_parser.cpp
@@ -76,6 +77,12 @@ add_library(mps_parser SHARED
   src/writer.cpp
   src/utilities/cython_mps_parser.cpp
 )
+
+# Shared library for standalone use
+add_library(mps_parser SHARED ${MPS_PARSER_SOURCES})
+
+# Static library for linking into libcuopt
+add_library(mps_parser_static STATIC ${MPS_PARSER_SOURCES})
 
 set_target_properties(mps_parser
   PROPERTIES BUILD_RPATH "\$ORIGIN"
@@ -88,7 +95,18 @@ set_target_properties(mps_parser
   CXX_SCAN_FOR_MODULES OFF
 )
 
+set_target_properties(mps_parser_static
+  PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+  POSITION_INDEPENDENT_CODE ON
+)
+
 target_compile_options(mps_parser
+  PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${MPS_PARSER_CXX_FLAGS}>"
+)
+
+target_compile_options(mps_parser_static
   PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${MPS_PARSER_CXX_FLAGS}>"
 )
 
@@ -105,10 +123,20 @@ if(WRITE_FATBIN)
 endif()
 
 add_library(cuopt::mps_parser ALIAS mps_parser)
+add_library(cuopt::mps_parser_static ALIAS mps_parser_static)
 
 # ##################################################################################################
 # - include paths ---------------------------------------------------------------------------------
 target_include_directories(mps_parser
+  PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  PUBLIC
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+  "$<INSTALL_INTERFACE:include>"
+)
+
+target_include_directories(mps_parser_static
   PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty"
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
