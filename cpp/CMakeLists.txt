@@ -753,8 +753,8 @@ endif()
 
 # ##################################################################################################
 # - Pluggable Serializers --------------------------------------------------------------------------
-# Build optional serializer plugins (e.g., msgpack)
-add_subdirectory(src/linear_programming/utilities/serializers)
+# Removed: msgpack serializer plugin no longer needed with gRPC
+# add_subdirectory(src/linear_programming/utilities/serializers)
 
 # ##################################################################################################
 # - CPack has to be the last item in the cmake file-------------------------------------------------
