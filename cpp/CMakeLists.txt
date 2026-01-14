@@ -228,30 +228,41 @@ create_logger_macros(CUOPT "cuopt::default_logger()" include/cuopt)
 
 find_package(CUDSS REQUIRED)
 
-# Protocol Buffers for remote solve serialization
-find_package(Protobuf REQUIRED)
-include_directories(${Protobuf_INCLUDE_DIRS})
-include_directories(${CMAKE_CURRENT_BINARY_DIR})
-
-# gRPC for remote solve service (optional, for gRPC-based implementation)
+# gRPC for remote solve service (optional, brings in Protobuf as dependency)
 find_package(gRPC CONFIG)
 if(gRPC_FOUND)
   message(STATUS "Found gRPC: ${gRPC_VERSION}")
   set(CUOPT_ENABLE_GRPC ON)
   add_compile_definitions(CUOPT_ENABLE_GRPC)
+  # gRPC brings in Protobuf, no need to find it separately
 else()
   message(STATUS "gRPC not found, gRPC-based remote solve will be disabled")
   set(CUOPT_ENABLE_GRPC OFF)
+  # If no gRPC, find Protobuf separately for legacy remote solve
+  find_package(Protobuf REQUIRED)
 endif()
+
+include_directories(${Protobuf_INCLUDE_DIRS})
+include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
 # Generate C++ code from .proto file
 set(PROTO_FILE "${CMAKE_CURRENT_SOURCE_DIR}/src/linear_programming/utilities/cuopt_remote.proto")
 set(PROTO_SRCS "${CMAKE_CURRENT_BINARY_DIR}/cuopt_remote.pb.cc")
 set(PROTO_HDRS "${CMAKE_CURRENT_BINARY_DIR}/cuopt_remote.pb.h")
 
+# Find protoc compiler (provided by either gRPC or standalone Protobuf)
+if(TARGET protobuf::protoc)
+  get_target_property(_PROTOBUF_PROTOC protobuf::protoc IMPORTED_LOCATION_RELEASE)
+  if(NOT _PROTOBUF_PROTOC)
+    get_target_property(_PROTOBUF_PROTOC protobuf::protoc IMPORTED_LOCATION)
+  endif()
+else()
+  set(_PROTOBUF_PROTOC ${Protobuf_PROTOC_EXECUTABLE})
+endif()
+
 add_custom_command(
   OUTPUT "${PROTO_SRCS}" "${PROTO_HDRS}"
-  COMMAND ${Protobuf_PROTOC_EXECUTABLE}
+  COMMAND ${_PROTOBUF_PROTOC}
   ARGS --cpp_out ${CMAKE_CURRENT_BINARY_DIR}
        --proto_path ${CMAKE_CURRENT_SOURCE_DIR}/src/linear_programming/utilities
        ${PROTO_FILE}
@@ -275,7 +286,7 @@ if(CUOPT_ENABLE_GRPC)
 
   add_custom_command(
     OUTPUT "${GRPC_PROTO_SRCS}" "${GRPC_PROTO_HDRS}" "${GRPC_SERVICE_SRCS}" "${GRPC_SERVICE_HDRS}"
-    COMMAND ${Protobuf_PROTOC_EXECUTABLE}
+    COMMAND ${_PROTOBUF_PROTOC}
     ARGS --cpp_out ${CMAKE_CURRENT_BINARY_DIR}
          --grpc_out ${CMAKE_CURRENT_BINARY_DIR}
          --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN_EXECUTABLE}
@@ -731,7 +742,12 @@ if(BUILD_REMOTE_SERVER AND NOT BUILD_LP_ONLY)
     message(STATUS "Building cuopt_grpc_server (gRPC-based remote solve prototype)")
 
     # test_grpc_client - test client for gRPC server
-    add_executable(test_grpc_client test_grpc_client.cpp)
+    add_executable(test_grpc_client
+      test_grpc_client.cpp
+      ${PROTO_SRCS}
+      ${GRPC_PROTO_SRCS}
+      ${GRPC_SERVICE_SRCS}
+    )
     target_compile_options(test_grpc_client
       PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>"
     )

@@ -84,21 +84,14 @@ message DeleteRequest {
   string job_id = 1;
 }
 
-// Response when result is deleted
-message DeleteResponse {
-  string message = 1;
-}
+// DeleteResponse is defined in cuopt_remote.proto (imported above)
 
 // Request to cancel job
 message CancelRequest {
   string job_id = 1;
 }
 
-// Response when job is cancelled
-message CancelResponse {
-  JobStatus job_status = 1;    // Status after cancellation
-  string message = 2;
-}
+// CancelResponse is defined in cuopt_remote.proto (imported above)
 
 // Request to wait for result (blocking)
 message WaitRequest {
