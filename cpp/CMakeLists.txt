@@ -697,6 +697,58 @@ if(BUILD_REMOTE_SERVER AND NOT BUILD_LP_ONLY)
     COMPONENT runtime
     RUNTIME DESTINATION ${_BIN_DEST}
   )
+
+  # cuopt_grpc_server - gRPC-based remote server (prototype)
+  if(CUOPT_ENABLE_GRPC)
+    add_executable(cuopt_grpc_server cuopt_grpc_server.cpp)
+    target_compile_options(cuopt_grpc_server
+      PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>"
+    )
+    target_include_directories(cuopt_grpc_server
+      PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src"
+      "${CMAKE_CURRENT_SOURCE_DIR}/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}/libmps_parser/include"
+      "${CMAKE_CURRENT_BINARY_DIR}"
+      PUBLIC
+      "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+      "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>"
+    )
+    target_link_libraries(cuopt_grpc_server
+      PUBLIC
+      cuopt
+      OpenMP::OpenMP_CXX
+      PRIVATE
+      protobuf::libprotobuf
+      gRPC::grpc++
+    )
+    target_link_options(cuopt_grpc_server PRIVATE -Wl,--enable-new-dtags)
+
+    install(TARGETS cuopt_grpc_server
+      COMPONENT runtime
+      RUNTIME DESTINATION ${_BIN_DEST}
+    )
+    message(STATUS "Building cuopt_grpc_server (gRPC-based remote solve prototype)")
+
+    # test_grpc_client - test client for gRPC server
+    add_executable(test_grpc_client test_grpc_client.cpp)
+    target_compile_options(test_grpc_client
+      PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>"
+    )
+    target_include_directories(test_grpc_client
+      PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src"
+      "${CMAKE_CURRENT_SOURCE_DIR}/include"
+      "${CMAKE_CURRENT_BINARY_DIR}"
+    )
+    target_link_libraries(test_grpc_client
+      PRIVATE
+      protobuf::libprotobuf
+      gRPC::grpc++
+    )
+    target_link_options(test_grpc_client PRIVATE -Wl,--enable-new-dtags)
+    message(STATUS "Building test_grpc_client (gRPC test client)")
+  endif()
 endif()
 
 # ##################################################################################################
