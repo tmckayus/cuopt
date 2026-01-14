@@ -25,6 +25,7 @@ dependencies:
 - doxygen=1.9.1
 - fastapi
 - gcc_linux-64=14.*
+- grpc-cpp
 - ipython
 - jsonref==1.1.0
 - libboost-devel
@@ -32,6 +33,7 @@ dependencies:
 - libcurand-dev
 - libcusolver-dev
 - libcusparse-dev
+- libgrpc
 - libprotobuf
 - libraft-headers==26.2.*,>=0.0.0a0
 - librmm==26.2.*,>=0.0.0a0

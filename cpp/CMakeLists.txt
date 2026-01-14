@@ -233,6 +233,17 @@ find_package(Protobuf REQUIRED)
 include_directories(${Protobuf_INCLUDE_DIRS})
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
+# gRPC for remote solve service (optional, for gRPC-based implementation)
+find_package(gRPC CONFIG)
+if(gRPC_FOUND)
+  message(STATUS "Found gRPC: ${gRPC_VERSION}")
+  set(CUOPT_ENABLE_GRPC ON)
+  add_compile_definitions(CUOPT_ENABLE_GRPC)
+else()
+  message(STATUS "gRPC not found, gRPC-based remote solve will be disabled")
+  set(CUOPT_ENABLE_GRPC OFF)
+endif()
+
 # Generate C++ code from .proto file
 set(PROTO_FILE "${CMAKE_CURRENT_SOURCE_DIR}/src/linear_programming/utilities/cuopt_remote.proto")
 set(PROTO_SRCS "${CMAKE_CURRENT_BINARY_DIR}/cuopt_remote.pb.cc")
@@ -249,6 +260,33 @@ add_custom_command(
   VERBATIM
 )
 
+# Generate gRPC service code if gRPC is available
+if(CUOPT_ENABLE_GRPC)
+  find_program(_GRPC_CPP_PLUGIN_EXECUTABLE grpc_cpp_plugin)
+  if(NOT _GRPC_CPP_PLUGIN_EXECUTABLE)
+    message(FATAL_ERROR "grpc_cpp_plugin not found")
+  endif()
+
+  set(GRPC_PROTO_FILE "${CMAKE_CURRENT_SOURCE_DIR}/src/linear_programming/utilities/cuopt_remote_service.proto")
+  set(GRPC_PROTO_SRCS "${CMAKE_CURRENT_BINARY_DIR}/cuopt_remote_service.pb.cc")
+  set(GRPC_PROTO_HDRS "${CMAKE_CURRENT_BINARY_DIR}/cuopt_remote_service.pb.h")
+  set(GRPC_SERVICE_SRCS "${CMAKE_CURRENT_BINARY_DIR}/cuopt_remote_service.grpc.pb.cc")
+  set(GRPC_SERVICE_HDRS "${CMAKE_CURRENT_BINARY_DIR}/cuopt_remote_service.grpc.pb.h")
+
+  add_custom_command(
+    OUTPUT "${GRPC_PROTO_SRCS}" "${GRPC_PROTO_HDRS}" "${GRPC_SERVICE_SRCS}" "${GRPC_SERVICE_HDRS}"
+    COMMAND ${Protobuf_PROTOC_EXECUTABLE}
+    ARGS --cpp_out ${CMAKE_CURRENT_BINARY_DIR}
+         --grpc_out ${CMAKE_CURRENT_BINARY_DIR}
+         --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN_EXECUTABLE}
+         --proto_path ${CMAKE_CURRENT_SOURCE_DIR}/src/linear_programming/utilities
+         ${GRPC_PROTO_FILE}
+    DEPENDS ${GRPC_PROTO_FILE} ${PROTO_FILE}
+    COMMENT "Generating gRPC C++ code from cuopt_remote_service.proto"
+    VERBATIM
+  )
+endif()
+
 if(BUILD_TESTS)
   include(cmake/thirdparty/get_gtest.cmake)
 endif()
@@ -258,10 +296,19 @@ add_subdirectory(src)
 if (HOST_LINEINFO)
   set_source_files_properties(${CUOPT_SRC_FILES} DIRECTORY ${CMAKE_SOURCE_DIR} PROPERTIES COMPILE_OPTIONS "-g1")
 endif()
-add_library(cuopt SHARED
-  ${CUOPT_SRC_FILES}
-  ${PROTO_SRCS}
-)
+if(CUOPT_ENABLE_GRPC)
+  add_library(cuopt SHARED
+    ${CUOPT_SRC_FILES}
+    ${PROTO_SRCS}
+    ${GRPC_PROTO_SRCS}
+    ${GRPC_SERVICE_SRCS}
+  )
+else()
+  add_library(cuopt SHARED
+    ${CUOPT_SRC_FILES}
+    ${PROTO_SRCS}
+  )
+endif()
 
 set_target_properties(cuopt
   PROPERTIES BUILD_RPATH "\$ORIGIN"
@@ -373,6 +420,11 @@ target_link_libraries(cuopt
   cuopt::mps_parser_static  # Static link - symbols embedded in libcuopt.so
   protobuf::libprotobuf
   )
+
+# Link gRPC if available
+if(CUOPT_ENABLE_GRPC)
+  target_link_libraries(cuopt PRIVATE gRPC::grpc++)
+endif()
 
 
 # ##################################################################################################
@@ -603,6 +655,11 @@ if(BUILD_REMOTE_SERVER AND NOT BUILD_LP_ONLY)
     PRIVATE
     protobuf::libprotobuf
   )
+
+  # Link gRPC if available for gRPC-based server
+  if(CUOPT_ENABLE_GRPC)
+    target_link_libraries(cuopt_remote_server PRIVATE gRPC::grpc++)
+  endif()
   # Use RUNPATH so LD_LIBRARY_PATH can override conda paths during development
   set_target_properties(cuopt_remote_server PROPERTIES
     SKIP_BUILD_RPATH OFF

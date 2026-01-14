@@ -304,6 +304,8 @@ dependencies:
           - zlib
           - bzip2
           - libprotobuf
+          - grpc-cpp
+          - libgrpc
   test_cpp:
     common:
       - output_types: [conda]
