@@ -26,7 +26,6 @@
 #include <cuopt/linear_programming/solve.hpp>
 #include <cuopt/linear_programming/utilities/remote_serialization.hpp>
 #include <mps_parser/mps_data_model.hpp>
-#include <mps_parser/parser.hpp>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -49,6 +48,7 @@
 #include <mutex>
 #include <random>
 #include <sstream>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -77,8 +77,6 @@ struct JobQueueEntry {
   uint32_t problem_type;          // 0 = LP, 1 = MIP
   uint64_t data_size;             // Size of problem data (uint64 for large problems)
   char shm_data_name[128];        // Name of per-job shared memory segment (shm mode only)
-  uint32_t payload_kind;          // 0 = protobuf Solve*Request bytes, 1 = raw MPS file path
-  char payload_file_path[512];    // For raw MPS: server-side path that worker should parse
   std::atomic<bool> ready;        // Job is ready to be processed
   std::atomic<bool> claimed;      // Worker has claimed this job
   std::atomic<pid_t> worker_pid;  // PID of worker that claimed this job (0 if none)
@@ -330,14 +328,12 @@ void worker_process(int worker_id)
       }
 
       // Clear job slot (don't exit/restart worker)
-      job.worker_pid           = 0;
-      job.worker_index         = -1;
-      job.data_sent            = false;
-      job.ready                = false;
-      job.claimed              = false;
-      job.cancelled            = false;
-      job.payload_kind         = 0;
-      job.payload_file_path[0] = '\0';
+      job.worker_pid   = 0;
+      job.worker_index = -1;
+      job.data_sent    = false;
+      job.ready        = false;
+      job.claimed      = false;
+      job.cancelled    = false;
       continue;  // Go back to waiting for next job
     }
 
@@ -382,40 +378,25 @@ void worker_process(int worker_id)
     write(STDOUT_FILENO, msg01, 44);
     fsync(STDOUT_FILENO);
 
-    // Read problem data (protobuf bytes) OR use raw MPS file path.
+    // Read problem data (pipe mode or shm mode)
     std::vector<uint8_t> request_data;
     bool read_success = false;
-
-    const bool is_raw_mps = (job.payload_kind == 1);
-    std::string raw_mps_path;
-    if (is_raw_mps) { raw_mps_path = std::string(job.payload_file_path); }
-
-    if (!is_raw_mps) {
-      if (config.use_pipes) {
-        // Pipe mode: read from pipe (blocks until server writes data)
-        // No need to wait for data_sent flag - pipe read naturally blocks
-        int read_fd  = worker_pipes[worker_id].worker_read_fd;
-        read_success = recv_job_data_pipe(read_fd, job.data_size, request_data);
-        if (!read_success) {
-          std::cerr << "[Worker " << worker_id << "] Failed to read job data from pipe\n";
-        }
-      } else {
-        // SHM mode: read from shared memory
-        read_success = read_job_shm(job.shm_data_name, job.data_size, request_data);
-        if (!read_success) {
-          std::cerr << "[Worker " << worker_id << "] Failed to read job data from shm\n";
-        }
-        // Cleanup job input shm now that we've read it
-        cleanup_job_shm(job.shm_data_name);
+    if (config.use_pipes) {
+      // Pipe mode: read from pipe (blocks until server writes data)
+      // No need to wait for data_sent flag - pipe read naturally blocks
+      int read_fd  = worker_pipes[worker_id].worker_read_fd;
+      read_success = recv_job_data_pipe(read_fd, job.data_size, request_data);
+      if (!read_success) {
+        std::cerr << "[Worker " << worker_id << "] Failed to read job data from pipe\n";
       }
     } else {
-      // Raw MPS mode: nothing to read from pipe/shm; worker parses from the provided file path.
-      if (raw_mps_path.empty()) {
-        std::cerr << "[Worker " << worker_id << "] Raw MPS path is empty\n";
-        read_success = false;
-      } else {
-        read_success = true;
+      // SHM mode: read from shared memory
+      read_success = read_job_shm(job.shm_data_name, job.data_size, request_data);
+      if (!read_success) {
+        std::cerr << "[Worker " << worker_id << "] Failed to read job data from shm\n";
       }
+      // Cleanup job input shm now that we've read it
+      cleanup_job_shm(job.shm_data_name);
     }
 
     if (!read_success) {
@@ -436,13 +417,11 @@ void worker_process(int worker_id)
         }
       }
       // Clear job slot
-      job.worker_pid           = 0;
-      job.worker_index         = -1;
-      job.data_sent            = false;
-      job.ready                = false;
-      job.claimed              = false;
-      job.payload_kind         = 0;
-      job.payload_file_path[0] = '\0';
+      job.worker_pid   = 0;
+      job.worker_index = -1;
+      job.data_sent    = false;
+      job.ready        = false;
+      job.claimed      = false;
       continue;
     }
 
@@ -455,15 +434,7 @@ void worker_process(int worker_id)
         cuopt::mps_parser::mps_data_model_t<int, double> mps_data;
         mip_solver_settings_t<int, double> settings;
 
-        if (is_raw_mps) {
-          // Parse MPS from file path and solve with default settings (for now).
-          mps_data      = cuopt::mps_parser::parse_mps<int, double>(raw_mps_path, false);
-          auto solution = solve_mip(&handle, mps_data, settings);
-          solution.to_host(handle.get_stream());
-          result_data = serializer->serialize_mip_solution(solution);
-          success     = true;
-          unlink(raw_mps_path.c_str());
-        } else if (serializer->deserialize_mip_request(request_data, mps_data, settings)) {
+        if (serializer->deserialize_mip_request(request_data, mps_data, settings)) {
           auto solution = solve_mip(&handle, mps_data, settings);
           solution.to_host(handle.get_stream());
           result_data = serializer->serialize_mip_solution(solution);
@@ -475,21 +446,7 @@ void worker_process(int worker_id)
         cuopt::mps_parser::mps_data_model_t<int, double> mps_data;
         pdlp_solver_settings_t<int, double> settings;
 
-        if (is_raw_mps) {
-          // Parse MPS from file path and solve with default settings (for now).
-          mps_data         = cuopt::mps_parser::parse_mps<int, double>(raw_mps_path, false);
-          const char* msg1 = "[Worker] Calling solve_lp (raw MPS)...\n";
-          write(STDOUT_FILENO, msg1, strlen(msg1));
-          fsync(STDOUT_FILENO);
-          auto solution    = solve_lp(&handle, mps_data, settings);
-          const char* msg2 = "[Worker] solve_lp done (raw MPS)\n";
-          write(STDOUT_FILENO, msg2, strlen(msg2));
-          fsync(STDOUT_FILENO);
-          solution.to_host(handle.get_stream());
-          result_data = serializer->serialize_lp_solution(solution);
-          success     = true;
-          unlink(raw_mps_path.c_str());
-        } else if (serializer->deserialize_lp_request(request_data, mps_data, settings)) {
+        if (serializer->deserialize_lp_request(request_data, mps_data, settings)) {
           const char* msg1 = "[Worker] Calling solve_lp via write()...\n";
           write(STDOUT_FILENO, msg1, strlen(msg1));
           fsync(STDOUT_FILENO);
@@ -619,14 +576,12 @@ void worker_process(int worker_id)
     }
 
     // Clear job slot
-    job.worker_pid           = 0;
-    job.worker_index         = -1;
-    job.data_sent            = false;
-    job.ready                = false;
-    job.claimed              = false;
-    job.cancelled            = false;
-    job.payload_kind         = 0;
-    job.payload_file_path[0] = '\0';
+    job.worker_pid   = 0;
+    job.worker_index = -1;
+    job.data_sent    = false;
+    job.ready        = false;
+    job.claimed      = false;
+    job.cancelled    = false;
 
     std::cout << "[Worker " << worker_id << "] Completed job: " << job_id
               << " (success: " << success << ")\n";
@@ -829,9 +784,6 @@ void mark_worker_jobs_failed(pid_t dead_worker_pid)
             pending_job_files.erase(itf);
           }
         }
-        if (job_queue[i].payload_kind == 1 && job_queue[i].payload_file_path[0] != '\0') {
-          unlink(job_queue[i].payload_file_path);
-        }
       } else {
         // SHM mode: cleanup job input shm (worker may not have done it)
         cleanup_job_shm(job_queue[i].shm_data_name);
@@ -995,13 +947,6 @@ void result_retrieval_thread()
                 job_queue[i].cancelled = true;
               }
               found = true;
-              continue;
-            }
-
-            // Raw MPS payloads are file paths that workers read directly; nothing to send.
-            if (job_queue[i].payload_kind == 1) {
-              job_queue[i].data_sent = true;
-              found                  = true;
               continue;
             }
 
@@ -1842,10 +1787,8 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
 
     // Initialize job queue entry
     strncpy(job_queue[job_idx].job_id, job_id.c_str(), sizeof(job_queue[job_idx].job_id) - 1);
-    job_queue[job_idx].problem_type         = is_lp ? 0 : 1;
-    job_queue[job_idx].data_size            = job_data.size();
-    job_queue[job_idx].payload_kind         = 0;
-    job_queue[job_idx].payload_file_path[0] = '\0';
+    job_queue[job_idx].problem_type = is_lp ? 0 : 1;
+    job_queue[job_idx].data_size    = job_data.size();
     // `claimed` currently true as a reservation; keep it until the entry is fully initialized.
     job_queue[job_idx].cancelled.store(false);
     job_queue[job_idx].worker_index.store(-1);
@@ -1911,9 +1854,7 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
     const auto& start       = in.start();
     std::string upload_id   = start.upload_id().empty() ? generate_job_id() : start.upload_id();
     bool is_mip             = (start.problem_type() == cuopt::remote::MIP);
-    const bool raw_mps      = start.raw_mps();
     std::string upload_path = get_upload_file_path(upload_id);
-    if (raw_mps) { upload_path += ".mps"; }
 
     // Open file (append if resume, else truncate).
     int flags = O_CREAT | O_WRONLY;
@@ -2045,21 +1986,12 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
 
     strncpy(job_queue[job_idx].job_id, job_id.c_str(), sizeof(job_queue[job_idx].job_id) - 1);
     job_queue[job_idx].problem_type = is_mip ? 1 : 0;
-    job_queue[job_idx].data_size    = raw_mps ? 0 : static_cast<uint64_t>(committed);
+    job_queue[job_idx].data_size    = static_cast<uint64_t>(committed);
     job_queue[job_idx].cancelled.store(false);
     job_queue[job_idx].worker_index.store(-1);
-    job_queue[job_idx].data_sent.store(raw_mps ? true : false);
+    job_queue[job_idx].data_sent.store(false);
     job_queue[job_idx].shm_data_name[0] = '\0';
-    job_queue[job_idx].payload_kind     = raw_mps ? 1 : 0;
-    if (raw_mps) {
-      strncpy(job_queue[job_idx].payload_file_path,
-              upload_path.c_str(),
-              sizeof(job_queue[job_idx].payload_file_path) - 1);
-    } else {
-      job_queue[job_idx].payload_file_path[0] = '\0';
-    }
-
-    if (!raw_mps) {
+    {
       std::lock_guard<std::mutex> lock(pending_files_mutex);
       pending_job_files[job_id] = PendingJobFile{upload_path, static_cast<uint64_t>(committed)};
     }
@@ -2156,6 +2088,77 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
     return Status::OK;
   }
 
+  Status StreamResult(ServerContext* context,
+                      const cuopt::remote::GetResultRequest* request,
+                      ServerWriter<cuopt::remote::ResultChunk>* writer) override
+  {
+    (void)context;
+    std::string job_id = request->job_id();
+
+    std::vector<uint8_t> bytes;
+    bool is_mip = false;
+    {
+      std::lock_guard<std::mutex> lock(tracker_mutex);
+      auto it = job_tracker.find(job_id);
+      if (it == job_tracker.end()) {
+        cuopt::remote::ResultChunk chunk;
+        chunk.set_job_id(job_id);
+        chunk.set_offset(0);
+        chunk.set_done(true);
+        chunk.set_error_message("Job not found");
+        writer->Write(chunk);
+        return Status::OK;
+      }
+
+      if (it->second.status != JobStatus::COMPLETED) {
+        cuopt::remote::ResultChunk chunk;
+        chunk.set_job_id(job_id);
+        chunk.set_offset(0);
+        chunk.set_done(true);
+        chunk.set_error_message("Result not ready");
+        writer->Write(chunk);
+        return Status::OK;
+      }
+
+      bytes =
+        it->second.result_data;  // copy; acceptable for now (can optimize with shared_ptr later)
+      is_mip = it->second.is_mip;
+    }
+
+    const size_t chunk_size = 1 << 20;  // 1 MiB
+    size_t offset           = 0;
+    while (offset < bytes.size()) {
+      size_t n = bytes.size() - offset;
+      if (n > chunk_size) { n = chunk_size; }
+
+      cuopt::remote::ResultChunk chunk;
+      chunk.set_job_id(job_id);
+      chunk.set_offset(static_cast<int64_t>(offset));
+      chunk.set_data(reinterpret_cast<const char*>(bytes.data() + offset), n);
+      chunk.set_done(false);
+
+      if (!writer->Write(chunk)) { break; }  // client cancelled
+      offset += n;
+    }
+
+    cuopt::remote::ResultChunk done;
+    done.set_job_id(job_id);
+    done.set_offset(static_cast<int64_t>(bytes.size()));
+    done.set_done(true);
+    // encode type hint in error_message is ugly; leave empty (client can infer by trying parse or
+    // via status/is_mip call if needed). For now client will track is_mip separately.
+    done.set_error_message("");
+    writer->Write(done);
+
+    if (config.verbose) {
+      std::cout << "[gRPC] StreamResult finished job_id=" << job_id << " bytes=" << bytes.size()
+                << " is_mip=" << (is_mip ? 1 : 0) << "\n";
+      std::cout.flush();
+    }
+
+    return Status::OK;
+  }
+
   // Other RPCs - stubs for now
   Status DeleteResult(ServerContext* context,
                       const cuopt::remote::DeleteRequest* request,
@@ -2232,7 +2235,109 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
                     const cuopt::remote::StreamLogsRequest* request,
                     ServerWriter<cuopt::remote::LogMessage>* writer) override
   {
-    return Status(StatusCode::UNIMPLEMENTED, "StreamLogs not yet implemented");
+    const std::string job_id   = request->job_id();
+    int64_t from_byte          = request->from_byte();
+    const std::string log_path = get_log_file_path(job_id);
+
+    // Wait for the log file to appear (job might not have started yet).
+    int waited_ms = 0;
+    while (!context->IsCancelled()) {
+      struct stat st;
+      if (stat(log_path.c_str(), &st) == 0) { break; }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      waited_ms += 50;
+      // Give up quickly if job doesn't exist.
+      if (waited_ms >= 2000) {
+        std::string msg;
+        JobStatus s = check_job_status(job_id, msg);
+        if (s == JobStatus::NOT_FOUND) {
+          cuopt::remote::LogMessage m;
+          m.set_line("Job not found");
+          m.set_byte_offset(from_byte);
+          m.set_job_complete(true);
+          writer->Write(m);
+          return Status::OK;
+        }
+        // else job exists but log not yet created; keep waiting
+        waited_ms = 0;
+      }
+    }
+
+    std::ifstream in(log_path, std::ios::in | std::ios::binary);
+    if (!in.is_open()) {
+      cuopt::remote::LogMessage m;
+      m.set_line("Failed to open log file");
+      m.set_byte_offset(from_byte);
+      m.set_job_complete(true);
+      writer->Write(m);
+      return Status::OK;
+    }
+
+    if (from_byte > 0) { in.seekg(from_byte, std::ios::beg); }
+
+    int64_t current_offset = from_byte;
+    std::string line;
+
+    while (!context->IsCancelled()) {
+      std::streampos before = in.tellg();
+      if (before >= 0) { current_offset = static_cast<int64_t>(before); }
+
+      if (std::getline(in, line)) {
+        // Account for the newline consumed by getline (1 byte) if present in file.
+        std::streampos after = in.tellg();
+        int64_t next_offset  = current_offset;
+        if (after >= 0) {
+          next_offset = static_cast<int64_t>(after);
+        } else {
+          // tellg can be -1 at EOF; approximate
+          next_offset = current_offset + static_cast<int64_t>(line.size());
+        }
+
+        cuopt::remote::LogMessage m;
+        m.set_line(line);
+        m.set_byte_offset(next_offset);
+        m.set_job_complete(false);
+        if (!writer->Write(m)) { break; }
+        continue;
+      }
+
+      // No new line available: clear EOF and sleep briefly
+      if (in.eof()) {
+        in.clear();
+      } else if (in.fail()) {
+        in.clear();
+      }
+
+      // If job is in terminal state and we've drained file, finish the stream.
+      std::string msg;
+      JobStatus s = check_job_status(job_id, msg);
+      if (s == JobStatus::COMPLETED || s == JobStatus::FAILED || s == JobStatus::CANCELLED) {
+        // One last attempt to read any remaining partial line
+        std::streampos before2 = in.tellg();
+        if (before2 >= 0) { current_offset = static_cast<int64_t>(before2); }
+        if (std::getline(in, line)) {
+          std::streampos after2 = in.tellg();
+          int64_t next_offset2  = current_offset + static_cast<int64_t>(line.size());
+          if (after2 >= 0) { next_offset2 = static_cast<int64_t>(after2); }
+          cuopt::remote::LogMessage m;
+          m.set_line(line);
+          m.set_byte_offset(next_offset2);
+          m.set_job_complete(false);
+          writer->Write(m);
+        }
+
+        cuopt::remote::LogMessage done;
+        done.set_line("");
+        done.set_byte_offset(current_offset);
+        done.set_job_complete(true);
+        writer->Write(done);
+        return Status::OK;
+      }
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    return Status::OK;
   }
 
   Status SolveSync(ServerContext* context,
@@ -2393,7 +2498,6 @@ int main(int argc, char** argv)
     job_queue[i].claimed.store(false);
     job_queue[i].cancelled.store(false);
     job_queue[i].worker_index.store(-1);
-    job_queue[i].payload_kind = 0;
   }
 
   for (size_t i = 0; i < MAX_RESULTS; ++i) {

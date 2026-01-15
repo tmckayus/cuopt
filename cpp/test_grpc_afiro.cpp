@@ -7,7 +7,13 @@
  * Test gRPC remote solve with afiro.mps
  */
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -22,6 +28,7 @@
 
 using grpc::Channel;
 using grpc::ClientContext;
+using grpc::ClientReader;
 using grpc::ClientReaderWriter;
 using grpc::Status;
 
@@ -31,197 +38,162 @@ class CuOptGrpcClient {
  public:
   CuOptGrpcClient(std::shared_ptr<Channel> channel) : stub_(CuOptRemoteService::NewStub(channel)) {}
 
-  std::string UploadAndSubmitRawMpsLP(const std::string& mps_path)
+  void StreamLogsToStdout(const std::string& job_id, std::atomic<bool>& stop_flag)
   {
-    std::ifstream f(mps_path, std::ios::binary);
-    if (!f) {
-      std::cerr << "[Client] Failed to open MPS file: " << mps_path << std::endl;
-      return "";
+    StreamLogsRequest req;
+    req.set_job_id(job_id);
+    req.set_from_byte(0);
+
+    ClientContext ctx;
+    std::unique_ptr<ClientReader<LogMessage>> reader = stub_->StreamLogs(&ctx, req);
+
+    LogMessage msg;
+    while (!stop_flag.load() && reader->Read(&msg)) {
+      if (!msg.line().empty()) { std::cout << "[ServerLog] " << msg.line() << std::endl; }
+      if (msg.job_complete()) { break; }
     }
 
-    ClientContext context;
-    std::unique_ptr<ClientReaderWriter<UploadJobRequest, UploadJobResponse>> stream =
-      stub_->UploadAndSubmit(&context);
+    // If the caller wants to stop early, cancel the stream.
+    if (stop_flag.load()) { ctx.TryCancel(); }
+    reader->Finish();
+  }
 
-    UploadJobRequest req;
-    auto* start = req.mutable_start();
-    start->set_problem_type(LP);
-    start->set_resume(false);
-    start->set_raw_mps(true);
-    start->set_original_filename(mps_path);
+  std::string UploadAndSubmitLPFromFD(int fd, int64_t total_size, cuopt::remote::LPMethod method)
+  {
+    // We keep fd open and can retry the streaming RPC (in-process) using resume semantics.
+    // The server enforces sequential offsets and reports committed_size acks.
+    std::string upload_id;
+    bool resume = false;
 
-    if (!stream->Write(req)) {
-      std::cerr << "[Client] UploadAndSubmit(raw_mps): failed to write start" << std::endl;
-      return "";
-    }
+    for (int attempt = 0; attempt < 5; ++attempt) {
+      ClientContext context;
+      std::unique_ptr<ClientReaderWriter<UploadJobRequest, UploadJobResponse>> stream =
+        stub_->UploadAndSubmit(&context);
 
-    UploadJobResponse resp;
-    if (!stream->Read(&resp) || !resp.has_ack()) {
-      std::cerr << "[Client] UploadAndSubmit(raw_mps): missing ack after start" << std::endl;
-      return "";
-    }
-
-    const std::string upload_id = resp.ack().upload_id();
-    int64_t committed           = resp.ack().committed_size();
-
-    const size_t chunk_size = 1 << 20;  // 1 MiB
-    std::vector<char> buf(chunk_size);
-    int64_t total_sent = committed;
-
-    while (true) {
-      f.read(buf.data(), static_cast<std::streamsize>(buf.size()));
-      std::streamsize n = f.gcount();
-      if (n <= 0) { break; }
-
-      req.Clear();
-      auto* chunk = req.mutable_chunk();
-      chunk->set_upload_id(upload_id);
-      chunk->set_offset(committed);
-      chunk->set_data(buf.data(), static_cast<size_t>(n));
+      UploadJobRequest req;
+      auto* start = req.mutable_start();
+      start->set_problem_type(LP);
+      start->set_resume(resume);
+      if (!upload_id.empty()) { start->set_upload_id(upload_id); }
+      start->set_total_size(total_size);
 
       if (!stream->Write(req)) {
-        std::cerr << "[Client] UploadAndSubmit(raw_mps): failed to write chunk at offset "
-                  << committed << std::endl;
-        return "";
+        // immediate transport failure, retry
+        resume = true;
+        continue;
       }
+
+      UploadJobResponse resp;
       if (!stream->Read(&resp) || !resp.has_ack()) {
-        std::cerr << "[Client] UploadAndSubmit(raw_mps): missing ack after chunk" << std::endl;
+        // failed to read ack, retry
+        resume = true;
+        continue;
+      }
+
+      upload_id         = resp.ack().upload_id();
+      int64_t committed = resp.ack().committed_size();
+
+      // Resume reading from committed offset
+      if (lseek(fd, committed, SEEK_SET) < 0) {
+        std::cerr << "[Client] lseek failed for resume offset " << committed << std::endl;
         return "";
       }
 
-      committed  = resp.ack().committed_size();
-      total_sent = committed;
-      if ((total_sent % (256LL * 1024 * 1024)) < static_cast<int64_t>(n)) {
-        std::cout << "[Client] Upload progress: " << total_sent << " bytes" << std::endl;
+      const size_t chunk_size = 1 << 20;  // 1 MiB
+      std::vector<uint8_t> buf(chunk_size);
+
+      while (committed < total_size) {
+        ssize_t nread =
+          ::read(fd,
+                 buf.data(),
+                 static_cast<size_t>(std::min<int64_t>(chunk_size, total_size - committed)));
+        if (nread < 0) {
+          if (errno == EINTR) continue;
+          std::cerr << "[Client] read() failed: " << strerror(errno) << std::endl;
+          break;
+        }
+        if (nread == 0) {
+          std::cerr << "[Client] Unexpected EOF reading serialized protobuf" << std::endl;
+          break;
+        }
+
+        req.Clear();
+        auto* chunk = req.mutable_chunk();
+        chunk->set_upload_id(upload_id);
+        chunk->set_offset(committed);
+        chunk->set_data(buf.data(), static_cast<size_t>(nread));
+
+        if (!stream->Write(req)) { break; }
+
+        resp.Clear();
+        if (!stream->Read(&resp) || !resp.has_ack()) { break; }
+        committed = resp.ack().committed_size();
       }
+
+      // Finish upload
+      req.Clear();
+      req.mutable_finish()->set_upload_id(upload_id);
+      stream->Write(req);
+      stream->WritesDone();
+
+      std::string job_id;
+      while (stream->Read(&resp)) {
+        if (resp.has_submit()) {
+          job_id = resp.submit().job_id();
+          break;
+        }
+        if (resp.has_error()) {
+          std::cerr << "[Client] UploadAndSubmit error: " << resp.error().message()
+                    << " committed=" << resp.error().committed_size() << std::endl;
+          break;
+        }
+      }
+
+      Status st = stream->Finish();
+      if (st.ok() && !job_id.empty()) { return job_id; }
+
+      // Retry
+      resume = true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    req.Clear();
-    req.mutable_finish()->set_upload_id(upload_id);
-    stream->Write(req);
-    stream->WritesDone();
-
-    std::string job_id;
-    while (stream->Read(&resp)) {
-      if (resp.has_submit()) {
-        job_id = resp.submit().job_id();
-        break;
-      }
-      if (resp.has_error()) {
-        std::cerr << "[Client] UploadAndSubmit(raw_mps) error: " << resp.error().message()
-                  << " committed=" << resp.error().committed_size() << std::endl;
-        break;
-      }
-    }
-
-    Status status = stream->Finish();
-    if (!status.ok()) {
-      std::cerr << "[Client] UploadAndSubmit(raw_mps) RPC failed: " << status.error_message()
-                << std::endl;
-      return "";
-    }
-
-    return job_id;
+    return "";
   }
 
   std::string UploadAndSubmitLP(const SolveLPRequest& lp_request)
   {
-    const size_t size = lp_request.ByteSizeLong();
-    std::vector<uint8_t> bytes(size);
-    if (!lp_request.SerializeToArray(bytes.data(), size)) {
-      std::cerr << "[Client] Failed to serialize SolveLPRequest for upload" << std::endl;
+    // Serialize to a private temp file (0600) and unlink immediately (unlink-on-open).
+    // This avoids allocating a multi-GB contiguous buffer for serialized protobuf bytes.
+    char tmp[] = "/tmp/cuopt_req_XXXXXX";
+    int fd     = mkstemp(tmp);
+    if (fd < 0) {
+      std::cerr << "[Client] mkstemp failed: " << strerror(errno) << std::endl;
       return "";
     }
+    // Ensure permissions are owner-only and unlink so it auto-cleans.
+    fchmod(fd, 0600);
+    unlink(tmp);
 
-    ClientContext context;
-    std::unique_ptr<ClientReaderWriter<UploadJobRequest, UploadJobResponse>> stream =
-      stub_->UploadAndSubmit(&context);
-
-    UploadJobRequest req;
-    auto* start = req.mutable_start();
-    start->set_problem_type(LP);
-    start->set_resume(false);
-    start->set_total_size(static_cast<int64_t>(bytes.size()));
-
-    if (!stream->Write(req)) {
-      std::cerr << "[Client] UploadAndSubmit: failed to write start" << std::endl;
+    if (!lp_request.SerializeToFileDescriptor(fd)) {
+      std::cerr << "[Client] Failed to serialize SolveLPRequest to temp file" << std::endl;
+      close(fd);
       return "";
     }
-
-    UploadJobResponse resp;
-    if (!stream->Read(&resp) || !resp.has_ack()) {
-      std::cerr << "[Client] UploadAndSubmit: missing ack after start" << std::endl;
+    int64_t total_size = lseek(fd, 0, SEEK_END);
+    if (total_size < 0) {
+      std::cerr << "[Client] lseek(SEEK_END) failed" << std::endl;
+      close(fd);
       return "";
     }
+    lseek(fd, 0, SEEK_SET);
 
-    const std::string upload_id = resp.ack().upload_id();
-    int64_t committed           = resp.ack().committed_size();
-
-    const size_t chunk_size = 1 << 20;  // 1 MiB
-    while (static_cast<size_t>(committed) < bytes.size()) {
-      const size_t offset = static_cast<size_t>(committed);
-      size_t n            = bytes.size() - offset;
-      if (n > chunk_size) { n = chunk_size; }
-
-      req.Clear();
-      auto* chunk = req.mutable_chunk();
-      chunk->set_upload_id(upload_id);
-      chunk->set_offset(committed);
-      chunk->set_data(reinterpret_cast<const char*>(bytes.data() + offset), n);
-
-      if (!stream->Write(req)) {
-        std::cerr << "[Client] UploadAndSubmit: failed to write chunk at offset " << committed
-                  << std::endl;
-        return "";
-      }
-
-      resp.Clear();
-      if (!stream->Read(&resp) || !resp.has_ack()) {
-        std::cerr << "[Client] UploadAndSubmit: missing ack after chunk" << std::endl;
-        return "";
-      }
-
-      committed = resp.ack().committed_size();
-    }
-
-    req.Clear();
-    req.mutable_finish()->set_upload_id(upload_id);
-    stream->Write(req);
-    stream->WritesDone();
-
-    std::string job_id;
-    while (stream->Read(&resp)) {
-      if (resp.has_submit()) {
-        job_id = resp.submit().job_id();
-        break;
-      }
-      if (resp.has_error()) {
-        std::cerr << "[Client] UploadAndSubmit error: " << resp.error().message()
-                  << " committed=" << resp.error().committed_size() << std::endl;
-        break;
-      }
-    }
-
-    Status status = stream->Finish();
-    if (!status.ok()) {
-      std::cerr << "[Client] UploadAndSubmit RPC failed: " << status.error_message() << std::endl;
-      return "";
-    }
-
+    std::string job_id = UploadAndSubmitLPFromFD(fd, total_size, lp_request.settings().method());
+    close(fd);
     return job_id;
   }
 
   std::string SubmitMpsFile(const std::string& mps_file_path)
   {
-    // If the MPS is huge, prefer streaming the raw MPS file to the server and parsing there.
-    // This avoids building a multi-GB protobuf message in client memory.
-    if (mps_file_path.find("L2CTA3D.mps") != std::string::npos) {
-      std::cout << "[Client] Using raw MPS streaming mode for: " << mps_file_path << std::endl;
-      std::string job_id = UploadAndSubmitRawMpsLP(mps_file_path);
-      if (!job_id.empty()) { return job_id; }
-      std::cerr << "[Client] Raw MPS upload failed; falling back to protobuf path" << std::endl;
-    }
-
     // Parse MPS file
     std::cout << "[Client] Parsing MPS file: " << mps_file_path << std::endl;
 
@@ -338,13 +310,19 @@ class CuOptGrpcClient {
 
     // Settings
     auto* settings = lp_request->mutable_settings();
+    // Give large instances more time by default.
     settings->set_time_limit(60.0);
-    settings->set_log_to_console(false);
+    settings->set_log_to_console(true);
     // IMPORTANT: proto3 defaults numeric fields to 0. If we don't set this,
     // cuOpt may interpret iteration_limit=0 as "do zero iterations" and return
     // PDLP_ITERATION_LIMIT immediately with a trivial objective.
     // Use -1 sentinel for "unset" so server/library defaults apply.
     settings->set_iteration_limit(-1);
+    // Allow overriding LP method for known-problem cases (e.g. avoid Concurrent/Barrier issues).
+    if (mps_file_path.find("L2CTA3D.mps") != std::string::npos) {
+      settings->set_method(PDLP);
+      settings->set_time_limit(1800.0);
+    }
 
     // Sanity-check what we're about to send (proto3 only serializes non-default fields)
     std::cout << "[Client] Prepared SolveLPRequest: bytes=" << lp_request->ByteSizeLong()
@@ -384,6 +362,58 @@ class CuOptGrpcClient {
 
   bool GetResult(const std::string& job_id)
   {
+    // Prefer streaming result to avoid any total result size limit.
+    // (Each streamed chunk must still fit within gRPC per-message limits.)
+    {
+      GetResultRequest request;
+      request.set_job_id(job_id);
+      ClientContext context;
+      std::unique_ptr<ClientReader<ResultChunk>> reader = stub_->StreamResult(&context, request);
+
+      std::vector<uint8_t> bytes;
+      bytes.reserve(16 * 1024 * 1024);
+
+      ResultChunk chunk;
+      while (reader->Read(&chunk)) {
+        if (!chunk.error_message().empty()) {
+          std::cerr << "[Client] StreamResult error: " << chunk.error_message() << std::endl;
+          break;
+        }
+        if (chunk.done()) { break; }
+        const std::string& data = chunk.data();
+        bytes.insert(bytes.end(), data.begin(), data.end());
+      }
+
+      Status status = reader->Finish();
+      if (!status.ok()) {
+        std::cerr << "[Client] StreamResult RPC failed: " << status.error_message() << std::endl;
+        // fall through to unary GetResult as a fallback
+      } else if (!bytes.empty()) {
+        // Parse as LP solution (this test client is LP-only)
+        cuopt::remote::LPSolution lp_solution;
+        if (!lp_solution.ParseFromArray(bytes.data(), bytes.size())) {
+          std::cerr << "[Client] Failed to parse streamed LP solution" << std::endl;
+          return false;
+        }
+
+        std::cout << "\n[Client] ============ REMOTE RESULT (STREAM) ============" << std::endl;
+        std::cout << "[Client] Termination Status: " << lp_solution.termination_status()
+                  << std::endl;
+        std::cout << "[Client] Objective: " << lp_solution.primal_objective() << std::endl;
+        std::cout << "[Client] Primal solution size: " << lp_solution.primal_solution_size()
+                  << std::endl;
+        std::cout << "[Client] Dual solution size: " << lp_solution.dual_solution_size()
+                  << std::endl;
+        std::cout << "[Client] Iterations: " << lp_solution.nb_iterations() << std::endl;
+        std::cout << "[Client] Solve time: " << lp_solution.solve_time() << " seconds" << std::endl;
+        if (!lp_solution.error_message().empty()) {
+          std::cout << "[Client] Error: " << lp_solution.error_message() << std::endl;
+        }
+        std::cout << "[Client] ================================================\n" << std::endl;
+        return true;
+      }
+    }
+
     GetResultRequest request;
     request.set_job_id(job_id);
 
@@ -433,13 +463,22 @@ int main(int argc, char** argv)
   std::string mps_file       = "../datasets/afiro.mps";
   int max_message_mb         = 256;
   bool submit_only           = false;
+  int max_wait_sec           = 30;
+  bool stream_logs           = false;
 
   if (argc > 1) { mps_file = argv[1]; }
   if (argc > 2) { server_address = argv[2]; }
   if (argc > 3) { max_message_mb = std::stoi(argv[3]); }
-  if (argc > 4) {
-    std::string arg = argv[4];
-    if (arg == "--submit-only") { submit_only = true; }
+  // Parse optional flags
+  for (int i = 4; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--submit-only") {
+      submit_only = true;
+    } else if (arg == "--max-wait-sec" && i + 1 < argc) {
+      max_wait_sec = std::stoi(argv[++i]);
+    } else if (arg == "--stream-logs") {
+      stream_logs = true;
+    }
   }
 
   std::cout << "[Client] Connecting to " << server_address << std::endl;
@@ -459,13 +498,26 @@ int main(int argc, char** argv)
     return 0;
   }
 
+  std::atomic<bool> stop_logs{false};
+  std::thread log_thread;
+  if (stream_logs) {
+    std::cout << "[Client] Streaming server logs..." << std::endl;
+    log_thread = std::thread(
+      [&client, &job_id, &stop_logs]() { client.StreamLogsToStdout(job_id, stop_logs); });
+  }
+
   // Poll for completion
   std::cout << "[Client] Waiting for result..." << std::endl;
   bool completed = false;
-  for (int i = 0; i < 60; ++i) {
+  auto start     = std::chrono::steady_clock::now();
+  while (true) {
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     if (client.CheckStatus(job_id)) {
       completed = true;
+      break;
+    }
+    auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::seconds>(now - start).count() >= max_wait_sec) {
       break;
     }
   }
@@ -477,6 +529,11 @@ int main(int argc, char** argv)
 
   // Get result
   if (!client.GetResult(job_id)) { return 1; }
+
+  if (stream_logs) {
+    stop_logs = true;
+    if (log_thread.joinable()) { log_thread.join(); }
+  }
 
   std::cout << "[Client] Test completed successfully" << std::endl;
   return 0;
