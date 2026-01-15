@@ -813,6 +813,31 @@ if(BUILD_REMOTE_SERVER AND NOT BUILD_LP_ONLY)
     target_link_options(test_grpc_mip_sample PRIVATE -Wl,--enable-new-dtags)
     message(STATUS "Building test_grpc_mip_sample (gRPC MIP sample test)")
 
+    # test_grpc_cancel_restart - submit a longer-running job, cancel it while processing, and
+    # validate worker kill/restart behavior.
+    add_executable(test_grpc_cancel_restart
+      test_grpc_cancel_restart.cpp
+      ${PROTO_SRCS}
+      ${GRPC_PROTO_SRCS}
+      ${GRPC_SERVICE_SRCS}
+    )
+    target_compile_options(test_grpc_cancel_restart PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>")
+    target_include_directories(test_grpc_cancel_restart PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include
+      ${CMAKE_CURRENT_BINARY_DIR}
+      ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+      ${CMAKE_SOURCE_DIR}/_deps/rmm-src/include
+      ${CMAKE_SOURCE_DIR}/_deps/raft-src/cpp/include
+    )
+    target_link_libraries(test_grpc_cancel_restart
+      PRIVATE
+      protobuf::libprotobuf
+      gRPC::grpc++
+      cuopt
+    )
+    target_link_options(test_grpc_cancel_restart PRIVATE -Wl,--enable-new-dtags)
+    message(STATUS "Building test_grpc_cancel_restart (gRPC cancel/restart test)")
+
     # test_simple_solve - simple standalone test for LP solving
     add_executable(test_simple_solve test_simple_solve.cpp)
     target_compile_options(test_simple_solve PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>")

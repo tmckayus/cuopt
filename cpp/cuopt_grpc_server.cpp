@@ -26,6 +26,7 @@
 #include <cuopt/linear_programming/solve.hpp>
 #include <cuopt/linear_programming/utilities/remote_serialization.hpp>
 #include <mps_parser/mps_data_model.hpp>
+#include <mps_parser/parser.hpp>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -76,6 +77,8 @@ struct JobQueueEntry {
   uint32_t problem_type;          // 0 = LP, 1 = MIP
   uint64_t data_size;             // Size of problem data (uint64 for large problems)
   char shm_data_name[128];        // Name of per-job shared memory segment (shm mode only)
+  uint32_t payload_kind;          // 0 = protobuf Solve*Request bytes, 1 = raw MPS file path
+  char payload_file_path[512];    // For raw MPS: server-side path that worker should parse
   std::atomic<bool> ready;        // Job is ready to be processed
   std::atomic<bool> claimed;      // Worker has claimed this job
   std::atomic<pid_t> worker_pid;  // PID of worker that claimed this job (0 if none)
@@ -327,12 +330,14 @@ void worker_process(int worker_id)
       }
 
       // Clear job slot (don't exit/restart worker)
-      job.worker_pid   = 0;
-      job.worker_index = -1;
-      job.data_sent    = false;
-      job.ready        = false;
-      job.claimed      = false;
-      job.cancelled    = false;
+      job.worker_pid           = 0;
+      job.worker_index         = -1;
+      job.data_sent            = false;
+      job.ready                = false;
+      job.claimed              = false;
+      job.cancelled            = false;
+      job.payload_kind         = 0;
+      job.payload_file_path[0] = '\0';
       continue;  // Go back to waiting for next job
     }
 
@@ -377,26 +382,40 @@ void worker_process(int worker_id)
     write(STDOUT_FILENO, msg01, 44);
     fsync(STDOUT_FILENO);
 
-    // Read problem data (pipe mode or shm mode)
+    // Read problem data (protobuf bytes) OR use raw MPS file path.
     std::vector<uint8_t> request_data;
     bool read_success = false;
 
-    if (config.use_pipes) {
-      // Pipe mode: read from pipe (blocks until server writes data)
-      // No need to wait for data_sent flag - pipe read naturally blocks
-      int read_fd  = worker_pipes[worker_id].worker_read_fd;
-      read_success = recv_job_data_pipe(read_fd, job.data_size, request_data);
-      if (!read_success) {
-        std::cerr << "[Worker " << worker_id << "] Failed to read job data from pipe\n";
+    const bool is_raw_mps = (job.payload_kind == 1);
+    std::string raw_mps_path;
+    if (is_raw_mps) { raw_mps_path = std::string(job.payload_file_path); }
+
+    if (!is_raw_mps) {
+      if (config.use_pipes) {
+        // Pipe mode: read from pipe (blocks until server writes data)
+        // No need to wait for data_sent flag - pipe read naturally blocks
+        int read_fd  = worker_pipes[worker_id].worker_read_fd;
+        read_success = recv_job_data_pipe(read_fd, job.data_size, request_data);
+        if (!read_success) {
+          std::cerr << "[Worker " << worker_id << "] Failed to read job data from pipe\n";
+        }
+      } else {
+        // SHM mode: read from shared memory
+        read_success = read_job_shm(job.shm_data_name, job.data_size, request_data);
+        if (!read_success) {
+          std::cerr << "[Worker " << worker_id << "] Failed to read job data from shm\n";
+        }
+        // Cleanup job input shm now that we've read it
+        cleanup_job_shm(job.shm_data_name);
       }
     } else {
-      // SHM mode: read from shared memory
-      read_success = read_job_shm(job.shm_data_name, job.data_size, request_data);
-      if (!read_success) {
-        std::cerr << "[Worker " << worker_id << "] Failed to read job data from shm\n";
+      // Raw MPS mode: nothing to read from pipe/shm; worker parses from the provided file path.
+      if (raw_mps_path.empty()) {
+        std::cerr << "[Worker " << worker_id << "] Raw MPS path is empty\n";
+        read_success = false;
+      } else {
+        read_success = true;
       }
-      // Cleanup job input shm now that we've read it
-      cleanup_job_shm(job.shm_data_name);
     }
 
     if (!read_success) {
@@ -417,11 +436,13 @@ void worker_process(int worker_id)
         }
       }
       // Clear job slot
-      job.worker_pid   = 0;
-      job.worker_index = -1;
-      job.data_sent    = false;
-      job.ready        = false;
-      job.claimed      = false;
+      job.worker_pid           = 0;
+      job.worker_index         = -1;
+      job.data_sent            = false;
+      job.ready                = false;
+      job.claimed              = false;
+      job.payload_kind         = 0;
+      job.payload_file_path[0] = '\0';
       continue;
     }
 
@@ -434,7 +455,15 @@ void worker_process(int worker_id)
         cuopt::mps_parser::mps_data_model_t<int, double> mps_data;
         mip_solver_settings_t<int, double> settings;
 
-        if (serializer->deserialize_mip_request(request_data, mps_data, settings)) {
+        if (is_raw_mps) {
+          // Parse MPS from file path and solve with default settings (for now).
+          mps_data      = cuopt::mps_parser::parse_mps<int, double>(raw_mps_path, false);
+          auto solution = solve_mip(&handle, mps_data, settings);
+          solution.to_host(handle.get_stream());
+          result_data = serializer->serialize_mip_solution(solution);
+          success     = true;
+          unlink(raw_mps_path.c_str());
+        } else if (serializer->deserialize_mip_request(request_data, mps_data, settings)) {
           auto solution = solve_mip(&handle, mps_data, settings);
           solution.to_host(handle.get_stream());
           result_data = serializer->serialize_mip_solution(solution);
@@ -446,7 +475,21 @@ void worker_process(int worker_id)
         cuopt::mps_parser::mps_data_model_t<int, double> mps_data;
         pdlp_solver_settings_t<int, double> settings;
 
-        if (serializer->deserialize_lp_request(request_data, mps_data, settings)) {
+        if (is_raw_mps) {
+          // Parse MPS from file path and solve with default settings (for now).
+          mps_data         = cuopt::mps_parser::parse_mps<int, double>(raw_mps_path, false);
+          const char* msg1 = "[Worker] Calling solve_lp (raw MPS)...\n";
+          write(STDOUT_FILENO, msg1, strlen(msg1));
+          fsync(STDOUT_FILENO);
+          auto solution    = solve_lp(&handle, mps_data, settings);
+          const char* msg2 = "[Worker] solve_lp done (raw MPS)\n";
+          write(STDOUT_FILENO, msg2, strlen(msg2));
+          fsync(STDOUT_FILENO);
+          solution.to_host(handle.get_stream());
+          result_data = serializer->serialize_lp_solution(solution);
+          success     = true;
+          unlink(raw_mps_path.c_str());
+        } else if (serializer->deserialize_lp_request(request_data, mps_data, settings)) {
           const char* msg1 = "[Worker] Calling solve_lp via write()...\n";
           write(STDOUT_FILENO, msg1, strlen(msg1));
           fsync(STDOUT_FILENO);
@@ -576,12 +619,14 @@ void worker_process(int worker_id)
     }
 
     // Clear job slot
-    job.worker_pid   = 0;
-    job.worker_index = -1;
-    job.data_sent    = false;
-    job.ready        = false;
-    job.claimed      = false;
-    job.cancelled    = false;
+    job.worker_pid           = 0;
+    job.worker_index         = -1;
+    job.data_sent            = false;
+    job.ready                = false;
+    job.claimed              = false;
+    job.cancelled            = false;
+    job.payload_kind         = 0;
+    job.payload_file_path[0] = '\0';
 
     std::cout << "[Worker " << worker_id << "] Completed job: " << job_id
               << " (success: " << success << ")\n";
@@ -784,6 +829,9 @@ void mark_worker_jobs_failed(pid_t dead_worker_pid)
             pending_job_files.erase(itf);
           }
         }
+        if (job_queue[i].payload_kind == 1 && job_queue[i].payload_file_path[0] != '\0') {
+          unlink(job_queue[i].payload_file_path);
+        }
       } else {
         // SHM mode: cleanup job input shm (worker may not have done it)
         cleanup_job_shm(job_queue[i].shm_data_name);
@@ -947,6 +995,13 @@ void result_retrieval_thread()
                 job_queue[i].cancelled = true;
               }
               found = true;
+              continue;
+            }
+
+            // Raw MPS payloads are file paths that workers read directly; nothing to send.
+            if (job_queue[i].payload_kind == 1) {
+              job_queue[i].data_sent = true;
+              found                  = true;
               continue;
             }
 
@@ -1568,8 +1623,11 @@ void delete_log_file(const std::string& job_id)
 
 void delete_upload_file(const std::string& upload_id)
 {
-  std::string f = get_upload_file_path(upload_id);
-  unlink(f.c_str());
+  // Uploads may be stored as either ".bin" (protobuf payload) or ".bin.mps" (raw MPS payload).
+  std::string f0 = get_upload_file_path(upload_id);
+  unlink(f0.c_str());
+  std::string f1 = f0 + ".mps";
+  unlink(f1.c_str());
 }
 
 // Delete job
@@ -1638,11 +1696,10 @@ int cancel_job(const std::string& job_id, JobStatus& job_status_out, std::string
           std::cout << "[Server] Cancelling running job " << job_id << " (killing worker "
                     << worker_pid << ")\n";
         }
-        kill(worker_pid, SIGKILL);
-        // The worker monitor thread will detect the dead worker, restart it,
-        // and mark_worker_jobs_failed will be called. But we want CANCELLED not FAILED.
-        // So we mark it as cancelled here first.
+        // Mark cancelled BEFORE killing so the worker monitor path (mark_worker_jobs_failed)
+        // reliably observes was_cancelled=true and reports CANCELLED rather than FAILED.
         job_queue[i].cancelled = true;
+        kill(worker_pid, SIGKILL);
       } else {
         // Job is queued but not yet claimed - mark as cancelled
         if (config.verbose) { std::cout << "[Server] Cancelling queued job " << job_id << "\n"; }
@@ -1785,8 +1842,10 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
 
     // Initialize job queue entry
     strncpy(job_queue[job_idx].job_id, job_id.c_str(), sizeof(job_queue[job_idx].job_id) - 1);
-    job_queue[job_idx].problem_type = is_lp ? 0 : 1;
-    job_queue[job_idx].data_size    = job_data.size();
+    job_queue[job_idx].problem_type         = is_lp ? 0 : 1;
+    job_queue[job_idx].data_size            = job_data.size();
+    job_queue[job_idx].payload_kind         = 0;
+    job_queue[job_idx].payload_file_path[0] = '\0';
     // `claimed` currently true as a reservation; keep it until the entry is fully initialized.
     job_queue[job_idx].cancelled.store(false);
     job_queue[job_idx].worker_index.store(-1);
@@ -1852,7 +1911,9 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
     const auto& start       = in.start();
     std::string upload_id   = start.upload_id().empty() ? generate_job_id() : start.upload_id();
     bool is_mip             = (start.problem_type() == cuopt::remote::MIP);
+    const bool raw_mps      = start.raw_mps();
     std::string upload_path = get_upload_file_path(upload_id);
+    if (raw_mps) { upload_path += ".mps"; }
 
     // Open file (append if resume, else truncate).
     int flags = O_CREAT | O_WRONLY;
@@ -1918,6 +1979,14 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
           committed += static_cast<int64_t>(data.size());
         }
 
+        // Light progress logging for large uploads
+        if (config.verbose &&
+            (committed % (256LL * 1024 * 1024) < static_cast<int64_t>(data.size()))) {
+          std::cout << "[gRPC] Upload progress upload_id=" << upload_id
+                    << " committed=" << committed << " bytes\n";
+          std::cout.flush();
+        }
+
         out.Clear();
         out.mutable_ack()->set_upload_id(upload_id);
         out.mutable_ack()->set_committed_size(committed);
@@ -1976,13 +2045,21 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
 
     strncpy(job_queue[job_idx].job_id, job_id.c_str(), sizeof(job_queue[job_idx].job_id) - 1);
     job_queue[job_idx].problem_type = is_mip ? 1 : 0;
-    job_queue[job_idx].data_size    = static_cast<uint64_t>(committed);
+    job_queue[job_idx].data_size    = raw_mps ? 0 : static_cast<uint64_t>(committed);
     job_queue[job_idx].cancelled.store(false);
     job_queue[job_idx].worker_index.store(-1);
-    job_queue[job_idx].data_sent.store(false);
+    job_queue[job_idx].data_sent.store(raw_mps ? true : false);
     job_queue[job_idx].shm_data_name[0] = '\0';
+    job_queue[job_idx].payload_kind     = raw_mps ? 1 : 0;
+    if (raw_mps) {
+      strncpy(job_queue[job_idx].payload_file_path,
+              upload_path.c_str(),
+              sizeof(job_queue[job_idx].payload_file_path) - 1);
+    } else {
+      job_queue[job_idx].payload_file_path[0] = '\0';
+    }
 
-    {
+    if (!raw_mps) {
       std::lock_guard<std::mutex> lock(pending_files_mutex);
       pending_job_files[job_id] = PendingJobFile{upload_path, static_cast<uint64_t>(committed)};
     }
@@ -2015,43 +2092,23 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
                      const cuopt::remote::StatusRequest* request,
                      cuopt::remote::StatusResponse* response) override
   {
+    (void)context;
     std::string job_id = request->job_id();
 
-    std::lock_guard<std::mutex> lock(tracker_mutex);
-    auto it = job_tracker.find(job_id);
+    // Use shared-memory job queue state to expose PROCESSING when a worker claims the job.
+    // This enables reliable mid-solve cancellation tests.
+    std::string message;
+    JobStatus status = check_job_status(job_id, message);
 
-    if (it == job_tracker.end()) {
-      response->set_job_status(cuopt::remote::NOT_FOUND);
-      response->set_message("Job not found");
-      return Status::OK;
+    switch (status) {
+      case JobStatus::QUEUED: response->set_job_status(cuopt::remote::QUEUED); break;
+      case JobStatus::PROCESSING: response->set_job_status(cuopt::remote::PROCESSING); break;
+      case JobStatus::COMPLETED: response->set_job_status(cuopt::remote::COMPLETED); break;
+      case JobStatus::FAILED: response->set_job_status(cuopt::remote::FAILED); break;
+      case JobStatus::CANCELLED: response->set_job_status(cuopt::remote::CANCELLED); break;
+      default: response->set_job_status(cuopt::remote::NOT_FOUND); break;
     }
-
-    // Map internal status to protobuf status
-    switch (it->second.status) {
-      case JobStatus::QUEUED:
-        response->set_job_status(cuopt::remote::QUEUED);
-        response->set_message("Job queued");
-        break;
-      case JobStatus::PROCESSING:
-        response->set_job_status(cuopt::remote::PROCESSING);
-        response->set_message("Job processing");
-        break;
-      case JobStatus::COMPLETED:
-        response->set_job_status(cuopt::remote::COMPLETED);
-        response->set_message("Job completed");
-        break;
-      case JobStatus::FAILED:
-        response->set_job_status(cuopt::remote::FAILED);
-        response->set_message(it->second.error_message);
-        break;
-      case JobStatus::CANCELLED:
-        response->set_job_status(cuopt::remote::CANCELLED);
-        response->set_message("Job cancelled");
-        break;
-      default:
-        response->set_job_status(cuopt::remote::NOT_FOUND);
-        response->set_message("Unknown status");
-    }
+    response->set_message(message);
 
     return Status::OK;
   }
@@ -2124,7 +2181,44 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
                    const cuopt::remote::CancelRequest* request,
                    cuopt::remote::CancelResponse* response) override
   {
-    return Status(StatusCode::UNIMPLEMENTED, "CancelJob not yet implemented");
+    (void)context;
+    std::string job_id = request->job_id();
+
+    JobStatus internal_status = JobStatus::NOT_FOUND;
+    std::string message;
+    int rc = cancel_job(job_id, internal_status, message);
+
+    // Map internal status -> protobuf JobStatus
+    cuopt::remote::JobStatus pb_status = cuopt::remote::NOT_FOUND;
+    switch (internal_status) {
+      case JobStatus::QUEUED: pb_status = cuopt::remote::QUEUED; break;
+      case JobStatus::PROCESSING: pb_status = cuopt::remote::PROCESSING; break;
+      case JobStatus::COMPLETED: pb_status = cuopt::remote::COMPLETED; break;
+      case JobStatus::FAILED: pb_status = cuopt::remote::FAILED; break;
+      case JobStatus::CANCELLED: pb_status = cuopt::remote::CANCELLED; break;
+      case JobStatus::NOT_FOUND: pb_status = cuopt::remote::NOT_FOUND; break;
+    }
+
+    response->set_job_status(pb_status);
+    response->set_message(message);
+
+    // Map rc -> ResponseStatus for backward-compatible response payload.
+    // (We still return gRPC Status::OK; clients should check fields.)
+    if (rc == 0 || rc == 3) {
+      response->set_status(cuopt::remote::SUCCESS);
+    } else if (rc == 1) {
+      response->set_status(cuopt::remote::ERROR_NOT_FOUND);
+    } else {
+      response->set_status(cuopt::remote::ERROR_INVALID_REQUEST);
+    }
+
+    if (config.verbose) {
+      std::cout << "[gRPC] CancelJob job_id=" << job_id << " rc=" << rc
+                << " status=" << static_cast<int>(pb_status) << " msg=" << message << "\n";
+      std::cout.flush();
+    }
+
+    return Status::OK;
   }
 
   Status WaitForResult(ServerContext* context,
@@ -2299,6 +2393,7 @@ int main(int argc, char** argv)
     job_queue[i].claimed.store(false);
     job_queue[i].cancelled.store(false);
     job_queue[i].worker_index.store(-1);
+    job_queue[i].payload_kind = 0;
   }
 
   for (size_t i = 0; i < MAX_RESULTS; ++i) {

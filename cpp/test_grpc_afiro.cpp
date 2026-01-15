@@ -31,6 +31,99 @@ class CuOptGrpcClient {
  public:
   CuOptGrpcClient(std::shared_ptr<Channel> channel) : stub_(CuOptRemoteService::NewStub(channel)) {}
 
+  std::string UploadAndSubmitRawMpsLP(const std::string& mps_path)
+  {
+    std::ifstream f(mps_path, std::ios::binary);
+    if (!f) {
+      std::cerr << "[Client] Failed to open MPS file: " << mps_path << std::endl;
+      return "";
+    }
+
+    ClientContext context;
+    std::unique_ptr<ClientReaderWriter<UploadJobRequest, UploadJobResponse>> stream =
+      stub_->UploadAndSubmit(&context);
+
+    UploadJobRequest req;
+    auto* start = req.mutable_start();
+    start->set_problem_type(LP);
+    start->set_resume(false);
+    start->set_raw_mps(true);
+    start->set_original_filename(mps_path);
+
+    if (!stream->Write(req)) {
+      std::cerr << "[Client] UploadAndSubmit(raw_mps): failed to write start" << std::endl;
+      return "";
+    }
+
+    UploadJobResponse resp;
+    if (!stream->Read(&resp) || !resp.has_ack()) {
+      std::cerr << "[Client] UploadAndSubmit(raw_mps): missing ack after start" << std::endl;
+      return "";
+    }
+
+    const std::string upload_id = resp.ack().upload_id();
+    int64_t committed           = resp.ack().committed_size();
+
+    const size_t chunk_size = 1 << 20;  // 1 MiB
+    std::vector<char> buf(chunk_size);
+    int64_t total_sent = committed;
+
+    while (true) {
+      f.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+      std::streamsize n = f.gcount();
+      if (n <= 0) { break; }
+
+      req.Clear();
+      auto* chunk = req.mutable_chunk();
+      chunk->set_upload_id(upload_id);
+      chunk->set_offset(committed);
+      chunk->set_data(buf.data(), static_cast<size_t>(n));
+
+      if (!stream->Write(req)) {
+        std::cerr << "[Client] UploadAndSubmit(raw_mps): failed to write chunk at offset "
+                  << committed << std::endl;
+        return "";
+      }
+      if (!stream->Read(&resp) || !resp.has_ack()) {
+        std::cerr << "[Client] UploadAndSubmit(raw_mps): missing ack after chunk" << std::endl;
+        return "";
+      }
+
+      committed  = resp.ack().committed_size();
+      total_sent = committed;
+      if ((total_sent % (256LL * 1024 * 1024)) < static_cast<int64_t>(n)) {
+        std::cout << "[Client] Upload progress: " << total_sent << " bytes" << std::endl;
+      }
+    }
+
+    req.Clear();
+    req.mutable_finish()->set_upload_id(upload_id);
+    stream->Write(req);
+    stream->WritesDone();
+
+    std::string job_id;
+    while (stream->Read(&resp)) {
+      if (resp.has_submit()) {
+        job_id = resp.submit().job_id();
+        break;
+      }
+      if (resp.has_error()) {
+        std::cerr << "[Client] UploadAndSubmit(raw_mps) error: " << resp.error().message()
+                  << " committed=" << resp.error().committed_size() << std::endl;
+        break;
+      }
+    }
+
+    Status status = stream->Finish();
+    if (!status.ok()) {
+      std::cerr << "[Client] UploadAndSubmit(raw_mps) RPC failed: " << status.error_message()
+                << std::endl;
+      return "";
+    }
+
+    return job_id;
+  }
+
   std::string UploadAndSubmitLP(const SolveLPRequest& lp_request)
   {
     const size_t size = lp_request.ByteSizeLong();
@@ -120,6 +213,15 @@ class CuOptGrpcClient {
 
   std::string SubmitMpsFile(const std::string& mps_file_path)
   {
+    // If the MPS is huge, prefer streaming the raw MPS file to the server and parsing there.
+    // This avoids building a multi-GB protobuf message in client memory.
+    if (mps_file_path.find("L2CTA3D.mps") != std::string::npos) {
+      std::cout << "[Client] Using raw MPS streaming mode for: " << mps_file_path << std::endl;
+      std::string job_id = UploadAndSubmitRawMpsLP(mps_file_path);
+      if (!job_id.empty()) { return job_id; }
+      std::cerr << "[Client] Raw MPS upload failed; falling back to protobuf path" << std::endl;
+    }
+
     // Parse MPS file
     std::cout << "[Client] Parsing MPS file: " << mps_file_path << std::endl;
 

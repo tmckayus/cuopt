@@ -92,6 +92,13 @@ message UploadStart {
 
   // Optional total payload size hint (bytes). Can be 0 if unknown.
   int64 total_size = 4;
+
+  // If true, the uploaded payload bytes are a raw MPS file (text/binary) rather than a serialized
+  // SolveLPRequest/SolveMIPRequest protobuf. The worker will parse the MPS from the saved file.
+  bool raw_mps = 5;
+
+  // Optional original filename (used for logging/extension).
+  string original_filename = 6;
 }
 
 message UploadChunk {
