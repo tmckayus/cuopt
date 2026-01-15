@@ -1018,7 +1018,13 @@ class protobuf_serializer_t : public remote_serializer_t<i_t, f_t> {
 
     // Limits
     pb_settings->set_time_limit(settings.time_limit);
-    pb_settings->set_iteration_limit(static_cast<int64_t>(settings.iteration_limit));
+    // Avoid emitting a huge number when the iteration limit is the library default.
+    // Use -1 sentinel for "unset/use server defaults".
+    if (settings.iteration_limit == std::numeric_limits<i_t>::max()) {
+      pb_settings->set_iteration_limit(-1);
+    } else {
+      pb_settings->set_iteration_limit(static_cast<int64_t>(settings.iteration_limit));
+    }
 
     // Solver configuration
     pb_settings->set_log_to_console(settings.log_to_console);
@@ -1189,8 +1195,12 @@ class protobuf_serializer_t : public remote_serializer_t<i_t, f_t> {
     settings.tolerances.relative_primal_tolerance   = pb_settings.relative_primal_tolerance();
 
     // Limits
-    settings.time_limit      = pb_settings.time_limit();
-    settings.iteration_limit = static_cast<i_t>(pb_settings.iteration_limit());
+    settings.time_limit = pb_settings.time_limit();
+    // proto3 defaults numeric fields to 0; treat negative iteration_limit as "unset"
+    // so the server keeps the library default (typically max()).
+    if (pb_settings.iteration_limit() >= 0) {
+      settings.iteration_limit = static_cast<i_t>(pb_settings.iteration_limit());
+    }
 
     // Solver configuration
     settings.log_to_console       = pb_settings.log_to_console();

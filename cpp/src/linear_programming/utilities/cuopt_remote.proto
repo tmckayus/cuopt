@@ -103,6 +103,9 @@ message PDLPSolverSettings {
 
   // Limits
   double time_limit = 10;
+  // Iteration limit. Sentinel: set to -1 to mean "unset/use server defaults".
+  // Note: proto3 numeric fields default to 0 when omitted, so clients should
+  // explicitly use -1 (or a positive value) to avoid accidentally requesting 0 iterations.
   int64 iteration_limit = 11;
 
   // Solver configuration
