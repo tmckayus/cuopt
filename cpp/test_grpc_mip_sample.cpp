@@ -15,6 +15,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <grpcpp/grpcpp.h>
 #include "cuopt_remote_service.grpc.pb.h"
@@ -23,6 +24,7 @@
 
 using grpc::Channel;
 using grpc::ClientContext;
+using grpc::ClientReaderWriter;
 using grpc::Status;
 
 using namespace cuopt::remote;
@@ -32,6 +34,93 @@ class CuOptGrpcMipClient {
   explicit CuOptGrpcMipClient(std::shared_ptr<Channel> channel)
     : stub_(CuOptRemoteService::NewStub(std::move(channel)))
   {
+  }
+
+  std::string UploadAndSubmitMIP(const SolveMIPRequest& mip_request)
+  {
+    const size_t size = mip_request.ByteSizeLong();
+    std::vector<uint8_t> bytes(size);
+    if (!mip_request.SerializeToArray(bytes.data(), size)) {
+      std::cerr << "[Client] Failed to serialize SolveMIPRequest for upload" << std::endl;
+      return "";
+    }
+
+    ClientContext context;
+    std::unique_ptr<ClientReaderWriter<UploadJobRequest, UploadJobResponse>> stream =
+      stub_->UploadAndSubmit(&context);
+
+    UploadJobRequest req;
+    auto* start = req.mutable_start();
+    start->set_problem_type(MIP);
+    start->set_resume(false);
+    start->set_total_size(static_cast<int64_t>(bytes.size()));
+
+    if (!stream->Write(req)) {
+      std::cerr << "[Client] UploadAndSubmit: failed to write start" << std::endl;
+      return "";
+    }
+
+    UploadJobResponse resp;
+    if (!stream->Read(&resp) || !resp.has_ack()) {
+      std::cerr << "[Client] UploadAndSubmit: missing ack after start" << std::endl;
+      return "";
+    }
+
+    const std::string upload_id = resp.ack().upload_id();
+    int64_t committed           = resp.ack().committed_size();
+
+    const size_t chunk_size = 1 << 20;  // 1 MiB
+    while (static_cast<size_t>(committed) < bytes.size()) {
+      const size_t offset = static_cast<size_t>(committed);
+      size_t n            = bytes.size() - offset;
+      if (n > chunk_size) { n = chunk_size; }
+
+      req.Clear();
+      auto* chunk = req.mutable_chunk();
+      chunk->set_upload_id(upload_id);
+      chunk->set_offset(committed);
+      chunk->set_data(reinterpret_cast<const char*>(bytes.data() + offset), n);
+
+      if (!stream->Write(req)) {
+        std::cerr << "[Client] UploadAndSubmit: failed to write chunk at offset " << committed
+                  << std::endl;
+        return "";
+      }
+
+      resp.Clear();
+      if (!stream->Read(&resp) || !resp.has_ack()) {
+        std::cerr << "[Client] UploadAndSubmit: missing ack after chunk" << std::endl;
+        return "";
+      }
+
+      committed = resp.ack().committed_size();
+    }
+
+    req.Clear();
+    req.mutable_finish()->set_upload_id(upload_id);
+    stream->Write(req);
+    stream->WritesDone();
+
+    std::string job_id;
+    while (stream->Read(&resp)) {
+      if (resp.has_submit()) {
+        job_id = resp.submit().job_id();
+        break;
+      }
+      if (resp.has_error()) {
+        std::cerr << "[Client] UploadAndSubmit error: " << resp.error().message()
+                  << " committed=" << resp.error().committed_size() << std::endl;
+        break;
+      }
+    }
+
+    Status status = stream->Finish();
+    if (!status.ok()) {
+      std::cerr << "[Client] UploadAndSubmit RPC failed: " << status.error_message() << std::endl;
+      return "";
+    }
+
+    return job_id;
   }
 
   std::string SubmitMpsFileAsMip(const std::string& mps_file_path, double time_limit_s)
@@ -135,16 +224,14 @@ class CuOptGrpcMipClient {
     std::cout << "[Client] Prepared SolveMIPRequest: bytes=" << mip_request->ByteSizeLong()
               << " time_limit=" << settings->time_limit() << std::endl;
 
-    SubmitJobResponse response;
-    ClientContext context;
-    Status status = stub_->SubmitJob(&context, request, &response);
-    if (!status.ok()) {
-      std::cerr << "[Client] SubmitJob RPC failed: " << status.error_message() << std::endl;
+    std::cout << "[Client] Uploading + submitting job (streaming)..." << std::endl;
+    std::string job_id = UploadAndSubmitMIP(*mip_request);
+    if (job_id.empty()) {
+      std::cerr << "[Client] UploadAndSubmit failed" << std::endl;
       return "";
     }
-
-    std::cout << "[Client] Job submitted. Job ID: " << response.job_id() << std::endl;
-    return response.job_id();
+    std::cout << "[Client] Job submitted. Job ID: " << job_id << std::endl;
+    return job_id;
   }
 
   bool CheckCompleted(const std::string& job_id)

@@ -54,6 +54,7 @@
 using grpc::Server;
 using grpc::ServerBuilder;
 using grpc::ServerContext;
+using grpc::ServerReaderWriter;
 using grpc::ServerWriter;
 using grpc::Status;
 using grpc::StatusCode;
@@ -169,6 +170,15 @@ std::vector<WorkerPipes> worker_pipes;
 std::mutex pending_data_mutex;
 std::map<std::string, std::vector<uint8_t>> pending_job_data;
 
+// Large payloads uploaded via gRPC streaming are spooled to disk to avoid
+// holding multi-GB request buffers in the server process.
+struct PendingJobFile {
+  std::string path;
+  uint64_t size_bytes{};
+};
+std::mutex pending_files_mutex;
+std::map<std::string, PendingJobFile> pending_job_files;
+
 const char* SHM_JOB_QUEUE    = "/cuopt_job_queue";
 const char* SHM_RESULT_QUEUE = "/cuopt_result_queue";
 const char* SHM_CONTROL      = "/cuopt_control";
@@ -177,6 +187,12 @@ const std::string LOG_DIR = "/tmp/cuopt_logs";
 inline std::string get_log_file_path(const std::string& job_id)
 {
   return LOG_DIR + "/job_" + job_id + ".log";
+}
+
+const std::string UPLOAD_DIR = "/tmp/cuopt_uploads";
+inline std::string get_upload_file_path(const std::string& upload_id)
+{
+  return UPLOAD_DIR + "/upload_" + upload_id + ".bin";
 }
 
 // ============================================================================
@@ -200,6 +216,8 @@ void signal_handler(int signal)
 std::string generate_job_id();
 void ensure_log_dir_exists();
 void delete_log_file(const std::string& job_id);
+void ensure_upload_dir_exists();
+void delete_upload_file(const std::string& upload_id);
 void cleanup_shared_memory();
 void spawn_workers();
 void wait_for_workers();
@@ -210,6 +228,9 @@ void result_retrieval_thread();
 static bool write_to_pipe(int fd, const void* data, size_t size);
 static bool read_from_pipe(int fd, void* data, size_t size, int timeout_ms = 120000);
 static bool send_job_data_pipe(int worker_idx, const std::vector<uint8_t>& data);
+static bool send_job_data_pipe_file(int worker_idx,
+                                    const std::string& path,
+                                    uint64_t expected_size);
 static bool recv_job_data_pipe(int fd, uint64_t expected_size, std::vector<uint8_t>& data);
 static bool send_result_pipe(int fd, const std::vector<uint8_t>& data);
 static bool recv_result_pipe(int worker_idx, uint64_t expected_size, std::vector<uint8_t>& data);
@@ -751,8 +772,18 @@ void mark_worker_jobs_failed(pid_t dead_worker_pid)
       // Cleanup job data
       if (config.use_pipes) {
         // Pipe mode: remove from pending data if not yet sent
-        std::lock_guard<std::mutex> lock(pending_data_mutex);
-        pending_job_data.erase(job_id);
+        {
+          std::lock_guard<std::mutex> lock(pending_data_mutex);
+          pending_job_data.erase(job_id);
+        }
+        {
+          std::lock_guard<std::mutex> lock(pending_files_mutex);
+          auto itf = pending_job_files.find(job_id);
+          if (itf != pending_job_files.end()) {
+            unlink(itf->second.path.c_str());
+            pending_job_files.erase(itf);
+          }
+        }
       } else {
         // SHM mode: cleanup job input shm (worker may not have done it)
         cleanup_job_shm(job_queue[i].shm_data_name);
@@ -886,6 +917,39 @@ void result_retrieval_thread()
           std::cout.flush();
 
           if (worker_idx >= 0) {
+            // Prefer file-backed payloads (streaming upload).
+            PendingJobFile pending_file;
+            bool have_file = false;
+            {
+              std::lock_guard<std::mutex> lock(pending_files_mutex);
+              auto itf = pending_job_files.find(job_id);
+              if (itf != pending_job_files.end()) {
+                pending_file = itf->second;
+                pending_job_files.erase(itf);
+                have_file = true;
+              }
+            }
+
+            if (have_file) {
+              if (config.verbose) {
+                std::cout << "[Server] Sending file-backed payload to worker " << worker_idx
+                          << " for job " << job_id << " size=" << pending_file.size_bytes << "\n";
+                std::cout.flush();
+              }
+              bool ok =
+                send_job_data_pipe_file(worker_idx, pending_file.path, pending_file.size_bytes);
+              unlink(pending_file.path.c_str());  // best-effort cleanup
+              if (ok) {
+                job_queue[i].data_sent = true;
+              } else {
+                std::cerr << "[Server] Failed to send file-backed payload to worker " << worker_idx
+                          << "\n";
+                job_queue[i].cancelled = true;
+              }
+              found = true;
+              continue;
+            }
+
             // Get pending job data
             std::vector<uint8_t> job_data;
             {
@@ -1181,6 +1245,58 @@ static bool send_job_data_pipe(int worker_idx, const std::vector<uint8_t>& data)
   return true;
 }
 
+// Stream job data from a file to the worker via pipe (length-prefixed).
+// This avoids holding the entire job payload in server memory.
+static bool send_job_data_pipe_file(int worker_idx, const std::string& path, uint64_t expected_size)
+{
+  if (worker_idx < 0 || worker_idx >= static_cast<int>(worker_pipes.size())) { return false; }
+  int pipe_fd = worker_pipes[worker_idx].to_worker_fd;
+  if (pipe_fd < 0) return false;
+
+  int file_fd = open(path.c_str(), O_RDONLY);
+  if (file_fd < 0) {
+    std::cerr << "[Server] Failed to open payload file: " << path << " err=" << strerror(errno)
+              << "\n";
+    return false;
+  }
+
+  // Send size first (worker validates it against expected_size in shared memory).
+  uint64_t size = expected_size;
+  if (!write_to_pipe(pipe_fd, &size, sizeof(size))) {
+    close(file_fd);
+    return false;
+  }
+
+  std::vector<uint8_t> buf(1 << 20);  // 1 MiB
+  uint64_t remaining = size;
+  while (remaining > 0) {
+    size_t to_read = buf.size();
+    if (remaining < to_read) { to_read = static_cast<size_t>(remaining); }
+
+    ssize_t nread = ::read(file_fd, buf.data(), to_read);
+    if (nread < 0) {
+      if (errno == EINTR) continue;
+      std::cerr << "[Server] Failed reading payload file: " << path << " err=" << strerror(errno)
+                << "\n";
+      close(file_fd);
+      return false;
+    }
+    if (nread == 0) {
+      std::cerr << "[Server] Unexpected EOF reading payload file: " << path << "\n";
+      close(file_fd);
+      return false;
+    }
+    if (!write_to_pipe(pipe_fd, buf.data(), static_cast<size_t>(nread))) {
+      close(file_fd);
+      return false;
+    }
+    remaining -= static_cast<uint64_t>(nread);
+  }
+
+  close(file_fd);
+  return true;
+}
+
 // Receive job data from pipe (length-prefixed) - called by worker
 static bool recv_job_data_pipe(int fd, uint64_t expected_size, std::vector<uint8_t>& data)
 {
@@ -1437,11 +1553,23 @@ void ensure_log_dir_exists()
   if (stat(LOG_DIR.c_str(), &st) != 0) { mkdir(LOG_DIR.c_str(), 0755); }
 }
 
+void ensure_upload_dir_exists()
+{
+  struct stat st;
+  if (stat(UPLOAD_DIR.c_str(), &st) != 0) { mkdir(UPLOAD_DIR.c_str(), 0755); }
+}
+
 // Delete log file for a job
 void delete_log_file(const std::string& job_id)
 {
   std::string log_file = get_log_file_path(job_id);
   unlink(log_file.c_str());  // Ignore errors if file doesn't exist
+}
+
+void delete_upload_file(const std::string& upload_id)
+{
+  std::string f = get_upload_file_path(upload_id);
+  unlink(f.c_str());
 }
 
 // Delete job
@@ -1696,6 +1824,192 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
     return Status::OK;
   }
 
+  Status UploadAndSubmit(ServerContext* context,
+                         ServerReaderWriter<cuopt::remote::UploadJobResponse,
+                                            cuopt::remote::UploadJobRequest>* stream) override
+  {
+    (void)context;
+
+    if (!config.use_pipes) {
+      return Status(StatusCode::FAILED_PRECONDITION,
+                    "UploadAndSubmit currently requires pipe mode (do not use --use-shm)");
+    }
+
+    ensure_upload_dir_exists();
+
+    cuopt::remote::UploadJobRequest in;
+    cuopt::remote::UploadJobResponse out;
+
+    // First message must be UploadStart.
+    if (!stream->Read(&in) || !in.has_start()) {
+      out.mutable_error()->set_upload_id("");
+      out.mutable_error()->set_message("First message must be UploadStart");
+      out.mutable_error()->set_committed_size(0);
+      stream->Write(out);
+      return Status(StatusCode::INVALID_ARGUMENT, "Missing UploadStart");
+    }
+
+    const auto& start       = in.start();
+    std::string upload_id   = start.upload_id().empty() ? generate_job_id() : start.upload_id();
+    bool is_mip             = (start.problem_type() == cuopt::remote::MIP);
+    std::string upload_path = get_upload_file_path(upload_id);
+
+    // Open file (append if resume, else truncate).
+    int flags = O_CREAT | O_WRONLY;
+    flags |= start.resume() ? O_APPEND : O_TRUNC;
+    int fd = open(upload_path.c_str(), flags, 0644);
+    if (fd < 0) {
+      out.mutable_error()->set_upload_id(upload_id);
+      out.mutable_error()->set_message(std::string("Failed to open upload file: ") +
+                                       strerror(errno));
+      out.mutable_error()->set_committed_size(0);
+      stream->Write(out);
+      return Status(StatusCode::INTERNAL, "Failed to open upload file");
+    }
+
+    int64_t committed = 0;
+    if (start.resume()) {
+      struct stat st;
+      if (stat(upload_path.c_str(), &st) == 0) { committed = static_cast<int64_t>(st.st_size); }
+    }
+
+    // Ack start with committed size (resume point).
+    out.Clear();
+    out.mutable_ack()->set_upload_id(upload_id);
+    out.mutable_ack()->set_committed_size(committed);
+    stream->Write(out);
+
+    // Read chunks until finish.
+    while (stream->Read(&in)) {
+      if (in.has_chunk()) {
+        const auto& ch = in.chunk();
+        if (ch.upload_id() != upload_id) {
+          out.Clear();
+          out.mutable_error()->set_upload_id(upload_id);
+          out.mutable_error()->set_message("upload_id mismatch");
+          out.mutable_error()->set_committed_size(committed);
+          stream->Write(out);
+          close(fd);
+          delete_upload_file(upload_id);
+          return Status(StatusCode::INVALID_ARGUMENT, "upload_id mismatch");
+        }
+        if (ch.offset() != committed) {
+          out.Clear();
+          out.mutable_error()->set_upload_id(upload_id);
+          out.mutable_error()->set_message("Non-sequential chunk offset");
+          out.mutable_error()->set_committed_size(committed);
+          stream->Write(out);
+          close(fd);
+          return Status(StatusCode::OUT_OF_RANGE, "Non-sequential chunk offset");
+        }
+
+        const std::string& data = ch.data();
+        if (!data.empty()) {
+          if (!write_to_pipe(fd, data.data(), data.size())) {
+            out.Clear();
+            out.mutable_error()->set_upload_id(upload_id);
+            out.mutable_error()->set_message("Failed to write chunk to disk");
+            out.mutable_error()->set_committed_size(committed);
+            stream->Write(out);
+            close(fd);
+            delete_upload_file(upload_id);
+            return Status(StatusCode::INTERNAL, "Failed to write chunk");
+          }
+          committed += static_cast<int64_t>(data.size());
+        }
+
+        out.Clear();
+        out.mutable_ack()->set_upload_id(upload_id);
+        out.mutable_ack()->set_committed_size(committed);
+        stream->Write(out);
+        continue;
+      }
+
+      if (in.has_finish()) {
+        const auto& fin = in.finish();
+        if (fin.upload_id() != upload_id) {
+          out.Clear();
+          out.mutable_error()->set_upload_id(upload_id);
+          out.mutable_error()->set_message("upload_id mismatch on finish");
+          out.mutable_error()->set_committed_size(committed);
+          stream->Write(out);
+          close(fd);
+          delete_upload_file(upload_id);
+          return Status(StatusCode::INVALID_ARGUMENT, "upload_id mismatch on finish");
+        }
+        break;
+      }
+
+      out.Clear();
+      out.mutable_error()->set_upload_id(upload_id);
+      out.mutable_error()->set_message("Unexpected message type during upload");
+      out.mutable_error()->set_committed_size(committed);
+      stream->Write(out);
+      close(fd);
+      delete_upload_file(upload_id);
+      return Status(StatusCode::INVALID_ARGUMENT, "Unexpected message type");
+    }
+
+    close(fd);
+
+    // Enqueue job using file-backed payload
+    std::string job_id = generate_job_id();
+
+    int job_idx = -1;
+    for (size_t i = 0; i < MAX_JOBS; ++i) {
+      if (job_queue[i].ready.load()) { continue; }
+      bool expected_claimed = false;
+      if (job_queue[i].claimed.compare_exchange_strong(expected_claimed, true)) {
+        job_idx = static_cast<int>(i);
+        break;
+      }
+    }
+    if (job_idx < 0) {
+      out.Clear();
+      out.mutable_error()->set_upload_id(upload_id);
+      out.mutable_error()->set_message("Job queue full");
+      out.mutable_error()->set_committed_size(committed);
+      stream->Write(out);
+      delete_upload_file(upload_id);
+      return Status(StatusCode::RESOURCE_EXHAUSTED, "Job queue full");
+    }
+
+    strncpy(job_queue[job_idx].job_id, job_id.c_str(), sizeof(job_queue[job_idx].job_id) - 1);
+    job_queue[job_idx].problem_type = is_mip ? 1 : 0;
+    job_queue[job_idx].data_size    = static_cast<uint64_t>(committed);
+    job_queue[job_idx].cancelled.store(false);
+    job_queue[job_idx].worker_index.store(-1);
+    job_queue[job_idx].data_sent.store(false);
+    job_queue[job_idx].shm_data_name[0] = '\0';
+
+    {
+      std::lock_guard<std::mutex> lock(pending_files_mutex);
+      pending_job_files[job_id] = PendingJobFile{upload_path, static_cast<uint64_t>(committed)};
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(tracker_mutex);
+      job_tracker[job_id] =
+        JobInfo{job_id, JobStatus::QUEUED, std::chrono::steady_clock::now(), {}, is_mip, "", false};
+    }
+
+    job_queue[job_idx].claimed.store(false);
+    job_queue[job_idx].ready.store(true);
+
+    out.Clear();
+    out.mutable_submit()->set_job_id(job_id);
+    out.mutable_submit()->set_message("Job submitted successfully");
+    stream->Write(out);
+
+    if (config.verbose) {
+      std::cout << "[gRPC] UploadAndSubmit enqueued job: " << job_id
+                << " (type=" << (is_mip ? "MIP" : "LP") << ", bytes=" << committed << ")\n";
+      std::cout.flush();
+    }
+
+    return Status::OK;
+  }
+
   // CheckStatus - Check job status
   Status CheckStatus(ServerContext* context,
                      const cuopt::remote::StatusRequest* request,
@@ -1896,6 +2210,7 @@ int main(int argc, char** argv)
 
   // Create log directory
   ensure_log_dir_exists();
+  ensure_upload_dir_exists();
 
   std::cerr << "[DEBUG] About to initialize shared memory" << std::endl;
   std::cerr.flush();

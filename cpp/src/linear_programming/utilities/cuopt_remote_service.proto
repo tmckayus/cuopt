@@ -20,6 +20,13 @@ service CuOptRemoteService {
   // Submit a new LP or MIP solve job (returns immediately with job_id)
   rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
 
+  // Upload a serialized SolveLPRequest / SolveMIPRequest payload in chunks (streaming),
+  // then submit it as a job.
+  //
+  // This avoids gRPC unary message size limits and allows resumable uploads via
+  // explicit offsets/acks (client can reconnect and continue from committed_size).
+  rpc UploadAndSubmit(stream UploadJobRequest) returns (stream UploadJobResponse);
+
   // Check the status of a submitted job
   rpc CheckStatus(StatusRequest) returns (StatusResponse);
 
@@ -67,6 +74,68 @@ message SubmitJobRequest {
 message SubmitJobResponse {
   string job_id = 1;           // Unique job identifier
   string message = 2;          // Optional message
+}
+
+// =============================================================================
+// Streaming Upload (Chunked)
+// =============================================================================
+
+message UploadStart {
+  // Client-provided ID to support resume. If empty, server will generate one.
+  string upload_id = 1;
+
+  // Payload problem type (LP or MIP).
+  ProblemType problem_type = 2;
+
+  // If true, server will attempt to resume an existing upload_id (append).
+  bool resume = 3;
+
+  // Optional total payload size hint (bytes). Can be 0 if unknown.
+  int64 total_size = 4;
+}
+
+message UploadChunk {
+  // Must match upload_id from UploadStart.
+  string upload_id = 1;
+
+  // Byte offset of this chunk in the overall payload. Server currently requires
+  // strictly sequential appends: offset must equal the server's committed_size.
+  int64 offset = 2;
+
+  // Raw bytes of the serialized SolveLPRequest / SolveMIPRequest.
+  bytes data = 3;
+}
+
+message UploadFinish {
+  // Must match upload_id from UploadStart.
+  string upload_id = 1;
+}
+
+message UploadJobRequest {
+  oneof msg {
+    UploadStart start = 1;
+    UploadChunk chunk = 2;
+    UploadFinish finish = 3;
+  }
+}
+
+message UploadAck {
+  string upload_id = 1;
+  int64 committed_size = 2;
+}
+
+message UploadError {
+  string upload_id = 1;
+  string message = 2;
+  int64 committed_size = 3;
+}
+
+message UploadJobResponse {
+  oneof msg {
+    UploadAck ack = 1;
+    SubmitJobResponse submit = 2;
+    UploadError error = 3;
+  }
 }
 
 // Request to check job status
