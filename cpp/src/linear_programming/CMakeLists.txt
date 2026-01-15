@@ -28,6 +28,13 @@ set(LP_CORE_FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/termination_strategy/convergence_information.cu
 )
 
+# gRPC remote solve transport (host-only). Only build when gRPC is enabled.
+if(CUOPT_ENABLE_GRPC)
+  list(APPEND LP_CORE_FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/utilities/remote_solve_grpc.cpp
+  )
+endif()
+
 # C and Python adapter files
 set(LP_ADAPTER_FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/utilities/cython_solve.cu

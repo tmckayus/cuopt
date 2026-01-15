@@ -8,6 +8,10 @@
 #include <cuopt/linear_programming/utilities/remote_solve.hpp>
 #include <utilities/logger.hpp>
 
+#if CUOPT_ENABLE_GRPC
+#include "remote_solve_grpc.hpp"
+#endif
+
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -34,6 +38,17 @@ static bool use_sync_mode()
 {
   const char* sync_env = std::getenv("CUOPT_REMOTE_USE_SYNC");
   return (sync_env != nullptr && std::string(sync_env) == "1");
+}
+
+static bool use_grpc_transport()
+{
+#if CUOPT_ENABLE_GRPC
+  const char* transport = std::getenv("CUOPT_REMOTE_TRANSPORT");
+  if (transport != nullptr && std::string(transport) == "socket") { return false; }
+  return true;
+#else
+  return false;
+#endif
 }
 
 /**
@@ -443,11 +458,13 @@ optimization_problem_solution_t<i_t, f_t> solve_lp_remote(
   const pdlp_solver_settings_t<i_t, f_t>& settings)
 {
   const bool sync_mode = use_sync_mode();
+  const bool grpc_mode = use_grpc_transport();
 
-  CUOPT_LOG_INFO("[remote_solve] Solving LP remotely on {}:{} ({} mode)",
-                 config.host,
+  CUOPT_LOG_INFO("[remote_solve] Solving LP remotely on %s:%d (%s via %s)",
+                 config.host.c_str(),
                  config.port,
-                 sync_mode ? "sync" : "async");
+                 sync_mode ? "sync" : "async",
+                 grpc_mode ? "gRPC" : "socket");
 
   // Log problem info (similar to local solve)
   if (settings.log_to_console) {
@@ -463,6 +480,81 @@ optimization_problem_solution_t<i_t, f_t> solve_lp_remote(
   }
 
   auto serializer = get_serializer<i_t, f_t>();
+
+  if (grpc_mode) {
+#if CUOPT_ENABLE_GRPC
+    const std::string address = config.host + ":" + std::to_string(config.port);
+
+    // Serialize as SolveLPRequest (server expects this protobuf, not AsyncRequest)
+    std::vector<uint8_t> request_data = serializer->serialize_lp_request(view, settings);
+    CUOPT_LOG_DEBUG("[remote_solve] Serialized LP request (gRPC): {} bytes", request_data.size());
+
+    std::string job_id;
+    std::string err;
+    if (!grpc_remote::upload_and_submit(address,
+                                        grpc_remote::ProblemType::LP,
+                                        request_data.data(),
+                                        request_data.size(),
+                                        job_id,
+                                        err)) {
+      return optimization_problem_solution_t<i_t, f_t>(cuopt::logic_error(
+        "gRPC UploadAndSubmit failed: " + err, cuopt::error_type_t::RuntimeError));
+    }
+
+    // Optional realtime logs on client side
+    volatile bool stop_logs = false;
+    std::thread log_thread;
+    if (settings.log_to_console) {
+      log_thread =
+        std::thread([&]() { grpc_remote::stream_logs_to_stdout(address, job_id, &stop_logs, ""); });
+    }
+
+    // Poll status until terminal, allowing log streaming and cancellation in other threads.
+    std::string status;
+    while (true) {
+      std::string st_err;
+      if (!grpc_remote::check_status(address, job_id, status, st_err)) {
+        stop_logs = true;
+        if (log_thread.joinable()) { log_thread.join(); }
+        grpc_remote::delete_result(address, job_id);
+        return optimization_problem_solution_t<i_t, f_t>(cuopt::logic_error(
+          "gRPC CheckStatus failed: " + st_err, cuopt::error_type_t::RuntimeError));
+      }
+
+      if (status == "COMPLETED") { break; }
+      if (status == "FAILED" || status == "CANCELLED" || status == "NOT_FOUND") {
+        stop_logs = true;
+        if (log_thread.joinable()) { log_thread.join(); }
+        grpc_remote::delete_result(address, job_id);
+        return optimization_problem_solution_t<i_t, f_t>(
+          cuopt::logic_error("Remote job did not complete successfully (status=" + status + ")",
+                             cuopt::error_type_t::RuntimeError));
+      }
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    // Retrieve result bytes via streaming (unlimited total size)
+    std::vector<uint8_t> solution_bytes;
+    std::string res_err;
+    if (!grpc_remote::stream_result(address, job_id, solution_bytes, res_err)) {
+      stop_logs = true;
+      if (log_thread.joinable()) { log_thread.join(); }
+      grpc_remote::delete_result(address, job_id);
+      return optimization_problem_solution_t<i_t, f_t>(cuopt::logic_error(
+        "gRPC StreamResult failed: " + res_err, cuopt::error_type_t::RuntimeError));
+    }
+
+    stop_logs = true;
+    if (log_thread.joinable()) { log_thread.join(); }
+
+    grpc_remote::delete_result(address, job_id);
+    return serializer->deserialize_lp_solution(solution_bytes);
+#else
+    // Should be unreachable when grpc_mode==true
+    (void)serializer;
+#endif
+  }
 
   if (sync_mode) {
     //=========================================================================
@@ -558,11 +650,13 @@ mip_solution_t<i_t, f_t> solve_mip_remote(
   const mip_solver_settings_t<i_t, f_t>& settings)
 {
   const bool sync_mode = use_sync_mode();
+  const bool grpc_mode = use_grpc_transport();
 
-  CUOPT_LOG_INFO("[remote_solve] Solving MIP remotely on {}:{} ({} mode)",
-                 config.host,
+  CUOPT_LOG_INFO("[remote_solve] Solving MIP remotely on %s:%d (%s via %s)",
+                 config.host.c_str(),
                  config.port,
-                 sync_mode ? "sync" : "async");
+                 sync_mode ? "sync" : "async",
+                 grpc_mode ? "gRPC" : "socket");
 
   // Log problem info
   {
@@ -579,6 +673,73 @@ mip_solution_t<i_t, f_t> solve_mip_remote(
   }
 
   auto serializer = get_serializer<i_t, f_t>();
+
+  if (grpc_mode) {
+#if CUOPT_ENABLE_GRPC
+    const std::string address = config.host + ":" + std::to_string(config.port);
+
+    std::vector<uint8_t> request_data = serializer->serialize_mip_request(view, settings);
+    CUOPT_LOG_DEBUG("[remote_solve] Serialized MIP request (gRPC): {} bytes", request_data.size());
+
+    std::string job_id;
+    std::string err;
+    if (!grpc_remote::upload_and_submit(address,
+                                        grpc_remote::ProblemType::MIP,
+                                        request_data.data(),
+                                        request_data.size(),
+                                        job_id,
+                                        err)) {
+      return mip_solution_t<i_t, f_t>(cuopt::logic_error("gRPC UploadAndSubmit failed: " + err,
+                                                         cuopt::error_type_t::RuntimeError));
+    }
+
+    volatile bool stop_logs = false;
+    std::thread log_thread;
+    if (settings.log_to_console) {
+      log_thread =
+        std::thread([&]() { grpc_remote::stream_logs_to_stdout(address, job_id, &stop_logs, ""); });
+    }
+
+    std::string status;
+    while (true) {
+      std::string st_err;
+      if (!grpc_remote::check_status(address, job_id, status, st_err)) {
+        stop_logs = true;
+        if (log_thread.joinable()) { log_thread.join(); }
+        grpc_remote::delete_result(address, job_id);
+        return mip_solution_t<i_t, f_t>(cuopt::logic_error("gRPC CheckStatus failed: " + st_err,
+                                                           cuopt::error_type_t::RuntimeError));
+      }
+
+      if (status == "COMPLETED") { break; }
+      if (status == "FAILED" || status == "CANCELLED" || status == "NOT_FOUND") {
+        stop_logs = true;
+        if (log_thread.joinable()) { log_thread.join(); }
+        grpc_remote::delete_result(address, job_id);
+        return mip_solution_t<i_t, f_t>(
+          cuopt::logic_error("Remote job did not complete successfully (status=" + status + ")",
+                             cuopt::error_type_t::RuntimeError));
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    std::vector<uint8_t> solution_bytes;
+    std::string res_err;
+    if (!grpc_remote::stream_result(address, job_id, solution_bytes, res_err)) {
+      stop_logs = true;
+      if (log_thread.joinable()) { log_thread.join(); }
+      grpc_remote::delete_result(address, job_id);
+      return mip_solution_t<i_t, f_t>(cuopt::logic_error("gRPC StreamResult failed: " + res_err,
+                                                         cuopt::error_type_t::RuntimeError));
+    }
+
+    stop_logs = true;
+    if (log_thread.joinable()) { log_thread.join(); }
+
+    grpc_remote::delete_result(address, job_id);
+    return serializer->deserialize_mip_solution(solution_bytes);
+#endif
+  }
 
   if (sync_mode) {
     //=========================================================================
@@ -670,7 +831,35 @@ cancel_job_result_t cancel_job_remote(const remote_solve_config_t& config,
 {
   CUOPT_LOG_INFO("[remote_solve] Cancelling job {} on {}:{}", job_id, config.host, config.port);
 
-  // Use int32_t, double as the type parameters (doesn't affect cancel logic)
+  // Prefer gRPC cancel when available.
+  if (use_grpc_transport()) {
+#if CUOPT_ENABLE_GRPC
+    const std::string address = config.host + ":" + std::to_string(config.port);
+    bool ok                   = false;
+    std::string status;
+    std::string msg;
+    std::string err;
+    bool rpc_ok = grpc_remote::cancel_job(address, job_id, ok, status, msg, err);
+    cancel_job_result_t result;
+    result.success = rpc_ok && ok;
+    result.message = rpc_ok ? msg : err;
+    if (status == "QUEUED")
+      result.job_status = remote_job_status_t::QUEUED;
+    else if (status == "PROCESSING")
+      result.job_status = remote_job_status_t::PROCESSING;
+    else if (status == "COMPLETED")
+      result.job_status = remote_job_status_t::COMPLETED;
+    else if (status == "FAILED")
+      result.job_status = remote_job_status_t::FAILED;
+    else if (status == "CANCELLED")
+      result.job_status = remote_job_status_t::CANCELLED;
+    else
+      result.job_status = remote_job_status_t::NOT_FOUND;
+    return result;
+#endif
+  }
+
+  // Fallback: legacy socket cancel.
   auto result = cancel_job_impl<int32_t, double>(config.host, config.port, job_id);
 
   if (result.success) {
