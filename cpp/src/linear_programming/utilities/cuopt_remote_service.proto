@@ -33,6 +33,10 @@ service CuOptRemoteService {
   // Get the result of a completed job
   rpc GetResult(GetResultRequest) returns (ResultResponse);
 
+  // Stream the result of a completed job in chunks (effectively unlimited total size).
+  // Each chunk message must still fit within gRPC per-message limits.
+  rpc StreamResult(GetResultRequest) returns (stream ResultChunk);
+
   // Delete a result from server memory
   rpc DeleteResult(DeleteRequest) returns (DeleteResponse);
 
@@ -92,13 +96,6 @@ message UploadStart {
 
   // Optional total payload size hint (bytes). Can be 0 if unknown.
   int64 total_size = 4;
-
-  // If true, the uploaded payload bytes are a raw MPS file (text/binary) rather than a serialized
-  // SolveLPRequest/SolveMIPRequest protobuf. The worker will parse the MPS from the saved file.
-  bool raw_mps = 5;
-
-  // Optional original filename (used for logging/extension).
-  string original_filename = 6;
 }
 
 message UploadChunk {
@@ -153,6 +150,17 @@ message StatusRequest {
 // Request to get result
 message GetResultRequest {
   string job_id = 1;
+}
+
+// Chunked result payload (raw serialized solution bytes).
+// Client reassembles all chunks (by offset) and then parses as:
+// - cuopt.remote.LPSolution (if LP) OR cuopt.remote.MIPSolution (if MIP)
+message ResultChunk {
+  string job_id = 1;
+  int64 offset = 2;
+  bytes data = 3;
+  bool done = 4;
+  string error_message = 5;
 }
 
 // Request to delete result

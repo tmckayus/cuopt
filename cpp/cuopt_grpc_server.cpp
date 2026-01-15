@@ -2228,7 +2228,49 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
                        const cuopt::remote::WaitRequest* request,
                        cuopt::remote::ResultResponse* response) override
   {
-    return Status(StatusCode::UNIMPLEMENTED, "WaitForResult not yet implemented");
+    (void)context;
+    const std::string job_id = request->job_id();
+
+    std::vector<uint8_t> result_data;
+    std::string error_message;
+    bool ok = wait_for_result(job_id, result_data, error_message);
+
+    if (!ok) {
+      response->set_status(cuopt::remote::ERROR_SOLVE_FAILED);
+      response->set_error_message(error_message);
+      return Status::OK;
+    }
+
+    response->set_status(cuopt::remote::SUCCESS);
+    response->set_error_message("");
+
+    // Determine LP vs MIP from job tracker
+    bool is_mip = get_job_is_mip(job_id);
+    if (is_mip) {
+      cuopt::remote::MIPSolution mip_solution;
+      if (!mip_solution.ParseFromArray(result_data.data(), result_data.size())) {
+        response->set_status(cuopt::remote::ERROR_INTERNAL);
+        response->set_error_message("Failed to parse MIP result");
+        return Status::OK;
+      }
+      response->mutable_mip_solution()->CopyFrom(mip_solution);
+    } else {
+      cuopt::remote::LPSolution lp_solution;
+      if (!lp_solution.ParseFromArray(result_data.data(), result_data.size())) {
+        response->set_status(cuopt::remote::ERROR_INTERNAL);
+        response->set_error_message("Failed to parse LP result");
+        return Status::OK;
+      }
+      response->mutable_lp_solution()->CopyFrom(lp_solution);
+    }
+
+    if (config.verbose) {
+      std::cout << "[gRPC] WaitForResult finished job_id=" << job_id
+                << " bytes=" << result_data.size() << " is_mip=" << (is_mip ? 1 : 0) << "\n";
+      std::cout.flush();
+    }
+
+    return Status::OK;
   }
 
   Status StreamLogs(ServerContext* context,

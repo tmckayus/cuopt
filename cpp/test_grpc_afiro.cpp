@@ -370,31 +370,60 @@ class CuOptGrpcClient {
       ClientContext context;
       std::unique_ptr<ClientReader<ResultChunk>> reader = stub_->StreamResult(&context, request);
 
-      std::vector<uint8_t> bytes;
-      bytes.reserve(16 * 1024 * 1024);
+      // Spool streamed bytes to a private temp file (0600) and unlink immediately so it
+      // auto-cleans.
+      char tmp[] = "/tmp/cuopt_result_XXXXXX";
+      int fd     = mkstemp(tmp);
+      if (fd < 0) {
+        std::cerr << "[Client] mkstemp failed for result spool: " << strerror(errno) << std::endl;
+        return false;
+      }
+      fchmod(fd, 0600);
+      unlink(tmp);
 
       ResultChunk chunk;
+      bool saw_done = false;
       while (reader->Read(&chunk)) {
         if (!chunk.error_message().empty()) {
           std::cerr << "[Client] StreamResult error: " << chunk.error_message() << std::endl;
           break;
         }
-        if (chunk.done()) { break; }
+        if (chunk.done()) {
+          saw_done = true;
+          break;
+        }
         const std::string& data = chunk.data();
-        bytes.insert(bytes.end(), data.begin(), data.end());
+        const char* p           = data.data();
+        size_t remaining        = data.size();
+        while (remaining > 0) {
+          ssize_t n = ::write(fd, p, remaining);
+          if (n < 0) {
+            if (errno == EINTR) continue;
+            std::cerr << "[Client] write() failed spooling streamed result: " << strerror(errno)
+                      << std::endl;
+            remaining = 0;
+            break;
+          }
+          p += n;
+          remaining -= static_cast<size_t>(n);
+        }
       }
 
       Status status = reader->Finish();
       if (!status.ok()) {
         std::cerr << "[Client] StreamResult RPC failed: " << status.error_message() << std::endl;
+        close(fd);
         // fall through to unary GetResult as a fallback
-      } else if (!bytes.empty()) {
+      } else if (saw_done) {
         // Parse as LP solution (this test client is LP-only)
         cuopt::remote::LPSolution lp_solution;
-        if (!lp_solution.ParseFromArray(bytes.data(), bytes.size())) {
+        lseek(fd, 0, SEEK_SET);
+        if (!lp_solution.ParseFromFileDescriptor(fd)) {
           std::cerr << "[Client] Failed to parse streamed LP solution" << std::endl;
+          close(fd);
           return false;
         }
+        close(fd);
 
         std::cout << "\n[Client] ============ REMOTE RESULT (STREAM) ============" << std::endl;
         std::cout << "[Client] Termination Status: " << lp_solution.termination_status()
@@ -411,6 +440,8 @@ class CuOptGrpcClient {
         }
         std::cout << "[Client] ================================================\n" << std::endl;
         return true;
+      } else {
+        close(fd);
       }
     }
 
