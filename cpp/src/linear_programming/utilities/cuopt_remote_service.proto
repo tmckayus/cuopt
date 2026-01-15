@@ -58,8 +58,7 @@ service CuOptRemoteService {
   // Synchronous Operations
   // -------------------------
 
-  // Synchronous solve (blocking, returns result when complete)
-  rpc SolveSync(SolveSyncRequest) returns (SolveSyncResponse);
+  // (SolveSync removed - use SubmitJob + WaitForResult (+ StreamLogs/CancelJob) instead)
 }
 
 // =============================================================================
@@ -193,23 +192,6 @@ message LogMessage {
   string line = 1;             // Single log line
   int64 byte_offset = 2;       // Byte offset of this line in log file
   bool job_complete = 3;       // True if this is the last message (job done)
-}
-
-// Request for synchronous solve
-message SolveSyncRequest {
-  oneof job_data {
-    SolveLPRequest lp_request = 1;
-    SolveMIPRequest mip_request = 2;
-  }
-}
-
-// Response for synchronous solve
-message SolveSyncResponse {
-  oneof solution {
-    LPSolution lp_solution = 1;
-    MIPSolution mip_solution = 2;
-  }
-  string error_message = 3;
 }
 
 // =============================================================================

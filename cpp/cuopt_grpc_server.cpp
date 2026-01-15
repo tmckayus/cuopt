@@ -2381,13 +2381,6 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
 
     return Status::OK;
   }
-
-  Status SolveSync(ServerContext* context,
-                   const cuopt::remote::SolveSyncRequest* request,
-                   cuopt::remote::SolveSyncResponse* response) override
-  {
-    return Status(StatusCode::UNIMPLEMENTED, "SolveSync not yet implemented");
-  }
 };
 
 // ============================================================================
