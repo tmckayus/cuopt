@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved. # noqa
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved. # noqa
 # SPDX-License-Identifier: Apache-2.0
 
 # cython: profile=False
@@ -10,6 +10,7 @@
 from libc.stdint cimport uintptr_t
 
 import numpy as np
+import ctypes
 from numba.cuda.api import from_cuda_array_interface
 
 
@@ -49,18 +50,10 @@ cdef class PyCallback:
         return data
 
     def get_numpy_array(self, data, shape, typestr):
-        sizeofType = 4 if typestr == "float32" else 8
-        desc = {
-            'shape': (shape,),
-            'strides': None,
-            'typestr': typestr,
-            'data': (data, False),
-            'version': 3
-        }
-        data = desc['data'][0]
-        shape = desc['shape']
-
-        numpy_array = np.array([data], dtype=desc['typestr']).reshape(shape)
+        ctype = ctypes.c_float if typestr == "float32" else ctypes.c_double
+        buf_type = ctype * shape
+        buf = buf_type.from_address(data)
+        numpy_array = np.ctypeslib.as_array(buf)
         return numpy_array
 
 cdef class GetSolutionCallback(PyCallback):

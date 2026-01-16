@@ -64,6 +64,17 @@ bool copy_incumbent_to_device(const std::vector<double>& host_assignment,
   *d_objective_out  = nullptr;
   if (host_assignment.empty()) { return false; }
 
+  int device_count       = 0;
+  cudaError_t device_err = cudaGetDeviceCount(&device_count);
+  if (device_err != cudaSuccess || device_count == 0) {
+    static bool logged_no_device = false;
+    if (!logged_no_device) {
+      CUOPT_LOG_INFO("[remote_solve] No CUDA device available; using host incumbents");
+      logged_no_device = true;
+    }
+    return false;
+  }
+
   size_t n = host_assignment.size();
   std::vector<f_t> assignment(n);
   for (size_t i = 0; i < n; ++i) {
@@ -112,20 +123,39 @@ void invoke_incumbent_callbacks(
 {
   f_t* d_assignment = nullptr;
   f_t* d_objective  = nullptr;
-  if (!copy_incumbent_to_device<f_t>(assignment, objective, &d_assignment, &d_objective)) {
-    return;
+  bool on_device =
+    copy_incumbent_to_device<f_t>(assignment, objective, &d_assignment, &d_objective);
+  std::vector<f_t> h_assignment;
+  f_t h_objective     = static_cast<f_t>(objective);
+  f_t* assignment_ptr = nullptr;
+  f_t* objective_ptr  = nullptr;
+  if (on_device) {
+    assignment_ptr = d_assignment;
+    objective_ptr  = d_objective;
+  } else {
+    if (assignment.empty()) { return; }
+    h_assignment.resize(assignment.size());
+    for (size_t i = 0; i < assignment.size(); ++i) {
+      h_assignment[i] = static_cast<f_t>(assignment[i]);
+    }
+    assignment_ptr = h_assignment.data();
+    objective_ptr  = &h_objective;
   }
 
   for (auto* cb : callbacks) {
     if (cb == nullptr) { continue; }
     if (cb->get_type() != cuopt::internals::base_solution_callback_type::GET_SOLUTION) { continue; }
+    cb->set_memory_location(on_device ? cuopt::internals::callback_memory_location::DEVICE
+                                      : cuopt::internals::callback_memory_location::HOST);
     auto* get_cb = static_cast<cuopt::internals::get_solution_callback_t*>(cb);
-    get_cb->get_solution(d_assignment, d_objective);
+    get_cb->get_solution(assignment_ptr, objective_ptr);
   }
 
-  cudaDeviceSynchronize();
-  cudaFree(d_assignment);
-  cudaFree(d_objective);
+  if (on_device) {
+    cudaDeviceSynchronize();
+    cudaFree(d_assignment);
+    cudaFree(d_objective);
+  }
 }
 
 /**

@@ -280,6 +280,7 @@ void population_t<i_t, f_t>::run_solution_callbacks(solution_t<i_t, f_t>& sol)
 
     for (auto callback : user_callbacks) {
       if (callback->get_type() == internals::base_solution_callback_type::GET_SOLUTION) {
+        callback->set_memory_location(internals::callback_memory_location::DEVICE);
         auto get_sol_callback = static_cast<internals::get_solution_callback_t*>(callback);
         solution_t<i_t, f_t> temp_sol(sol);
         problem_ptr->post_process_assignment(temp_sol.assignment);
@@ -316,6 +317,7 @@ void population_t<i_t, f_t>::run_solution_callbacks(solution_t<i_t, f_t>& sol)
 
   for (auto callback : user_callbacks) {
     if (callback->get_type() == internals::base_solution_callback_type::SET_SOLUTION) {
+      callback->set_memory_location(internals::callback_memory_location::DEVICE);
       auto set_sol_callback = static_cast<internals::set_solution_callback_t*>(callback);
       rmm::device_uvector<f_t> incumbent_assignment(
         problem_ptr->original_problem_ptr->get_n_variables(), sol.handle_ptr->get_stream());
