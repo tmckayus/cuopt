@@ -1139,6 +1139,19 @@ static std::string create_job_shm(const std::string& job_id,
   return shm_name;
 }
 
+static int64_t get_upload_mem_threshold_bytes()
+{
+  // Default to 1 GiB; set env CUOPT_GRPC_UPLOAD_MEM_THRESHOLD_BYTES to override.
+  // 0 => always use file, -1 => always use memory (not recommended for huge uploads).
+  const char* val = std::getenv("CUOPT_GRPC_UPLOAD_MEM_THRESHOLD_BYTES");
+  if (!val || val[0] == '\0') { return 1LL << 30; }
+  try {
+    return std::stoll(val);
+  } catch (...) {
+    return 1LL << 30;
+  }
+}
+
 // Read data from per-job shared memory segment
 static bool read_job_shm(const char* shm_name, size_t data_size, std::vector<uint8_t>& data)
 {
@@ -1855,24 +1868,70 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
     std::string upload_id   = start.upload_id().empty() ? generate_job_id() : start.upload_id();
     bool is_mip             = (start.problem_type() == cuopt::remote::MIP);
     std::string upload_path = get_upload_file_path(upload_id);
+    int64_t committed       = 0;
 
-    // Open file (append if resume, else truncate).
-    int flags = O_CREAT | O_WRONLY;
-    flags |= start.resume() ? O_APPEND : O_TRUNC;
-    int fd = open(upload_path.c_str(), flags, 0644);
-    if (fd < 0) {
-      out.mutable_error()->set_upload_id(upload_id);
-      out.mutable_error()->set_message(std::string("Failed to open upload file: ") +
-                                       strerror(errno));
-      out.mutable_error()->set_committed_size(0);
-      stream->Write(out);
-      return Status(StatusCode::INTERNAL, "Failed to open upload file");
+    const int64_t threshold_bytes = get_upload_mem_threshold_bytes();
+    const int64_t total_size_hint = start.total_size();
+    const bool force_file         = (threshold_bytes == 0) || start.resume();
+    bool use_memory               = !force_file;
+    if (threshold_bytes >= 0 && total_size_hint > 0 && total_size_hint > threshold_bytes) {
+      use_memory = false;
+    }
+    if (threshold_bytes < 0) { use_memory = true; }
+
+    int fd = -1;
+    std::vector<uint8_t> mem_buffer;
+    auto cleanup_file = [&]() {
+      if (fd >= 0) {
+        close(fd);
+        delete_upload_file(upload_id);
+        fd = -1;
+      }
+    };
+
+    if (config.verbose) {
+      std::cout << "[gRPC] UploadAndSubmit start upload_id=" << upload_id
+                << " total_size=" << total_size_hint << " threshold_bytes=" << threshold_bytes
+                << " resume=" << (start.resume() ? 1 : 0) << " use_memory=" << (use_memory ? 1 : 0)
+                << " upload_path=" << upload_path << "\n";
+      std::cout.flush();
     }
 
-    int64_t committed = 0;
-    if (start.resume()) {
-      struct stat st;
-      if (stat(upload_path.c_str(), &st) == 0) { committed = static_cast<int64_t>(st.st_size); }
+    auto open_upload_file = [&](bool resume) -> bool {
+      int flags = O_CREAT | O_WRONLY;
+      flags |= resume ? O_APPEND : O_TRUNC;
+      fd = open(upload_path.c_str(), flags | O_CLOEXEC, 0600);
+      if (fd < 0) {
+        out.mutable_error()->set_upload_id(upload_id);
+        out.mutable_error()->set_message(std::string("Failed to open upload file: ") +
+                                         strerror(errno));
+        out.mutable_error()->set_committed_size(committed);
+        stream->Write(out);
+        return false;
+      }
+      if (config.verbose) {
+        struct stat st;
+        if (fstat(fd, &st) == 0) {
+          std::cout << "[gRPC] Upload file opened path=" << upload_path << " mode=" << std::oct
+                    << (st.st_mode & 0777) << std::dec << " uid=" << st.st_uid
+                    << " gid=" << st.st_gid << "\n";
+        } else {
+          std::cout << "[gRPC] Upload file opened path=" << upload_path
+                    << " fstat_failed err=" << strerror(errno) << "\n";
+        }
+        std::cout.flush();
+      }
+      if (resume) {
+        struct stat st;
+        if (stat(upload_path.c_str(), &st) == 0) { committed = static_cast<int64_t>(st.st_size); }
+      }
+      return true;
+    };
+
+    if (!use_memory) {
+      if (!open_upload_file(start.resume())) {
+        return Status(StatusCode::INTERNAL, "Failed to open upload file");
+      }
     }
 
     // Ack start with committed size (resume point).
@@ -1891,8 +1950,7 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
           out.mutable_error()->set_message("upload_id mismatch");
           out.mutable_error()->set_committed_size(committed);
           stream->Write(out);
-          close(fd);
-          delete_upload_file(upload_id);
+          cleanup_file();
           return Status(StatusCode::INVALID_ARGUMENT, "upload_id mismatch");
         }
         if (ch.offset() != committed) {
@@ -1907,15 +1965,47 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
 
         const std::string& data = ch.data();
         if (!data.empty()) {
-          if (!write_to_pipe(fd, data.data(), data.size())) {
-            out.Clear();
-            out.mutable_error()->set_upload_id(upload_id);
-            out.mutable_error()->set_message("Failed to write chunk to disk");
-            out.mutable_error()->set_committed_size(committed);
-            stream->Write(out);
-            close(fd);
-            delete_upload_file(upload_id);
-            return Status(StatusCode::INTERNAL, "Failed to write chunk");
+          if (use_memory) {
+            // Switch to file if threshold exceeded or unknown size grows too large.
+            if (threshold_bytes >= 0 &&
+                committed + static_cast<int64_t>(data.size()) > threshold_bytes) {
+              if (config.verbose) {
+                std::cout << "[gRPC] Upload spill to disk upload_id=" << upload_id
+                          << " committed=" << committed << " chunk=" << data.size()
+                          << " threshold_bytes=" << threshold_bytes << "\n";
+                std::cout.flush();
+              }
+              if (!open_upload_file(false)) {
+                return Status(StatusCode::INTERNAL, "Failed to open upload file");
+              }
+              if (!mem_buffer.empty()) {
+                if (!write_to_pipe(fd, mem_buffer.data(), mem_buffer.size())) {
+                  out.Clear();
+                  out.mutable_error()->set_upload_id(upload_id);
+                  out.mutable_error()->set_message("Failed to spill memory buffer to disk");
+                  out.mutable_error()->set_committed_size(committed);
+                  stream->Write(out);
+                  cleanup_file();
+                  return Status(StatusCode::INTERNAL, "Failed to spill buffer");
+                }
+                mem_buffer.clear();
+              }
+              use_memory = false;
+            }
+          }
+
+          if (use_memory) {
+            mem_buffer.insert(mem_buffer.end(), data.begin(), data.end());
+          } else {
+            if (!write_to_pipe(fd, data.data(), data.size())) {
+              out.Clear();
+              out.mutable_error()->set_upload_id(upload_id);
+              out.mutable_error()->set_message("Failed to write chunk to disk");
+              out.mutable_error()->set_committed_size(committed);
+              stream->Write(out);
+              cleanup_file();
+              return Status(StatusCode::INTERNAL, "Failed to write chunk");
+            }
           }
           committed += static_cast<int64_t>(data.size());
         }
@@ -1943,8 +2033,7 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
           out.mutable_error()->set_message("upload_id mismatch on finish");
           out.mutable_error()->set_committed_size(committed);
           stream->Write(out);
-          close(fd);
-          delete_upload_file(upload_id);
+          cleanup_file();
           return Status(StatusCode::INVALID_ARGUMENT, "upload_id mismatch on finish");
         }
         break;
@@ -1955,14 +2044,13 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
       out.mutable_error()->set_message("Unexpected message type during upload");
       out.mutable_error()->set_committed_size(committed);
       stream->Write(out);
-      close(fd);
-      delete_upload_file(upload_id);
+      cleanup_file();
       return Status(StatusCode::INVALID_ARGUMENT, "Unexpected message type");
     }
 
-    close(fd);
+    if (fd >= 0) { close(fd); }
 
-    // Enqueue job using file-backed payload
+    // Enqueue job using file-backed payload or in-memory buffer
     std::string job_id = generate_job_id();
 
     int job_idx = -1;
@@ -1980,7 +2068,7 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
       out.mutable_error()->set_message("Job queue full");
       out.mutable_error()->set_committed_size(committed);
       stream->Write(out);
-      delete_upload_file(upload_id);
+      cleanup_file();
       return Status(StatusCode::RESOURCE_EXHAUSTED, "Job queue full");
     }
 
@@ -1991,9 +2079,19 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
     job_queue[job_idx].worker_index.store(-1);
     job_queue[job_idx].data_sent.store(false);
     job_queue[job_idx].shm_data_name[0] = '\0';
-    {
+    if (use_memory) {
+      std::lock_guard<std::mutex> lock(pending_data_mutex);
+      pending_job_data[job_id] = std::move(mem_buffer);
+    } else {
       std::lock_guard<std::mutex> lock(pending_files_mutex);
       pending_job_files[job_id] = PendingJobFile{upload_path, static_cast<uint64_t>(committed)};
+    }
+
+    if (config.verbose) {
+      std::cout << "[gRPC] UploadAndSubmit stored payload upload_id=" << upload_id
+                << " job_id=" << job_id << " bytes=" << committed
+                << " storage=" << (use_memory ? "memory" : "file") << "\n";
+      std::cout.flush();
     }
 
     {
