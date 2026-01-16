@@ -314,4 +314,49 @@ void stream_logs_to_stdout(const std::string& address,
   reader->Finish();
 }
 
+bool get_incumbents(const std::string& address,
+                    const std::string& job_id,
+                    int64_t from_index,
+                    int32_t max_count,
+                    std::vector<Incumbent>& incumbents_out,
+                    int64_t& next_index_out,
+                    bool& job_complete_out,
+                    std::string& error_message)
+{
+  incumbents_out.clear();
+  next_index_out   = from_index;
+  job_complete_out = false;
+  error_message.clear();
+
+  auto stub = make_stub(address);
+  grpc::ClientContext ctx;
+  cuopt::remote::IncumbentRequest req;
+  req.set_job_id(job_id);
+  req.set_from_index(from_index);
+  req.set_max_count(max_count);
+
+  cuopt::remote::IncumbentResponse resp;
+  grpc::Status st = stub->GetIncumbents(&ctx, req, &resp);
+  if (!st.ok()) {
+    error_message = st.error_message();
+    return false;
+  }
+
+  incumbents_out.reserve(resp.incumbents_size());
+  for (const auto& inc : resp.incumbents()) {
+    Incumbent entry;
+    entry.index     = inc.index();
+    entry.objective = inc.objective();
+    entry.assignment.reserve(inc.assignment_size());
+    for (int i = 0; i < inc.assignment_size(); ++i) {
+      entry.assignment.push_back(inc.assignment(i));
+    }
+    incumbents_out.push_back(std::move(entry));
+  }
+
+  next_index_out   = resp.next_index();
+  job_complete_out = resp.job_complete();
+  return true;
+}
+
 }  // namespace cuopt::linear_programming::grpc_remote

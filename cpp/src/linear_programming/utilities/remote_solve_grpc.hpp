@@ -14,6 +14,12 @@ namespace cuopt::linear_programming::grpc_remote {
 
 enum class ProblemType { LP = 0, MIP = 1 };
 
+struct Incumbent {
+  int64_t index    = 0;
+  double objective = 0.0;
+  std::vector<double> assignment;
+};
+
 // Upload serialized SolveLPRequest / SolveMIPRequest bytes and enqueue a job.
 bool upload_and_submit(const std::string& address,
                        ProblemType problem_type,
@@ -51,5 +57,15 @@ void stream_logs_to_stdout(const std::string& address,
                            const std::string& job_id,
                            volatile bool* stop_flag,
                            const std::string& print_prefix);
+
+// Fetch incumbent solutions for a job starting at from_index.
+bool get_incumbents(const std::string& address,
+                    const std::string& job_id,
+                    int64_t from_index,
+                    int32_t max_count,
+                    std::vector<Incumbent>& incumbents_out,
+                    int64_t& next_index_out,
+                    bool& job_complete_out,
+                    std::string& error_message);
 
 }  // namespace cuopt::linear_programming::grpc_remote

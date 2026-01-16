@@ -58,7 +58,40 @@ class CuOptGrpcClient {
     reader->Finish();
   }
 
-  std::string UploadAndSubmitLPFromFD(int fd, int64_t total_size, cuopt::remote::LPMethod method)
+  void StreamIncumbentsToStdout(const std::string& job_id, std::atomic<bool>& stop_flag)
+  {
+    int64_t next_index = 0;
+    while (!stop_flag.load()) {
+      IncumbentRequest req;
+      req.set_job_id(job_id);
+      req.set_from_index(next_index);
+      req.set_max_count(16);
+
+      IncumbentResponse resp;
+      ClientContext ctx;
+      Status status = stub_->GetIncumbents(&ctx, req, &resp);
+      if (!status.ok()) {
+        std::cerr << "[Client] GetIncumbents RPC failed: " << status.error_message() << std::endl;
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        continue;
+      }
+
+      for (const auto& inc : resp.incumbents()) {
+        std::cout << "[Incumbent] idx=" << inc.index() << " obj=" << inc.objective()
+                  << " vars=" << inc.assignment_size() << std::endl;
+        next_index = std::max<int64_t>(next_index, inc.index() + 1);
+      }
+
+      if (resp.job_complete()) { break; }
+
+      // No new incumbents yet; avoid busy-polling.
+      if (resp.incumbents_size() == 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      }
+    }
+  }
+
+  std::string UploadAndSubmitFromFD(int fd, int64_t total_size, bool is_mip)
   {
     // We keep fd open and can retry the streaming RPC (in-process) using resume semantics.
     // The server enforces sequential offsets and reports committed_size acks.
@@ -72,7 +105,7 @@ class CuOptGrpcClient {
 
       UploadJobRequest req;
       auto* start = req.mutable_start();
-      start->set_problem_type(LP);
+      start->set_problem_type(is_mip ? MIP : LP);
       start->set_resume(resume);
       if (!upload_id.empty()) { start->set_upload_id(upload_id); }
       start->set_total_size(total_size);
@@ -187,12 +220,41 @@ class CuOptGrpcClient {
     }
     lseek(fd, 0, SEEK_SET);
 
-    std::string job_id = UploadAndSubmitLPFromFD(fd, total_size, lp_request.settings().method());
+    std::string job_id = UploadAndSubmitFromFD(fd, total_size, false);
     close(fd);
     return job_id;
   }
 
-  std::string SubmitMpsFile(const std::string& mps_file_path)
+  std::string UploadAndSubmitMIP(const SolveMIPRequest& mip_request)
+  {
+    char tmp[] = "/tmp/cuopt_req_XXXXXX";
+    int fd     = mkstemp(tmp);
+    if (fd < 0) {
+      std::cerr << "[Client] mkstemp failed: " << strerror(errno) << std::endl;
+      return "";
+    }
+    fchmod(fd, 0600);
+    unlink(tmp);
+
+    if (!mip_request.SerializeToFileDescriptor(fd)) {
+      std::cerr << "[Client] Failed to serialize SolveMIPRequest to temp file" << std::endl;
+      close(fd);
+      return "";
+    }
+    int64_t total_size = lseek(fd, 0, SEEK_END);
+    if (total_size < 0) {
+      std::cerr << "[Client] lseek(SEEK_END) failed" << std::endl;
+      close(fd);
+      return "";
+    }
+    lseek(fd, 0, SEEK_SET);
+
+    std::string job_id = UploadAndSubmitFromFD(fd, total_size, true);
+    close(fd);
+    return job_id;
+  }
+
+  std::string SubmitMpsFile(const std::string& mps_file_path, bool is_mip)
   {
     // Parse MPS file
     std::cout << "[Client] Parsing MPS file: " << mps_file_path << std::endl;
@@ -226,18 +288,16 @@ class CuOptGrpcClient {
     }
 
     // Build gRPC request
-    SubmitJobRequest request;
-    auto* lp_request = request.mutable_lp_request();
-
-    // Set header
-    auto* header = lp_request->mutable_header();
+    SolveLPRequest lp_request;
+    SolveMIPRequest mip_request;
+    auto* header = is_mip ? mip_request.mutable_header() : lp_request.mutable_header();
     header->set_version(1);
-    header->set_problem_type(LP);
+    header->set_problem_type(is_mip ? MIP : LP);
     header->set_index_type(INT32);
     header->set_float_type(DOUBLE);
 
     // Fill problem from MPS data
-    auto* problem = lp_request->mutable_problem();
+    auto* problem = is_mip ? mip_request.mutable_problem() : lp_request.mutable_problem();
     problem->set_problem_name(mps_data.get_problem_name());
     problem->set_maximize(mps_data.get_sense());
     problem->set_objective_name(mps_data.get_objective_name());
@@ -308,30 +368,41 @@ class CuOptGrpcClient {
     std::string var_types_str(var_types.begin(), var_types.end());
     problem->set_variable_types(var_types_str);
 
-    // Settings
-    auto* settings = lp_request->mutable_settings();
-    // Give large instances more time by default.
-    settings->set_time_limit(60.0);
-    settings->set_log_to_console(true);
-    // IMPORTANT: proto3 defaults numeric fields to 0. If we don't set this,
-    // cuOpt may interpret iteration_limit=0 as "do zero iterations" and return
-    // PDLP_ITERATION_LIMIT immediately with a trivial objective.
-    // Use -1 sentinel for "unset" so server/library defaults apply.
-    settings->set_iteration_limit(-1);
-    // Allow overriding LP method for known-problem cases (e.g. avoid Concurrent/Barrier issues).
-    if (mps_file_path.find("L2CTA3D.mps") != std::string::npos) {
-      settings->set_method(PDLP);
-      settings->set_time_limit(1800.0);
-    }
+    if (is_mip) {
+      auto* settings = mip_request.mutable_settings();
+      settings->set_time_limit(60.0);
+      settings->set_log_to_console(true);
+      settings->set_num_cpu_threads(-1);
+      settings->set_num_gpus(1);
+      settings->set_presolve(true);
+      settings->set_mip_scaling(true);
 
-    // Sanity-check what we're about to send (proto3 only serializes non-default fields)
-    std::cout << "[Client] Prepared SolveLPRequest: bytes=" << lp_request->ByteSizeLong()
-              << " objective_scaling_factor=" << problem->objective_scaling_factor()
-              << " iteration_limit=" << settings->iteration_limit() << std::endl;
+      std::cout << "[Client] Prepared SolveMIPRequest: bytes=" << mip_request.ByteSizeLong()
+                << " objective_scaling_factor=" << problem->objective_scaling_factor() << std::endl;
+    } else {
+      auto* settings = lp_request.mutable_settings();
+      // Give large instances more time by default.
+      settings->set_time_limit(60.0);
+      settings->set_log_to_console(true);
+      // IMPORTANT: proto3 defaults numeric fields to 0. If we don't set this,
+      // cuOpt may interpret iteration_limit=0 as "do zero iterations" and return
+      // PDLP_ITERATION_LIMIT immediately with a trivial objective.
+      // Use -1 sentinel for "unset" so server/library defaults apply.
+      settings->set_iteration_limit(-1);
+      // Allow overriding LP method for known-problem cases (e.g. avoid Concurrent/Barrier issues).
+      if (mps_file_path.find("L2CTA3D.mps") != std::string::npos) {
+        settings->set_method(PDLP);
+        settings->set_time_limit(1800.0);
+      }
+
+      std::cout << "[Client] Prepared SolveLPRequest: bytes=" << lp_request.ByteSizeLong()
+                << " objective_scaling_factor=" << problem->objective_scaling_factor()
+                << " iteration_limit=" << settings->iteration_limit() << std::endl;
+    }
 
     // Streaming Upload+Submit (chunked)
     std::cout << "[Client] Uploading + submitting job (streaming)..." << std::endl;
-    std::string job_id = UploadAndSubmitLP(*lp_request);
+    std::string job_id = is_mip ? UploadAndSubmitMIP(mip_request) : UploadAndSubmitLP(lp_request);
     if (job_id.empty()) {
       std::cerr << "[Client] UploadAndSubmit failed" << std::endl;
       return "";
@@ -360,7 +431,7 @@ class CuOptGrpcClient {
     }
   }
 
-  bool GetResult(const std::string& job_id)
+  bool GetResult(const std::string& job_id, bool is_mip)
   {
     // Prefer streaming result to avoid any total result size limit.
     // (Each streamed chunk must still fit within gRPC per-message limits.)
@@ -415,9 +486,31 @@ class CuOptGrpcClient {
         close(fd);
         // fall through to unary GetResult as a fallback
       } else if (saw_done) {
-        // Parse as LP solution (this test client is LP-only)
-        cuopt::remote::LPSolution lp_solution;
         lseek(fd, 0, SEEK_SET);
+        if (is_mip) {
+          cuopt::remote::MIPSolution mip_solution;
+          if (!mip_solution.ParseFromFileDescriptor(fd)) {
+            std::cerr << "[Client] Failed to parse streamed MIP solution" << std::endl;
+            close(fd);
+            return false;
+          }
+          close(fd);
+          std::cout << "\n[Client] ============ REMOTE RESULT (STREAM) ============" << std::endl;
+          std::cout << "[Client] Termination Status: " << mip_solution.termination_status()
+                    << std::endl;
+          std::cout << "[Client] Objective: " << mip_solution.objective() << std::endl;
+          std::cout << "[Client] Solution size: " << mip_solution.solution_size() << std::endl;
+          std::cout << "[Client] Nodes: " << mip_solution.nodes() << std::endl;
+          std::cout << "[Client] Solve time: " << mip_solution.total_solve_time() << " seconds"
+                    << std::endl;
+          if (!mip_solution.error_message().empty()) {
+            std::cout << "[Client] Error: " << mip_solution.error_message() << std::endl;
+          }
+          std::cout << "[Client] ================================================\n" << std::endl;
+          return true;
+        }
+
+        cuopt::remote::LPSolution lp_solution;
         if (!lp_solution.ParseFromFileDescriptor(fd)) {
           std::cerr << "[Client] Failed to parse streamed LP solution" << std::endl;
           close(fd);
@@ -470,6 +563,17 @@ class CuOptGrpcClient {
         if (!lp_sol.error_message().empty()) {
           std::cout << "[Client] Error: " << lp_sol.error_message() << std::endl;
         }
+      } else if (response.has_mip_solution()) {
+        const auto& mip_sol = response.mip_solution();
+        std::cout << "[Client] Termination Status: " << mip_sol.termination_status() << std::endl;
+        std::cout << "[Client] Objective: " << mip_sol.objective() << std::endl;
+        std::cout << "[Client] Solution size: " << mip_sol.solution_size() << std::endl;
+        std::cout << "[Client] Nodes: " << mip_sol.nodes() << std::endl;
+        std::cout << "[Client] Solve time: " << mip_sol.total_solve_time() << " seconds"
+                  << std::endl;
+        if (!mip_sol.error_message().empty()) {
+          std::cout << "[Client] Error: " << mip_sol.error_message() << std::endl;
+        }
       }
 
       if (!response.error_message().empty()) {
@@ -496,6 +600,8 @@ int main(int argc, char** argv)
   bool submit_only           = false;
   int max_wait_sec           = 30;
   bool stream_logs           = false;
+  bool stream_incumbents     = false;
+  bool is_mip                = false;
 
   if (argc > 1) { mps_file = argv[1]; }
   if (argc > 2) { server_address = argv[2]; }
@@ -509,6 +615,10 @@ int main(int argc, char** argv)
       max_wait_sec = std::stoi(argv[++i]);
     } else if (arg == "--stream-logs") {
       stream_logs = true;
+    } else if (arg == "--stream-incumbents") {
+      stream_incumbents = true;
+    } else if (arg == "--mip") {
+      is_mip = true;
     }
   }
 
@@ -522,7 +632,7 @@ int main(int argc, char** argv)
     grpc::CreateCustomChannel(server_address, grpc::InsecureChannelCredentials(), args));
 
   // Submit job
-  std::string job_id = client.SubmitMpsFile(mps_file);
+  std::string job_id = client.SubmitMpsFile(mps_file, is_mip);
   if (job_id.empty()) { return 1; }
   if (submit_only) {
     std::cout << "[Client] Submit-only mode; exiting after SubmitJob." << std::endl;
@@ -535,6 +645,15 @@ int main(int argc, char** argv)
     std::cout << "[Client] Streaming server logs..." << std::endl;
     log_thread = std::thread(
       [&client, &job_id, &stop_logs]() { client.StreamLogsToStdout(job_id, stop_logs); });
+  }
+
+  std::atomic<bool> stop_incumbents{false};
+  std::thread incumbent_thread;
+  if (stream_incumbents) {
+    std::cout << "[Client] Streaming incumbent solutions..." << std::endl;
+    incumbent_thread = std::thread([&client, &job_id, &stop_incumbents]() {
+      client.StreamIncumbentsToStdout(job_id, stop_incumbents);
+    });
   }
 
   // Poll for completion
@@ -559,11 +678,15 @@ int main(int argc, char** argv)
   }
 
   // Get result
-  if (!client.GetResult(job_id)) { return 1; }
+  if (!client.GetResult(job_id, is_mip)) { return 1; }
 
   if (stream_logs) {
     stop_logs = true;
     if (log_thread.joinable()) { log_thread.join(); }
+  }
+  if (stream_incumbents) {
+    stop_incumbents = true;
+    if (incumbent_thread.joinable()) { incumbent_thread.join(); }
   }
 
   std::cout << "[Client] Test completed successfully" << std::endl;

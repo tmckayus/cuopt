@@ -24,9 +24,11 @@
 #include "cuopt_remote_service.grpc.pb.h"
 
 #include <cuopt/linear_programming/solve.hpp>
+#include <cuopt/linear_programming/utilities/internals.hpp>
 #include <cuopt/linear_programming/utilities/remote_serialization.hpp>
 #include <mps_parser/mps_data_model.hpp>
 
+#include <cuda_runtime.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/mman.h>
@@ -110,11 +112,17 @@ struct SharedMemoryControl {
 
 enum class JobStatus { QUEUED, PROCESSING, COMPLETED, FAILED, NOT_FOUND, CANCELLED };
 
+struct IncumbentEntry {
+  double objective = 0.0;
+  std::vector<double> assignment;
+};
+
 struct JobInfo {
   std::string job_id;
   JobStatus status;
   std::chrono::steady_clock::time_point submit_time;
   std::vector<uint8_t> result_data;
+  std::vector<IncumbentEntry> incumbents;
   bool is_mip;
   std::string error_message;
   bool is_blocking;
@@ -169,6 +177,8 @@ struct WorkerPipes {
   int from_worker_fd;
   int worker_read_fd;
   int worker_write_fd;
+  int incumbent_from_worker_fd;
+  int worker_incumbent_write_fd;
 };
 
 std::vector<WorkerPipes> worker_pipes;
@@ -229,6 +239,7 @@ void spawn_workers();
 void wait_for_workers();
 void worker_monitor_thread();
 void result_retrieval_thread();
+void incumbent_retrieval_thread();
 
 // Pipe and shared memory functions
 static bool write_to_pipe(int fd, const void* data, size_t size);
@@ -239,6 +250,8 @@ static bool send_job_data_pipe_file(int worker_idx,
                                     uint64_t expected_size);
 static bool recv_job_data_pipe(int fd, uint64_t expected_size, std::vector<uint8_t>& data);
 static bool send_result_pipe(int fd, const std::vector<uint8_t>& data);
+static bool send_incumbent_pipe(int fd, const std::vector<uint8_t>& data);
+static bool recv_incumbent_pipe(int fd, std::vector<uint8_t>& data);
 static bool recv_result_pipe(int worker_idx, uint64_t expected_size, std::vector<uint8_t>& data);
 static std::string create_job_shm(const std::string& job_id,
                                   const std::vector<uint8_t>& data,
@@ -439,7 +452,76 @@ void worker_process(int worker_id)
         cuopt::mps_parser::mps_data_model_t<int, double> mps_data;
         mip_solver_settings_t<int, double> settings;
 
+        class IncumbentPipeCallback : public cuopt::internals::get_solution_callback_t {
+         public:
+          IncumbentPipeCallback(std::string job_id, int fd) : job_id_(std::move(job_id)), fd_(fd) {}
+
+          void get_solution(void* data, void* objective_value) override
+          {
+            if (fd_ < 0 || n_variables == 0) { return; }
+
+            double objective = 0.0;
+            std::vector<double> assignment;
+            assignment.resize(n_variables);
+
+            if (isFloat) {
+              std::vector<float> tmp(n_variables);
+              if (cudaMemcpy(
+                    tmp.data(), data, n_variables * sizeof(float), cudaMemcpyDeviceToHost) !=
+                  cudaSuccess) {
+                return;
+              }
+              for (size_t i = 0; i < n_variables; ++i) {
+                assignment[i] = static_cast<double>(tmp[i]);
+              }
+              float obj = 0.0f;
+              if (cudaMemcpy(&obj, objective_value, sizeof(float), cudaMemcpyDeviceToHost) !=
+                  cudaSuccess) {
+                return;
+              }
+              objective = static_cast<double>(obj);
+            } else {
+              if (cudaMemcpy(assignment.data(),
+                             data,
+                             n_variables * sizeof(double),
+                             cudaMemcpyDeviceToHost) != cudaSuccess) {
+                return;
+              }
+              double obj = 0.0;
+              if (cudaMemcpy(&obj, objective_value, sizeof(double), cudaMemcpyDeviceToHost) !=
+                  cudaSuccess) {
+                return;
+              }
+              objective = obj;
+            }
+
+            cuopt::remote::Incumbent msg;
+            msg.set_job_id(job_id_);
+            msg.set_objective(objective);
+            for (double v : assignment) {
+              msg.add_assignment(v);
+            }
+
+            std::vector<uint8_t> buffer(msg.ByteSizeLong());
+            if (!msg.SerializeToArray(buffer.data(), buffer.size())) { return; }
+            std::cout << "[Worker] Incumbent callback job_id=" << job_id_ << " obj=" << objective
+                      << " vars=" << assignment.size() << "\n";
+            std::cout.flush();
+            send_incumbent_pipe(fd_, buffer);
+          }
+
+         private:
+          std::string job_id_;
+          int fd_;
+        };
+
         if (serializer->deserialize_mip_request(request_data, mps_data, settings)) {
+          IncumbentPipeCallback incumbent_cb(job_id,
+                                             worker_pipes[worker_id].worker_incumbent_write_fd);
+          settings.set_mip_callback(&incumbent_cb);
+          std::cout << "[Worker] Registered incumbent callback for job_id=" << job_id
+                    << " callbacks=" << settings.get_mip_callbacks().size() << "\n";
+          std::cout.flush();
           auto solution = solve_mip(&handle, mps_data, settings);
           solution.to_host(handle.get_stream());
           result_data = serializer->serialize_mip_solution(solution);
@@ -597,6 +679,26 @@ void worker_process(int worker_id)
   _exit(0);
 }
 
+// Create pipe for worker -> server incumbent updates (always enabled)
+bool create_worker_incumbent_pipe(int worker_id)
+{
+  // Ensure worker_pipes has enough slots
+  while (static_cast<int>(worker_pipes.size()) <= worker_id) {
+    worker_pipes.push_back({-1, -1, -1, -1, -1, -1});
+  }
+
+  WorkerPipes& wp = worker_pipes[worker_id];
+
+  int incumbent_pipe[2];
+  if (pipe(incumbent_pipe) < 0) {
+    std::cerr << "[Server] Failed to create incumbent pipe for worker " << worker_id << "\n";
+    return false;
+  }
+  wp.incumbent_from_worker_fd  = incumbent_pipe[0];  // Server reads from this
+  wp.worker_incumbent_write_fd = incumbent_pipe[1];  // Worker writes to this
+  return true;
+}
+
 // Create pipes for a worker (pipe mode only)
 bool create_worker_pipes(int worker_id)
 {
@@ -604,7 +706,7 @@ bool create_worker_pipes(int worker_id)
 
   // Ensure worker_pipes has enough slots
   while (static_cast<int>(worker_pipes.size()) <= worker_id) {
-    worker_pipes.push_back({-1, -1, -1, -1});
+    worker_pipes.push_back({-1, -1, -1, -1, -1, -1});
   }
 
   WorkerPipes& wp = worker_pipes[worker_id];
@@ -635,34 +737,44 @@ bool create_worker_pipes(int worker_id)
 // Close server-side pipe ends for a worker (called when restarting)
 void close_worker_pipes_server(int worker_id)
 {
-  if (!config.use_pipes) return;
   if (worker_id < 0 || worker_id >= static_cast<int>(worker_pipes.size())) return;
 
   WorkerPipes& wp = worker_pipes[worker_id];
-  if (wp.to_worker_fd >= 0) {
-    close(wp.to_worker_fd);
-    wp.to_worker_fd = -1;
+  if (config.use_pipes) {
+    if (wp.to_worker_fd >= 0) {
+      close(wp.to_worker_fd);
+      wp.to_worker_fd = -1;
+    }
+    if (wp.from_worker_fd >= 0) {
+      close(wp.from_worker_fd);
+      wp.from_worker_fd = -1;
+    }
   }
-  if (wp.from_worker_fd >= 0) {
-    close(wp.from_worker_fd);
-    wp.from_worker_fd = -1;
+  if (wp.incumbent_from_worker_fd >= 0) {
+    close(wp.incumbent_from_worker_fd);
+    wp.incumbent_from_worker_fd = -1;
   }
 }
 
 // Close worker-side pipe ends in parent after fork
 void close_worker_pipes_child_ends(int worker_id)
 {
-  if (!config.use_pipes) return;
   if (worker_id < 0 || worker_id >= static_cast<int>(worker_pipes.size())) return;
 
   WorkerPipes& wp = worker_pipes[worker_id];
-  if (wp.worker_read_fd >= 0) {
-    close(wp.worker_read_fd);
-    wp.worker_read_fd = -1;
+  if (config.use_pipes) {
+    if (wp.worker_read_fd >= 0) {
+      close(wp.worker_read_fd);
+      wp.worker_read_fd = -1;
+    }
+    if (wp.worker_write_fd >= 0) {
+      close(wp.worker_write_fd);
+      wp.worker_write_fd = -1;
+    }
   }
-  if (wp.worker_write_fd >= 0) {
-    close(wp.worker_write_fd);
-    wp.worker_write_fd = -1;
+  if (wp.worker_incumbent_write_fd >= 0) {
+    close(wp.worker_incumbent_write_fd);
+    wp.worker_incumbent_write_fd = -1;
   }
 }
 
@@ -672,6 +784,11 @@ void spawn_workers()
     // Create pipes before forking (pipe mode)
     if (config.use_pipes && !create_worker_pipes(i)) {
       std::cerr << "[Server] Failed to create pipes for worker " << i << "\n";
+      continue;
+    }
+    if (!create_worker_incumbent_pipe(i)) {
+      std::cerr << "[Server] Failed to create incumbent pipe for worker " << i << "\n";
+      close_worker_pipes_server(i);
       continue;
     }
 
@@ -689,11 +806,21 @@ void spawn_workers()
             if (worker_pipes[j].worker_write_fd >= 0) close(worker_pipes[j].worker_write_fd);
             if (worker_pipes[j].to_worker_fd >= 0) close(worker_pipes[j].to_worker_fd);
             if (worker_pipes[j].from_worker_fd >= 0) close(worker_pipes[j].from_worker_fd);
+            if (worker_pipes[j].incumbent_from_worker_fd >= 0) {
+              close(worker_pipes[j].incumbent_from_worker_fd);
+            }
+            if (worker_pipes[j].worker_incumbent_write_fd >= 0) {
+              close(worker_pipes[j].worker_incumbent_write_fd);
+            }
           }
         }
         // Close server ends of our pipes
         close(worker_pipes[i].to_worker_fd);
         close(worker_pipes[i].from_worker_fd);
+      }
+      if (worker_pipes[i].incumbent_from_worker_fd >= 0) {
+        close(worker_pipes[i].incumbent_from_worker_fd);
+        worker_pipes[i].incumbent_from_worker_fd = -1;
       }
       worker_process(i);
       _exit(0);  // Should not reach here
@@ -719,13 +846,18 @@ void wait_for_workers()
 pid_t spawn_single_worker(int worker_id)
 {
   // Create new pipes for the replacement worker (pipe mode)
+  close_worker_pipes_server(worker_id);
   if (config.use_pipes) {
-    // Close old pipes first
-    close_worker_pipes_server(worker_id);
     if (!create_worker_pipes(worker_id)) {
       std::cerr << "[Server] Failed to create pipes for replacement worker " << worker_id << "\n";
       return -1;
     }
+  }
+  if (!create_worker_incumbent_pipe(worker_id)) {
+    std::cerr << "[Server] Failed to create incumbent pipe for replacement worker " << worker_id
+              << "\n";
+    close_worker_pipes_server(worker_id);
+    return -1;
   }
 
   pid_t pid = fork();
@@ -743,11 +875,21 @@ pid_t spawn_single_worker(int worker_id)
           if (worker_pipes[j].worker_write_fd >= 0) close(worker_pipes[j].worker_write_fd);
           if (worker_pipes[j].to_worker_fd >= 0) close(worker_pipes[j].to_worker_fd);
           if (worker_pipes[j].from_worker_fd >= 0) close(worker_pipes[j].from_worker_fd);
+          if (worker_pipes[j].incumbent_from_worker_fd >= 0) {
+            close(worker_pipes[j].incumbent_from_worker_fd);
+          }
+          if (worker_pipes[j].worker_incumbent_write_fd >= 0) {
+            close(worker_pipes[j].worker_incumbent_write_fd);
+          }
         }
       }
       // Close server ends of our pipes
       close(worker_pipes[worker_id].to_worker_fd);
       close(worker_pipes[worker_id].from_worker_fd);
+    }
+    if (worker_pipes[worker_id].incumbent_from_worker_fd >= 0) {
+      close(worker_pipes[worker_id].incumbent_from_worker_fd);
+      worker_pipes[worker_id].incumbent_from_worker_fd = -1;
     }
     worker_process(worker_id);
     _exit(0);  // Should not reach here
@@ -1110,6 +1252,79 @@ void result_retrieval_thread()
   std::cout.flush();
 }
 
+void incumbent_retrieval_thread()
+{
+  std::cout << "[Server] Incumbent retrieval thread started\n";
+  std::cout.flush();
+
+  while (keep_running) {
+    std::vector<pollfd> pfds;
+    pfds.reserve(worker_pipes.size());
+    for (const auto& wp : worker_pipes) {
+      if (wp.incumbent_from_worker_fd >= 0) {
+        pollfd pfd;
+        pfd.fd      = wp.incumbent_from_worker_fd;
+        pfd.events  = POLLIN;
+        pfd.revents = 0;
+        pfds.push_back(pfd);
+      }
+    }
+
+    if (pfds.empty()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      continue;
+    }
+
+    int poll_result = poll(pfds.data(), pfds.size(), 100);
+    if (poll_result < 0) {
+      if (errno == EINTR) continue;
+      std::cerr << "[Server] poll() failed in incumbent thread: " << strerror(errno) << "\n";
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      continue;
+    }
+    if (poll_result == 0) { continue; }
+
+    for (const auto& pfd : pfds) {
+      if (!(pfd.revents & POLLIN)) { continue; }
+      std::vector<uint8_t> data;
+      if (!recv_incumbent_pipe(pfd.fd, data)) { continue; }
+      if (data.empty()) { continue; }
+
+      cuopt::remote::Incumbent incumbent_msg;
+      if (!incumbent_msg.ParseFromArray(data.data(), data.size())) {
+        std::cerr << "[Server] Failed to parse incumbent payload\n";
+        continue;
+      }
+
+      const std::string job_id = incumbent_msg.job_id();
+      if (job_id.empty()) { continue; }
+
+      IncumbentEntry entry;
+      entry.objective = incumbent_msg.objective();
+      entry.assignment.reserve(incumbent_msg.assignment_size());
+      for (int i = 0; i < incumbent_msg.assignment_size(); ++i) {
+        entry.assignment.push_back(incumbent_msg.assignment(i));
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(tracker_mutex);
+        auto it = job_tracker.find(job_id);
+        if (it != job_tracker.end()) {
+          it->second.incumbents.push_back(std::move(entry));
+          std::cout << "[Server] Stored incumbent job_id=" << job_id
+                    << " idx=" << (it->second.incumbents.size() - 1)
+                    << " obj=" << incumbent_msg.objective()
+                    << " vars=" << incumbent_msg.assignment_size() << "\n";
+          std::cout.flush();
+        }
+      }
+    }
+  }
+
+  std::cout << "[Server] Incumbent retrieval thread stopped\n";
+  std::cout.flush();
+}
+
 static std::string create_job_shm(const std::string& job_id,
                                   const std::vector<uint8_t>& data,
                                   const char* prefix)
@@ -1155,6 +1370,15 @@ static int64_t get_upload_mem_threshold_bytes()
   } catch (...) {
     return 1LL << 30;
   }
+}
+
+static std::string read_file_to_string(const std::string& path)
+{
+  std::ifstream in(path, std::ios::in | std::ios::binary);
+  if (!in.is_open()) { return ""; }
+  std::ostringstream ss;
+  ss << in.rdbuf();
+  return ss.str();
 }
 
 // Read data from per-job shared memory segment
@@ -1339,6 +1563,25 @@ static bool send_result_pipe(int fd, const std::vector<uint8_t>& data)
   if (!write_to_pipe(fd, &size, sizeof(size))) return false;
   // Send data
   if (size > 0 && !write_to_pipe(fd, data.data(), data.size())) return false;
+  return true;
+}
+
+// Send incumbent data to server via pipe (length-prefixed) - called by worker
+static bool send_incumbent_pipe(int fd, const std::vector<uint8_t>& data)
+{
+  uint64_t size = data.size();
+  if (!write_to_pipe(fd, &size, sizeof(size))) return false;
+  if (size > 0 && !write_to_pipe(fd, data.data(), data.size())) return false;
+  return true;
+}
+
+// Receive incumbent data from worker via pipe (length-prefixed)
+static bool recv_incumbent_pipe(int fd, std::vector<uint8_t>& data)
+{
+  uint64_t size;
+  if (!read_from_pipe(fd, &size, sizeof(size))) return false;
+  data.resize(size);
+  if (size > 0 && !read_from_pipe(fd, data.data(), size)) return false;
   return true;
 }
 
@@ -1825,8 +2068,8 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
     // Add to job tracker
     {
       std::lock_guard<std::mutex> lock(tracker_mutex);
-      job_tracker[job_id] =
-        JobInfo{job_id, JobStatus::QUEUED, std::chrono::steady_clock::now(), {}, !is_lp, "", false};
+      job_tracker[job_id] = JobInfo{
+        job_id, JobStatus::QUEUED, std::chrono::steady_clock::now(), {}, {}, !is_lp, "", false};
     }
 
     // Publish job to workers: release reservation and set ready last.
@@ -2101,8 +2344,8 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
 
     {
       std::lock_guard<std::mutex> lock(tracker_mutex);
-      job_tracker[job_id] =
-        JobInfo{job_id, JobStatus::QUEUED, std::chrono::steady_clock::now(), {}, is_mip, "", false};
+      job_tracker[job_id] = JobInfo{
+        job_id, JobStatus::QUEUED, std::chrono::steady_clock::now(), {}, {}, is_mip, "", false};
     }
 
     job_queue[job_idx].claimed.store(false);
@@ -2484,6 +2727,53 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
 
     return Status::OK;
   }
+
+  Status GetIncumbents(ServerContext* context,
+                       const cuopt::remote::IncumbentRequest* request,
+                       cuopt::remote::IncumbentResponse* response) override
+  {
+    (void)context;
+    const std::string job_id = request->job_id();
+    int64_t from_index       = request->from_index();
+    int32_t max_count        = request->max_count();
+
+    if (from_index < 0) { from_index = 0; }
+
+    std::lock_guard<std::mutex> lock(tracker_mutex);
+    auto it = job_tracker.find(job_id);
+    if (it == job_tracker.end()) { return Status(StatusCode::NOT_FOUND, "Job not found"); }
+
+    const auto& incumbents = it->second.incumbents;
+    int64_t available      = static_cast<int64_t>(incumbents.size());
+    if (from_index > available) { from_index = available; }
+
+    int64_t count = available - from_index;
+    if (max_count > 0 && count > max_count) { count = max_count; }
+
+    for (int64_t i = 0; i < count; ++i) {
+      const auto& inc = incumbents[static_cast<size_t>(from_index + i)];
+      auto* out       = response->add_incumbents();
+      out->set_index(from_index + i);
+      out->set_objective(inc.objective);
+      for (double v : inc.assignment) {
+        out->add_assignment(v);
+      }
+      out->set_job_id(job_id);
+    }
+
+    response->set_next_index(available);
+    bool done =
+      (it->second.status == JobStatus::COMPLETED || it->second.status == JobStatus::FAILED ||
+       it->second.status == JobStatus::CANCELLED);
+    response->set_job_complete(done);
+    if (config.verbose) {
+      std::cout << "[gRPC] GetIncumbents job_id=" << job_id << " from=" << from_index
+                << " returned=" << response->incumbents_size() << " next=" << available
+                << " done=" << (done ? 1 : 0) << "\n";
+      std::cout.flush();
+    }
+    return Status::OK;
+  }
 };
 
 // ============================================================================
@@ -2675,6 +2965,9 @@ int main(int argc, char** argv)
   // Start result retrieval thread
   std::thread result_thread(result_retrieval_thread);
 
+  // Start incumbent retrieval thread
+  std::thread incumbent_thread(incumbent_retrieval_thread);
+
   // Start worker monitor thread
   std::thread monitor_thread(worker_monitor_thread);
 
@@ -2756,6 +3049,7 @@ int main(int argc, char** argv)
   result_cv.notify_all();
 
   if (result_thread.joinable()) result_thread.join();
+  if (incumbent_thread.joinable()) incumbent_thread.join();
   if (monitor_thread.joinable()) monitor_thread.join();
 
   wait_for_workers();

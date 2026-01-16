@@ -4,6 +4,7 @@
  */
 
 #include <cuopt/linear_programming/constants.h>
+#include <cuopt/linear_programming/utilities/internals.hpp>
 #include <cuopt/linear_programming/utilities/remote_serialization.hpp>
 #include <cuopt/linear_programming/utilities/remote_solve.hpp>
 #include <utilities/logger.hpp>
@@ -17,6 +18,8 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#include <cuda_runtime.h>
 
 #include <cstring>
 #include <iostream>
@@ -51,6 +54,80 @@ static bool use_grpc_transport()
 #endif
 }
 
+template <typename f_t>
+bool copy_incumbent_to_device(const std::vector<double>& host_assignment,
+                              double host_objective,
+                              f_t** d_assignment_out,
+                              f_t** d_objective_out)
+{
+  *d_assignment_out = nullptr;
+  *d_objective_out  = nullptr;
+  if (host_assignment.empty()) { return false; }
+
+  size_t n = host_assignment.size();
+  std::vector<f_t> assignment(n);
+  for (size_t i = 0; i < n; ++i) {
+    assignment[i] = static_cast<f_t>(host_assignment[i]);
+  }
+  f_t objective = static_cast<f_t>(host_objective);
+
+  if (cudaMalloc(reinterpret_cast<void**>(d_assignment_out), n * sizeof(f_t)) != cudaSuccess) {
+    CUOPT_LOG_WARN("[remote_solve] Failed to cudaMalloc for incumbent assignment");
+    return false;
+  }
+  if (cudaMalloc(reinterpret_cast<void**>(d_objective_out), sizeof(f_t)) != cudaSuccess) {
+    CUOPT_LOG_WARN("[remote_solve] Failed to cudaMalloc for incumbent objective");
+    cudaFree(*d_assignment_out);
+    *d_assignment_out = nullptr;
+    return false;
+  }
+
+  if (cudaMemcpy(*d_assignment_out, assignment.data(), n * sizeof(f_t), cudaMemcpyHostToDevice) !=
+      cudaSuccess) {
+    CUOPT_LOG_WARN("[remote_solve] Failed to cudaMemcpy incumbent assignment");
+    cudaFree(*d_assignment_out);
+    cudaFree(*d_objective_out);
+    *d_assignment_out = nullptr;
+    *d_objective_out  = nullptr;
+    return false;
+  }
+  if (cudaMemcpy(*d_objective_out, &objective, sizeof(f_t), cudaMemcpyHostToDevice) !=
+      cudaSuccess) {
+    CUOPT_LOG_WARN("[remote_solve] Failed to cudaMemcpy incumbent objective");
+    cudaFree(*d_assignment_out);
+    cudaFree(*d_objective_out);
+    *d_assignment_out = nullptr;
+    *d_objective_out  = nullptr;
+    return false;
+  }
+
+  return true;
+}
+
+template <typename f_t>
+void invoke_incumbent_callbacks(
+  const std::vector<cuopt::internals::base_solution_callback_t*>& callbacks,
+  const std::vector<double>& assignment,
+  double objective)
+{
+  f_t* d_assignment = nullptr;
+  f_t* d_objective  = nullptr;
+  if (!copy_incumbent_to_device<f_t>(assignment, objective, &d_assignment, &d_objective)) {
+    return;
+  }
+
+  for (auto* cb : callbacks) {
+    if (cb == nullptr) { continue; }
+    if (cb->get_type() != cuopt::internals::base_solution_callback_type::GET_SOLUTION) { continue; }
+    auto* get_cb = static_cast<cuopt::internals::get_solution_callback_t*>(cb);
+    get_cb->get_solution(d_assignment, d_objective);
+  }
+
+  cudaDeviceSynchronize();
+  cudaFree(d_assignment);
+  cudaFree(d_objective);
+}
+
 /**
  * @brief Simple socket client for remote solve with streaming support
  */
@@ -72,7 +149,7 @@ class remote_client_t {
 
     struct hostent* server = gethostbyname(host_.c_str());
     if (server == nullptr) {
-      CUOPT_LOG_ERROR("[remote_solve] Unknown host: {}", host_);
+      CUOPT_LOG_ERROR(std::string("[remote_solve] Unknown host: ") + host_);
       close(sockfd_);
       sockfd_ = -1;
       return false;
@@ -85,7 +162,8 @@ class remote_client_t {
     addr.sin_port = htons(port_);
 
     if (::connect(sockfd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-      CUOPT_LOG_ERROR("[remote_solve] Failed to connect to {}:{}", host_, port_);
+      CUOPT_LOG_ERROR(std::string("[remote_solve] Failed to connect to ") + host_ + ":" +
+                      std::to_string(port_));
       close(sockfd_);
       sockfd_ = -1;
       return false;
@@ -143,7 +221,8 @@ class remote_client_t {
 
       // Sanity check - reject messages larger than 16GB
       if (payload_size > 16ULL * 1024 * 1024 * 1024) {
-        CUOPT_LOG_ERROR("[remote_solve] Message too large: {} bytes", payload_size);
+        CUOPT_LOG_ERROR(std::string("[remote_solve] Message too large: ") +
+                        std::to_string(payload_size) + " bytes");
         return false;
       }
 
@@ -167,7 +246,8 @@ class remote_client_t {
         }
         return true;
       } else {
-        CUOPT_LOG_WARN("[remote_solve] Unknown message type: {}", static_cast<int>(msg_type));
+        CUOPT_LOG_WARN(std::string("[remote_solve] Unknown message type: ") +
+                       std::to_string(static_cast<int>(msg_type)));
         // Skip unknown message
         if (payload_size > 0) {
           std::vector<uint8_t> skip_buf(payload_size);
@@ -191,7 +271,8 @@ class remote_client_t {
 
     // Sanity check - reject responses larger than 16GB
     if (size > 16ULL * 1024 * 1024 * 1024) {
-      CUOPT_LOG_ERROR("[remote_solve] Response too large: {} bytes", size);
+      CUOPT_LOG_ERROR(std::string("[remote_solve] Response too large: ") + std::to_string(size) +
+                      " bytes");
       return false;
     }
 
@@ -343,16 +424,16 @@ static bool poll_until_complete(const std::string& host,
       // Fetch any remaining log entries
       if (verbose) {
         get_logs<i_t, f_t>(host, port, job_id, log_frombyte);
-        CUOPT_LOG_INFO("[remote_solve] Job {} completed", job_id);
+        CUOPT_LOG_INFO(std::string("[remote_solve] Job ") + job_id + " completed");
       }
       return true;
     } else if (status == job_status_t::FAILED) {
       // Fetch any remaining log entries (may contain error info)
       if (verbose) { get_logs<i_t, f_t>(host, port, job_id, log_frombyte); }
-      CUOPT_LOG_ERROR("[remote_solve] Job {} failed", job_id);
+      CUOPT_LOG_ERROR(std::string("[remote_solve] Job ") + job_id + " failed");
       return false;
     } else if (status == job_status_t::NOT_FOUND) {
-      CUOPT_LOG_ERROR("[remote_solve] Job {} not found", job_id);
+      CUOPT_LOG_ERROR(std::string("[remote_solve] Job ") + job_id + " not found");
       return false;
     }
 
@@ -487,7 +568,8 @@ optimization_problem_solution_t<i_t, f_t> solve_lp_remote(
 
     // Serialize as SolveLPRequest (server expects this protobuf, not AsyncRequest)
     std::vector<uint8_t> request_data = serializer->serialize_lp_request(view, settings);
-    CUOPT_LOG_DEBUG("[remote_solve] Serialized LP request (gRPC): {} bytes", request_data.size());
+    CUOPT_LOG_DEBUG(std::string("[remote_solve] Serialized LP request (gRPC): ") +
+                    std::to_string(request_data.size()) + " bytes");
 
     std::string job_id;
     std::string err;
@@ -568,8 +650,8 @@ optimization_problem_solution_t<i_t, f_t> solve_lp_remote(
     // Serialize as async request with blocking=true
     std::vector<uint8_t> request_data =
       serializer->serialize_async_lp_request(view, settings, true /* blocking */);
-    CUOPT_LOG_DEBUG("[remote_solve] Serialized LP request (blocking): {} bytes",
-                    request_data.size());
+    CUOPT_LOG_DEBUG(std::string("[remote_solve] Serialized LP request (blocking): ") +
+                    std::to_string(request_data.size()) + " bytes");
 
     // Connect and send
     remote_client_t client(config.host, config.port);
@@ -590,7 +672,8 @@ optimization_problem_solution_t<i_t, f_t> solve_lp_remote(
         "Failed to receive response from remote server", cuopt::error_type_t::RuntimeError));
     }
 
-    CUOPT_LOG_DEBUG("[remote_solve] Received LP result (blocking): {} bytes", response_data.size());
+    CUOPT_LOG_DEBUG(std::string("[remote_solve] Received LP result (blocking): ") +
+                    std::to_string(response_data.size()) + " bytes");
 
     // Deserialize solution from result response (same format as async GET_RESULT)
     return serializer->deserialize_lp_result_response(response_data);
@@ -603,7 +686,8 @@ optimization_problem_solution_t<i_t, f_t> solve_lp_remote(
     // Serialize as async request with blocking=false
     std::vector<uint8_t> request_data =
       serializer->serialize_async_lp_request(view, settings, false /* blocking */);
-    CUOPT_LOG_DEBUG("[remote_solve] Serialized LP request (async): {} bytes", request_data.size());
+    CUOPT_LOG_DEBUG(std::string("[remote_solve] Serialized LP request (async): ") +
+                    std::to_string(request_data.size()) + " bytes");
 
     // Submit job
     auto [submit_ok, job_id_or_error] =
@@ -613,7 +697,7 @@ optimization_problem_solution_t<i_t, f_t> solve_lp_remote(
         "Job submission failed: " + job_id_or_error, cuopt::error_type_t::RuntimeError));
     }
     std::string job_id = job_id_or_error;
-    CUOPT_LOG_INFO("[remote_solve] Job submitted, ID: {}", job_id);
+    CUOPT_LOG_INFO(std::string("[remote_solve] Job submitted, ID: ") + job_id);
 
     // Poll until complete
     if (!poll_until_complete<i_t, f_t>(config.host, config.port, job_id, settings.log_to_console)) {
@@ -632,7 +716,7 @@ optimization_problem_solution_t<i_t, f_t> solve_lp_remote(
 
     // Delete job from server
     delete_job<i_t, f_t>(config.host, config.port, job_id);
-    CUOPT_LOG_DEBUG("[remote_solve] Job {} deleted from server", job_id);
+    CUOPT_LOG_DEBUG(std::string("[remote_solve] Job ") + job_id + " deleted from server");
 
     // Deserialize solution from async result response
     return serializer->deserialize_lp_result_response(result_data);
@@ -679,7 +763,8 @@ mip_solution_t<i_t, f_t> solve_mip_remote(
     const std::string address = config.host + ":" + std::to_string(config.port);
 
     std::vector<uint8_t> request_data = serializer->serialize_mip_request(view, settings);
-    CUOPT_LOG_DEBUG("[remote_solve] Serialized MIP request (gRPC): {} bytes", request_data.size());
+    CUOPT_LOG_DEBUG(std::string("[remote_solve] Serialized MIP request (gRPC): ") +
+                    std::to_string(request_data.size()) + " bytes");
 
     std::string job_id;
     std::string err;
@@ -700,6 +785,19 @@ mip_solution_t<i_t, f_t> solve_mip_remote(
         std::thread([&]() { grpc_remote::stream_logs_to_stdout(address, job_id, &stop_logs, ""); });
     }
 
+    std::vector<cuopt::internals::base_solution_callback_t*> callbacks =
+      settings.get_mip_callbacks();
+    int64_t incumbent_index = 0;
+    bool incumbents_done    = callbacks.empty();
+    CUOPT_LOG_INFO(std::string("[remote_solve] MIP incumbent callbacks: ") +
+                   std::to_string(callbacks.size()));
+    if (!callbacks.empty()) {
+      size_t n_vars = view.get_objective_coefficients().size();
+      for (auto* cb : callbacks) {
+        if (cb != nullptr) { cb->setup<f_t>(n_vars); }
+      }
+    }
+
     std::string status;
     while (true) {
       std::string st_err;
@@ -709,6 +807,33 @@ mip_solution_t<i_t, f_t> solve_mip_remote(
         grpc_remote::delete_result(address, job_id);
         return mip_solution_t<i_t, f_t>(cuopt::logic_error("gRPC CheckStatus failed: " + st_err,
                                                            cuopt::error_type_t::RuntimeError));
+      }
+
+      if (!incumbents_done) {
+        std::vector<grpc_remote::Incumbent> incumbents;
+        int64_t next_index = incumbent_index;
+        bool job_complete  = false;
+        std::string inc_err;
+        if (grpc_remote::get_incumbents(address,
+                                        job_id,
+                                        incumbent_index,
+                                        32,
+                                        incumbents,
+                                        next_index,
+                                        job_complete,
+                                        inc_err)) {
+          if (!incumbents.empty()) {
+            CUOPT_LOG_INFO(std::string("[remote_solve] Received ") +
+                           std::to_string(incumbents.size()) + " incumbents");
+          }
+          for (const auto& inc : incumbents) {
+            invoke_incumbent_callbacks<f_t>(callbacks, inc.assignment, inc.objective);
+          }
+          incumbent_index = next_index;
+          if (job_complete) { incumbents_done = true; }
+        } else if (!inc_err.empty()) {
+          CUOPT_LOG_WARN(std::string("[remote_solve] GetIncumbents failed: ") + inc_err);
+        }
       }
 
       if (status == "COMPLETED") { break; }
@@ -721,6 +846,30 @@ mip_solution_t<i_t, f_t> solve_mip_remote(
                              cuopt::error_type_t::RuntimeError));
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    if (!incumbents_done) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      // Final drain after completion to catch any last incumbents.
+      for (int i = 0; i < 5; ++i) {
+        std::vector<grpc_remote::Incumbent> incumbents;
+        int64_t next_index = incumbent_index;
+        bool job_complete  = false;
+        std::string inc_err;
+        if (!grpc_remote::get_incumbents(
+              address, job_id, incumbent_index, 0, incumbents, next_index, job_complete, inc_err)) {
+          break;
+        }
+        if (incumbents.empty() && next_index == incumbent_index) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          continue;
+        }
+        for (const auto& inc : incumbents) {
+          invoke_incumbent_callbacks<f_t>(callbacks, inc.assignment, inc.objective);
+        }
+        incumbent_index = next_index;
+        if (job_complete) { break; }
+      }
     }
 
     std::vector<uint8_t> solution_bytes;
@@ -752,8 +901,8 @@ mip_solution_t<i_t, f_t> solve_mip_remote(
 
     std::vector<uint8_t> request_data =
       serializer->serialize_async_mip_request(view, settings, true /* blocking */);
-    CUOPT_LOG_DEBUG("[remote_solve] Serialized MIP request (blocking): {} bytes",
-                    request_data.size());
+    CUOPT_LOG_DEBUG(std::string("[remote_solve] Serialized MIP request (blocking): ") +
+                    std::to_string(request_data.size()) + " bytes");
 
     remote_client_t client(config.host, config.port);
     if (!client.connect()) {
@@ -773,8 +922,8 @@ mip_solution_t<i_t, f_t> solve_mip_remote(
         "Failed to receive response from remote server", cuopt::error_type_t::RuntimeError));
     }
 
-    CUOPT_LOG_DEBUG("[remote_solve] Received MIP result (blocking): {} bytes",
-                    response_data.size());
+    CUOPT_LOG_DEBUG(std::string("[remote_solve] Received MIP result (blocking): ") +
+                    std::to_string(response_data.size()) + " bytes");
 
     // Deserialize solution from result response (same format as async GET_RESULT)
     return serializer->deserialize_mip_result_response(response_data);
@@ -786,7 +935,8 @@ mip_solution_t<i_t, f_t> solve_mip_remote(
 
     std::vector<uint8_t> request_data =
       serializer->serialize_async_mip_request(view, settings, false /* blocking */);
-    CUOPT_LOG_DEBUG("[remote_solve] Serialized MIP request (async): {} bytes", request_data.size());
+    CUOPT_LOG_DEBUG(std::string("[remote_solve] Serialized MIP request (async): ") +
+                    std::to_string(request_data.size()) + " bytes");
 
     // Submit job
     auto [submit_ok, job_id_or_error] =
@@ -796,7 +946,7 @@ mip_solution_t<i_t, f_t> solve_mip_remote(
         "Job submission failed: " + job_id_or_error, cuopt::error_type_t::RuntimeError));
     }
     std::string job_id = job_id_or_error;
-    CUOPT_LOG_INFO("[remote_solve] Job submitted, ID: {}", job_id);
+    CUOPT_LOG_INFO(std::string("[remote_solve] Job submitted, ID: ") + job_id);
 
     // Poll until complete
     if (!poll_until_complete<i_t, f_t>(config.host, config.port, job_id, true /* verbose */)) {
@@ -815,7 +965,7 @@ mip_solution_t<i_t, f_t> solve_mip_remote(
 
     // Delete job from server
     delete_job<i_t, f_t>(config.host, config.port, job_id);
-    CUOPT_LOG_DEBUG("[remote_solve] Job {} deleted from server", job_id);
+    CUOPT_LOG_DEBUG(std::string("[remote_solve] Job ") + job_id + " deleted from server");
 
     // Deserialize solution from async result response
     return serializer->deserialize_mip_result_response(result_data);
@@ -829,7 +979,8 @@ mip_solution_t<i_t, f_t> solve_mip_remote(
 cancel_job_result_t cancel_job_remote(const remote_solve_config_t& config,
                                       const std::string& job_id)
 {
-  CUOPT_LOG_INFO("[remote_solve] Cancelling job {} on {}:{}", job_id, config.host, config.port);
+  CUOPT_LOG_INFO(std::string("[remote_solve] Cancelling job ") + job_id + " on " + config.host +
+                 ":" + std::to_string(config.port));
 
   // Prefer gRPC cancel when available.
   if (use_grpc_transport()) {
@@ -863,9 +1014,10 @@ cancel_job_result_t cancel_job_remote(const remote_solve_config_t& config,
   auto result = cancel_job_impl<int32_t, double>(config.host, config.port, job_id);
 
   if (result.success) {
-    CUOPT_LOG_INFO("[remote_solve] Job {} cancelled successfully", job_id);
+    CUOPT_LOG_INFO(std::string("[remote_solve] Job ") + job_id + " cancelled successfully");
   } else {
-    CUOPT_LOG_WARN("[remote_solve] Failed to cancel job {}: {}", job_id, result.message);
+    CUOPT_LOG_WARN(std::string("[remote_solve] Failed to cancel job ") + job_id + ": " +
+                   result.message);
   }
 
   return result;

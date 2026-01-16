@@ -55,6 +55,13 @@ service CuOptRemoteService {
   rpc StreamLogs(StreamLogsRequest) returns (stream LogMessage);
 
   // -------------------------
+  // Incumbent Solutions
+  // -------------------------
+
+  // Get any available incumbent solutions since a given index.
+  rpc GetIncumbents(IncumbentRequest) returns (IncumbentResponse);
+
+  // -------------------------
   // Synchronous Operations
   // -------------------------
 
@@ -192,6 +199,29 @@ message LogMessage {
   string line = 1;             // Single log line
   int64 byte_offset = 2;       // Byte offset of this line in log file
   bool job_complete = 3;       // True if this is the last message (job done)
+}
+
+// =============================================================================
+// Incumbent Solutions
+// =============================================================================
+
+message IncumbentRequest {
+  string job_id = 1;
+  int64 from_index = 2;        // Return incumbents starting from this index
+  int32 max_count = 3;         // Optional limit (0 or negative => no limit)
+}
+
+message Incumbent {
+  int64 index = 1;
+  double objective = 2;
+  repeated double assignment = 3;
+  string job_id = 4;
+}
+
+message IncumbentResponse {
+  repeated Incumbent incumbents = 1;
+  int64 next_index = 2;        // Next index the client should request
+  bool job_complete = 3;       // True if job is complete (no more incumbents)
 }
 
 // =============================================================================

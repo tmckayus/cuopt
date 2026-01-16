@@ -1465,12 +1465,13 @@ std::shared_ptr<remote_serializer_t<i_t, f_t>> get_serializer()
 
     if (custom_lib && custom_lib[0] != '\0') {
       // Try to load custom serializer
-      CUOPT_LOG_INFO("[remote_solve] Loading custom serializer from: {}", custom_lib);
+      CUOPT_LOG_INFO(std::string("[remote_solve] Loading custom serializer from: ") + custom_lib);
 
       // Open the shared library
       void* handle = dlopen(custom_lib, RTLD_NOW | RTLD_LOCAL);
       if (!handle) {
-        CUOPT_LOG_ERROR("[remote_solve] Failed to load serializer library: {}", dlerror());
+        CUOPT_LOG_ERROR(std::string("[remote_solve] Failed to load serializer library: ") +
+                        dlerror());
         instance = get_default_serializer<i_t, f_t>();
         return;
       }
@@ -1492,8 +1493,8 @@ std::shared_ptr<remote_serializer_t<i_t, f_t>> get_serializer()
       auto factory       = reinterpret_cast<factory_fn_t>(dlsym(handle, factory_name.c_str()));
 
       if (!factory) {
-        CUOPT_LOG_ERROR(
-          "[remote_solve] Factory function '{}' not found: {}", factory_name, dlerror());
+        CUOPT_LOG_ERROR(std::string("[remote_solve] Factory function '") + factory_name +
+                        "' not found: " + dlerror());
         dlclose(handle);
         instance = get_default_serializer<i_t, f_t>();
         return;
@@ -1501,7 +1502,7 @@ std::shared_ptr<remote_serializer_t<i_t, f_t>> get_serializer()
 
       auto custom_serializer = factory();
       if (custom_serializer) {
-        CUOPT_LOG_INFO("[remote_solve] Using custom serializer: {}",
+        CUOPT_LOG_INFO(std::string("[remote_solve] Using custom serializer: ") +
                        custom_serializer->format_name());
         instance = std::move(custom_serializer);
       } else {
