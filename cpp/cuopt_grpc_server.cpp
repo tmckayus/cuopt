@@ -154,7 +154,12 @@ struct ServerConfig {
   bool verbose    = true;
   bool use_pipes  = true;
   // gRPC max message size in MiB. 0 => unlimited (gRPC uses -1 internally).
-  int max_message_mb = 256;
+  int max_message_mb  = 256;
+  bool enable_tls     = false;
+  bool require_client = false;
+  std::string tls_cert_path;
+  std::string tls_key_path;
+  std::string tls_root_path;
 };
 
 ServerConfig config;
@@ -2495,6 +2500,11 @@ void print_usage(const char* prog)
     << "      --use-shm           Use per-job shared memory for payload transfer (default: pipes)\n"
     << "      --max-message-mb N  gRPC max send/recv message size in MiB (default: 256, "
        "0=unlimited)\n"
+    << "      --tls               Enable TLS (requires --tls-cert and --tls-key)\n"
+    << "      --tls-cert PATH     Path to PEM-encoded server certificate\n"
+    << "      --tls-key PATH      Path to PEM-encoded server private key\n"
+    << "      --tls-root PATH     Path to PEM root certs for client verification\n"
+    << "      --require-client-cert  Require and verify client certs (mTLS)\n"
     << "  -q, --quiet             Reduce verbosity\n"
     << "  -h, --help              Show this help\n";
 }
@@ -2515,6 +2525,16 @@ int main(int argc, char** argv)
       config.use_pipes = false;
     } else if (arg == "--max-message-mb") {
       if (i + 1 < argc) { config.max_message_mb = std::stoi(argv[++i]); }
+    } else if (arg == "--tls") {
+      config.enable_tls = true;
+    } else if (arg == "--tls-cert") {
+      if (i + 1 < argc) { config.tls_cert_path = argv[++i]; }
+    } else if (arg == "--tls-key") {
+      if (i + 1 < argc) { config.tls_key_path = argv[++i]; }
+    } else if (arg == "--tls-root") {
+      if (i + 1 < argc) { config.tls_root_path = argv[++i]; }
+    } else if (arg == "--require-client-cert") {
+      config.require_client = true;
     } else if (arg == "-q" || arg == "--quiet") {
       config.verbose = false;
     } else if (arg == "-h" || arg == "--help") {
@@ -2663,7 +2683,47 @@ int main(int argc, char** argv)
   CuOptRemoteServiceImpl service;
 
   ServerBuilder builder;
-  builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+  std::shared_ptr<grpc::ServerCredentials> creds;
+  if (config.enable_tls) {
+    if (config.tls_cert_path.empty() || config.tls_key_path.empty()) {
+      std::cerr << "[Server] TLS enabled but --tls-cert/--tls-key not provided\n";
+      return 1;
+    }
+    grpc::SslServerCredentialsOptions ssl_opts;
+    grpc::SslServerCredentialsOptions::PemKeyCertPair key_cert;
+    key_cert.cert_chain  = read_file_to_string(config.tls_cert_path);
+    key_cert.private_key = read_file_to_string(config.tls_key_path);
+    if (key_cert.cert_chain.empty() || key_cert.private_key.empty()) {
+      std::cerr << "[Server] Failed to read TLS cert/key files\n";
+      return 1;
+    }
+    ssl_opts.pem_key_cert_pairs.push_back(key_cert);
+
+    if (!config.tls_root_path.empty()) {
+      ssl_opts.pem_root_certs = read_file_to_string(config.tls_root_path);
+      if (ssl_opts.pem_root_certs.empty()) {
+        std::cerr << "[Server] Failed to read TLS root cert file\n";
+        return 1;
+      }
+    }
+
+    if (config.require_client) {
+      if (ssl_opts.pem_root_certs.empty()) {
+        std::cerr << "[Server] --require-client-cert requires --tls-root\n";
+        return 1;
+      }
+      ssl_opts.client_certificate_request =
+        GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY;
+    } else if (!ssl_opts.pem_root_certs.empty()) {
+      ssl_opts.client_certificate_request = GRPC_SSL_REQUEST_CLIENT_CERTIFICATE_AND_VERIFY;
+    }
+
+    creds = grpc::SslServerCredentials(ssl_opts);
+  } else {
+    creds = grpc::InsecureServerCredentials();
+  }
+
+  builder.AddListeningPort(server_address, creds);
   builder.RegisterService(&service);
   // Allow large LP/MIP payloads (e.g. large MPS problems).
   // Note: gRPC uses -1 to mean unlimited.
