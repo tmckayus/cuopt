@@ -228,16 +228,15 @@ create_logger_macros(CUOPT "cuopt::default_logger()" include/cuopt)
 
 find_package(CUDSS REQUIRED)
 
-# gRPC for remote solve service (optional, brings in Protobuf as dependency)
-find_package(gRPC CONFIG)
-if(gRPC_FOUND)
+# gRPC for remote solve service (defaults to enabled)
+option(CUOPT_ENABLE_GRPC "Enable gRPC-based remote solve server" ON)
+if(CUOPT_ENABLE_GRPC)
+  find_package(gRPC CONFIG REQUIRED)
   message(STATUS "Found gRPC: ${gRPC_VERSION}")
-  set(CUOPT_ENABLE_GRPC ON)
   add_compile_definitions(CUOPT_ENABLE_GRPC)
   # gRPC brings in Protobuf, no need to find it separately
 else()
-  message(STATUS "gRPC not found, gRPC-based remote solve will be disabled")
-  set(CUOPT_ENABLE_GRPC OFF)
+  message(STATUS "CUOPT_ENABLE_GRPC=OFF, gRPC-based remote solve disabled")
   # If no gRPC, find Protobuf separately for legacy remote solve
   find_package(Protobuf REQUIRED)
 endif()
@@ -708,143 +707,143 @@ if(BUILD_REMOTE_SERVER AND NOT BUILD_LP_ONLY)
     COMPONENT runtime
     RUNTIME DESTINATION ${_BIN_DEST}
   )
+endif()
 
-  # cuopt_grpc_server - gRPC-based remote server (prototype)
-  if(CUOPT_ENABLE_GRPC)
-    add_executable(cuopt_grpc_server cuopt_grpc_server.cpp)
-    target_compile_options(cuopt_grpc_server
-      PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>"
-    )
-    target_include_directories(cuopt_grpc_server
-      PRIVATE
-      "${CMAKE_CURRENT_SOURCE_DIR}/src"
-      "${CMAKE_CURRENT_SOURCE_DIR}/include"
-      "${CMAKE_CURRENT_SOURCE_DIR}/libmps_parser/include"
-      "${CMAKE_CURRENT_BINARY_DIR}"
-      PUBLIC
-      "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
-      "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>"
-    )
-    target_link_libraries(cuopt_grpc_server
-      PUBLIC
-      cuopt
-      OpenMP::OpenMP_CXX
-      PRIVATE
-      protobuf::libprotobuf
-      gRPC::grpc++
-    )
-    target_link_options(cuopt_grpc_server PRIVATE -Wl,--enable-new-dtags)
+# cuopt_grpc_server - gRPC-based remote server (prototype)
+if(CUOPT_ENABLE_GRPC)
+  add_executable(cuopt_grpc_server cuopt_grpc_server.cpp)
+  target_compile_options(cuopt_grpc_server
+    PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>"
+  )
+  target_include_directories(cuopt_grpc_server
+    PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/libmps_parser/include"
+    "${CMAKE_CURRENT_BINARY_DIR}"
+    PUBLIC
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>"
+  )
+  target_link_libraries(cuopt_grpc_server
+    PUBLIC
+    cuopt
+    OpenMP::OpenMP_CXX
+    PRIVATE
+    protobuf::libprotobuf
+    gRPC::grpc++
+  )
+  target_link_options(cuopt_grpc_server PRIVATE -Wl,--enable-new-dtags)
 
-    install(TARGETS cuopt_grpc_server
-      COMPONENT runtime
-      RUNTIME DESTINATION ${_BIN_DEST}
-    )
-    message(STATUS "Building cuopt_grpc_server (gRPC-based remote solve prototype)")
+  install(TARGETS cuopt_grpc_server
+    COMPONENT runtime
+    RUNTIME DESTINATION ${_BIN_DEST}
+  )
+  message(STATUS "Building cuopt_grpc_server (gRPC-based remote solve prototype)")
 
-    # test_grpc_client - test client for gRPC server
-    add_executable(test_grpc_client
-      test_grpc_client.cpp
-      ${PROTO_SRCS}
-      ${GRPC_PROTO_SRCS}
-      ${GRPC_SERVICE_SRCS}
-    )
-    target_compile_options(test_grpc_client
-      PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>"
-    )
-    target_include_directories(test_grpc_client
-      PRIVATE
-      "${CMAKE_CURRENT_SOURCE_DIR}/src"
-      "${CMAKE_CURRENT_SOURCE_DIR}/include"
-      "${CMAKE_CURRENT_BINARY_DIR}"
-    )
-    target_link_libraries(test_grpc_client
-      PRIVATE
-      protobuf::libprotobuf
-      gRPC::grpc++
-    )
-    target_link_options(test_grpc_client PRIVATE -Wl,--enable-new-dtags)
-    message(STATUS "Building test_grpc_client (gRPC test client)")
+  # test_grpc_client - test client for gRPC server
+  add_executable(test_grpc_client
+    test_grpc_client.cpp
+    ${PROTO_SRCS}
+    ${GRPC_PROTO_SRCS}
+    ${GRPC_SERVICE_SRCS}
+  )
+  target_compile_options(test_grpc_client
+    PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>"
+  )
+  target_include_directories(test_grpc_client
+    PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_BINARY_DIR}"
+  )
+  target_link_libraries(test_grpc_client
+    PRIVATE
+    protobuf::libprotobuf
+    gRPC::grpc++
+  )
+  target_link_options(test_grpc_client PRIVATE -Wl,--enable-new-dtags)
+  message(STATUS "Building test_grpc_client (gRPC test client)")
 
-    # test_grpc_afiro - test gRPC with afiro.mps file
-    add_executable(test_grpc_afiro
-      test_grpc_afiro.cpp
-      ${PROTO_SRCS}
-      ${GRPC_PROTO_SRCS}
-      ${GRPC_SERVICE_SRCS}
-    )
-    target_compile_options(test_grpc_afiro PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>")
-    target_include_directories(test_grpc_afiro PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/include
-      ${CMAKE_CURRENT_BINARY_DIR}
-      ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
-      ${CMAKE_SOURCE_DIR}/_deps/rmm-src/include
-      ${CMAKE_SOURCE_DIR}/_deps/raft-src/cpp/include
-    )
-    target_link_libraries(test_grpc_afiro
-      PRIVATE
-      protobuf::libprotobuf
-      gRPC::grpc++
-      cuopt
-    )
-    target_link_options(test_grpc_afiro PRIVATE -Wl,--enable-new-dtags)
-    message(STATUS "Building test_grpc_afiro (gRPC afiro.mps test)")
+  # test_grpc_afiro - test gRPC with afiro.mps file
+  add_executable(test_grpc_afiro
+    test_grpc_afiro.cpp
+    ${PROTO_SRCS}
+    ${GRPC_PROTO_SRCS}
+    ${GRPC_SERVICE_SRCS}
+  )
+  target_compile_options(test_grpc_afiro PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>")
+  target_include_directories(test_grpc_afiro PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+    ${CMAKE_SOURCE_DIR}/_deps/rmm-src/include
+    ${CMAKE_SOURCE_DIR}/_deps/raft-src/cpp/include
+  )
+  target_link_libraries(test_grpc_afiro
+    PRIVATE
+    protobuf::libprotobuf
+    gRPC::grpc++
+    cuopt
+  )
+  target_link_options(test_grpc_afiro PRIVATE -Wl,--enable-new-dtags)
+  message(STATUS "Building test_grpc_afiro (gRPC afiro.mps test)")
 
-    # test_grpc_mip_sample - test gRPC with a small MIP sample file
-    add_executable(test_grpc_mip_sample
-      test_grpc_mip_sample.cpp
-      ${PROTO_SRCS}
-      ${GRPC_PROTO_SRCS}
-      ${GRPC_SERVICE_SRCS}
-    )
-    target_compile_options(test_grpc_mip_sample PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>")
-    target_include_directories(test_grpc_mip_sample PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/include
-      ${CMAKE_CURRENT_BINARY_DIR}
-      ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
-      ${CMAKE_SOURCE_DIR}/_deps/rmm-src/include
-      ${CMAKE_SOURCE_DIR}/_deps/raft-src/cpp/include
-    )
-    target_link_libraries(test_grpc_mip_sample
-      PRIVATE
-      protobuf::libprotobuf
-      gRPC::grpc++
-      cuopt
-    )
-    target_link_options(test_grpc_mip_sample PRIVATE -Wl,--enable-new-dtags)
-    message(STATUS "Building test_grpc_mip_sample (gRPC MIP sample test)")
+  # test_grpc_mip_sample - test gRPC with a small MIP sample file
+  add_executable(test_grpc_mip_sample
+    test_grpc_mip_sample.cpp
+    ${PROTO_SRCS}
+    ${GRPC_PROTO_SRCS}
+    ${GRPC_SERVICE_SRCS}
+  )
+  target_compile_options(test_grpc_mip_sample PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>")
+  target_include_directories(test_grpc_mip_sample PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+    ${CMAKE_SOURCE_DIR}/_deps/rmm-src/include
+    ${CMAKE_SOURCE_DIR}/_deps/raft-src/cpp/include
+  )
+  target_link_libraries(test_grpc_mip_sample
+    PRIVATE
+    protobuf::libprotobuf
+    gRPC::grpc++
+    cuopt
+  )
+  target_link_options(test_grpc_mip_sample PRIVATE -Wl,--enable-new-dtags)
+  message(STATUS "Building test_grpc_mip_sample (gRPC MIP sample test)")
 
-    # test_grpc_cancel_restart - submit a longer-running job, cancel it while processing, and
-    # validate worker kill/restart behavior.
-    add_executable(test_grpc_cancel_restart
-      test_grpc_cancel_restart.cpp
-      ${PROTO_SRCS}
-      ${GRPC_PROTO_SRCS}
-      ${GRPC_SERVICE_SRCS}
-    )
-    target_compile_options(test_grpc_cancel_restart PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>")
-    target_include_directories(test_grpc_cancel_restart PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/include
-      ${CMAKE_CURRENT_BINARY_DIR}
-      ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
-      ${CMAKE_SOURCE_DIR}/_deps/rmm-src/include
-      ${CMAKE_SOURCE_DIR}/_deps/raft-src/cpp/include
-    )
-    target_link_libraries(test_grpc_cancel_restart
-      PRIVATE
-      protobuf::libprotobuf
-      gRPC::grpc++
-      cuopt
-    )
-    target_link_options(test_grpc_cancel_restart PRIVATE -Wl,--enable-new-dtags)
-    message(STATUS "Building test_grpc_cancel_restart (gRPC cancel/restart test)")
+  # test_grpc_cancel_restart - submit a longer-running job, cancel it while processing, and
+  # validate worker kill/restart behavior.
+  add_executable(test_grpc_cancel_restart
+    test_grpc_cancel_restart.cpp
+    ${PROTO_SRCS}
+    ${GRPC_PROTO_SRCS}
+    ${GRPC_SERVICE_SRCS}
+  )
+  target_compile_options(test_grpc_cancel_restart PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>")
+  target_include_directories(test_grpc_cancel_restart PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+    ${CMAKE_SOURCE_DIR}/_deps/rmm-src/include
+    ${CMAKE_SOURCE_DIR}/_deps/raft-src/cpp/include
+  )
+  target_link_libraries(test_grpc_cancel_restart
+    PRIVATE
+    protobuf::libprotobuf
+    gRPC::grpc++
+    cuopt
+  )
+  target_link_options(test_grpc_cancel_restart PRIVATE -Wl,--enable-new-dtags)
+  message(STATUS "Building test_grpc_cancel_restart (gRPC cancel/restart test)")
 
-    # test_simple_solve - simple standalone test for LP solving
-    add_executable(test_simple_solve test_simple_solve.cpp)
-    target_compile_options(test_simple_solve PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>")
-    target_include_directories(test_simple_solve PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-    target_link_libraries(test_simple_solve PRIVATE cuopt mps_parser_static)
-    message(STATUS "Building test_simple_solve (standalone LP test)")
-  endif()
+  # test_simple_solve - simple standalone test for LP solving
+  add_executable(test_simple_solve test_simple_solve.cpp)
+  target_compile_options(test_simple_solve PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>")
+  target_include_directories(test_simple_solve PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  target_link_libraries(test_simple_solve PRIVATE cuopt mps_parser_static)
+  message(STATUS "Building test_simple_solve (standalone LP test)")
 endif()
 
 # ##################################################################################################

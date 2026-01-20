@@ -15,7 +15,7 @@ REPODIR=$(cd "$(dirname "$0")"; pwd)
 LIBCUOPT_BUILD_DIR=${LIBCUOPT_BUILD_DIR:=${REPODIR}/cpp/build}
 LIBMPS_PARSER_BUILD_DIR=${LIBMPS_PARSER_BUILD_DIR:=${REPODIR}/cpp/libmps_parser/build}
 
-VALIDARGS="clean libcuopt libmps_parser cuopt_mps_parser cuopt cuopt_server cuopt_sh_client cuopt_remote_server docs deb -a -b -g -fsanitize -tsan -msan -v -l= --verbose-pdlp --build-lp-only  --no-fetch-rapids --skip-c-python-adapters --skip-tests-build --skip-routing-build --skip-fatbin-write --host-lineinfo [--cmake-args=\\\"<args>\\\"] [--cache-tool=<tool>] -n --allgpuarch --ci-only-arch --show_depr_warn -h --help"
+VALIDARGS="clean libcuopt libmps_parser cuopt_mps_parser cuopt cuopt_server cuopt_sh_client cuopt_grpc_server docs deb -a -b -g -fsanitize -tsan -msan -v -l= --verbose-pdlp --build-lp-only  --no-fetch-rapids --skip-c-python-adapters --skip-tests-build --skip-routing-build --skip-fatbin-write --host-lineinfo [--cmake-args=\\\"<args>\\\"] [--cache-tool=<tool>] -n --allgpuarch --ci-only-arch --show_depr_warn -h --help"
 HELP="$0 [<target> ...] [<flag> ...]
  where <target> is:
    clean            - remove all existing build artifacts and configuration (start over)
@@ -25,7 +25,7 @@ HELP="$0 [<target> ...] [<flag> ...]
    cuopt            - build the cuopt Python package
    cuopt_server     - build the cuopt_server Python package
    cuopt_sh_client  - build cuopt self host client
-   cuopt_remote_server - build the cuopt remote solve server executable
+  cuopt_grpc_server  - build the cuopt gRPC server executable (prototype)
    docs             - build the docs
    deb              - build deb package (requires libcuopt to be built first)
  and <flag> is:
@@ -392,26 +392,45 @@ if buildAll || hasArg libcuopt; then
 fi
 
 ################################################################################
-# Build the cuopt remote solve server
-if hasArg cuopt_remote_server; then
-    if [ ! -d "${LIBCUOPT_BUILD_DIR}" ]; then
-        echo "Error: libcuopt must be built before cuopt_remote_server. Run with 'libcuopt' target first."
-        exit 1
-    fi
+# Build the cuopt gRPC server (prototype)
+if hasArg cuopt_grpc_server; then
+    mkdir -p "${LIBCUOPT_BUILD_DIR}"
     cd "${LIBCUOPT_BUILD_DIR}"
 
-    # Reconfigure with BUILD_REMOTE_SERVER=ON
-    cmake -DBUILD_REMOTE_SERVER=ON "${LIBCUOPT_BUILD_DIR}"
+    # Ensure gRPC is enabled and configured in this build directory.
+    cmake -DDEFINE_ASSERT=${DEFINE_ASSERT} \
+          -DDEFINE_BENCHMARK="${DEFINE_BENCHMARK}" \
+          -DDEFINE_PDLP_VERBOSE_MODE=${DEFINE_PDLP_VERBOSE_MODE} \
+          -DLIBCUOPT_LOGGING_LEVEL="${LOGGING_ACTIVE_LEVEL}" \
+          -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
+          -DCMAKE_CUDA_ARCHITECTURES=${CUOPT_CMAKE_CUDA_ARCHITECTURES} \
+          -DDISABLE_DEPRECATION_WARNING=${BUILD_DISABLE_DEPRECATION_WARNING} \
+          -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
+          -DFETCH_RAPIDS=${FETCH_RAPIDS} \
+          -DBUILD_LP_ONLY=${BUILD_LP_ONLY} \
+          -DBUILD_SANITIZER=${BUILD_SANITIZER} \
+          -DBUILD_TSAN=${BUILD_TSAN} \
+          -DBUILD_MSAN=${BUILD_MSAN} \
+          -DSKIP_C_PYTHON_ADAPTERS=${SKIP_C_PYTHON_ADAPTERS} \
+          -DBUILD_TESTS=$((1 - ${SKIP_TESTS_BUILD})) \
+          -DSKIP_ROUTING_BUILD=${SKIP_ROUTING_BUILD} \
+          -DWRITE_FATBIN=${WRITE_FATBIN} \
+          -DHOST_LINEINFO=${HOST_LINEINFO} \
+          -DINSTALL_TARGET="${INSTALL_TARGET}" \
+          -DCUOPT_ENABLE_GRPC=ON \
+          "${CACHE_ARGS[@]}" \
+          "${EXTRA_CMAKE_ARGS[@]}" \
+          "${REPODIR}"/cpp
 
     # Build the server target
-    cmake --build "${LIBCUOPT_BUILD_DIR}" --target cuopt_remote_server ${VERBOSE_FLAG} -j"${PARALLEL_LEVEL}"
+    cmake --build "${LIBCUOPT_BUILD_DIR}" --target cuopt_grpc_server ${VERBOSE_FLAG} -j"${PARALLEL_LEVEL}"
 
     # Install the server executable
     if [ -z "${INSTALL_TARGET}" ]; then
-        echo "Skipping install of cuopt_remote_server (-n flag set)"
+        echo "Skipping install of cuopt_grpc_server (-n flag set)"
     else
-        install -m 755 "${LIBCUOPT_BUILD_DIR}/cuopt_remote_server" "${INSTALL_PREFIX}/bin/"
-        echo "Installed cuopt_remote_server to ${INSTALL_PREFIX}/bin/"
+        install -m 755 "${LIBCUOPT_BUILD_DIR}/cuopt_grpc_server" "${INSTALL_PREFIX}/bin/"
+        echo "Installed cuopt_grpc_server to ${INSTALL_PREFIX}/bin/"
     fi
 fi
 

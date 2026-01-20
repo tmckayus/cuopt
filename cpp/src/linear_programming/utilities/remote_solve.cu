@@ -855,8 +855,16 @@ mip_solution_t<i_t, f_t> solve_mip_remote(
           if (!incumbents.empty()) {
             CUOPT_LOG_INFO(std::string("[remote_solve] Received ") +
                            std::to_string(incumbents.size()) + " incumbents");
+          } else if (next_index != incumbent_index || job_complete) {
+            CUOPT_LOG_INFO(
+              std::string("[remote_solve] GetIncumbents returned 0 incumbents (from=") +
+              std::to_string(incumbent_index) + " next=" + std::to_string(next_index) +
+              " done=" + std::to_string(static_cast<int>(job_complete)) + ")");
           }
           for (const auto& inc : incumbents) {
+            CUOPT_LOG_INFO(std::string("[remote_solve] Incumbent idx=") +
+                           std::to_string(inc.index) + " obj=" + std::to_string(inc.objective) +
+                           " vars=" + std::to_string(inc.assignment.size()));
             invoke_incumbent_callbacks<f_t>(callbacks, inc.assignment, inc.objective);
           }
           incumbent_index = next_index;
@@ -895,6 +903,9 @@ mip_solution_t<i_t, f_t> solve_mip_remote(
           continue;
         }
         for (const auto& inc : incumbents) {
+          CUOPT_LOG_INFO(std::string("[remote_solve] Final drain incumbent idx=") +
+                         std::to_string(inc.index) + " obj=" + std::to_string(inc.objective) +
+                         " vars=" + std::to_string(inc.assignment.size()));
           invoke_incumbent_callbacks<f_t>(callbacks, inc.assignment, inc.objective);
         }
         incumbent_index = next_index;
