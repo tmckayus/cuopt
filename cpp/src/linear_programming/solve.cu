@@ -1070,6 +1070,15 @@ static data_model_view_t<i_t, f_t> create_view_from_mps_data_model(
                                     mps_data_model.get_objective_coefficients().size());
   }
 
+  if (mps_data_model.has_quadratic_objective()) {
+    view.set_quadratic_objective_matrix(mps_data_model.get_quadratic_objective_values().data(),
+                                        mps_data_model.get_quadratic_objective_values().size(),
+                                        mps_data_model.get_quadratic_objective_indices().data(),
+                                        mps_data_model.get_quadratic_objective_indices().size(),
+                                        mps_data_model.get_quadratic_objective_offsets().data(),
+                                        mps_data_model.get_quadratic_objective_offsets().size());
+  }
+
   view.set_objective_scaling_factor(mps_data_model.get_objective_scaling_factor());
   view.set_objective_offset(mps_data_model.get_objective_offset());
 
@@ -1440,6 +1449,11 @@ optimization_problem_solution_t<i_t, f_t> solve_lp(raft::handle_t const* handle_
   }
 
   // Local solve with CPU data: copy to GPU and solve
+  if (handle_ptr == nullptr) {
+    CUOPT_LOG_ERROR("[solve_lp] Local solve requested but handle_ptr is null.");
+    return optimization_problem_solution_t<i_t, f_t>(
+      cuopt::logic_error("No CUDA handle for CPU->GPU copy", cuopt::error_type_t::RuntimeError));
+  }
   auto op_problem = data_model_view_to_optimization_problem(handle_ptr, view);
   return solve_lp(op_problem, settings, problem_checking, use_pdlp_solver_mode);
 }

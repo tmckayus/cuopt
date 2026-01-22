@@ -189,6 +189,7 @@ struct problem_and_stream_view_t {
   // Non-owning view pointing to whichever storage is active
   // Use view.is_device_memory() to check if data is on GPU or CPU
   cuopt::linear_programming::data_model_view_t<cuopt_int_t, cuopt_float_t> view;
+  std::vector<char> gpu_variable_types;  // host copy for view when GPU data is used
 
   // Lazy-initialized CUDA handle (only created for local solve)
   std::unique_ptr<raft::handle_t> handle;
@@ -225,9 +226,20 @@ struct problem_and_stream_view_t {
     view.set_variable_lower_bounds(gpu.get_variable_lower_bounds().data(), gpu.get_n_variables());
     view.set_variable_upper_bounds(gpu.get_variable_upper_bounds().data(), gpu.get_n_variables());
 
-    // Note: variable_types in optimization_problem_t uses var_t enum, not char
-    // The view's variable_types span will point to GPU memory with var_t values
-    // This is handled specially in solve routines
+    if (gpu.get_n_variables() > 0) {
+      std::vector<var_t> gpu_var_types(gpu.get_n_variables());
+      raft::copy(gpu_var_types.data(),
+                 gpu.get_variable_types().data(),
+                 gpu.get_n_variables(),
+                 gpu.get_handle_ptr()->get_stream());
+      gpu.get_handle_ptr()->sync_stream();
+
+      gpu_variable_types.resize(gpu.get_n_variables());
+      for (cuopt_int_t i = 0; i < gpu.get_n_variables(); ++i) {
+        gpu_variable_types[i] = (gpu_var_types[i] == var_t::INTEGER) ? 'I' : 'C';
+      }
+      view.set_variable_types(gpu_variable_types.data(), gpu.get_n_variables());
+    }
 
     if (gpu.has_quadratic_objective()) {
       view.set_quadratic_objective_matrix(gpu.get_quadratic_objective_values().data(),

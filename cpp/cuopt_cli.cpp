@@ -10,6 +10,9 @@
 #include <cuopt/linear_programming/optimization_problem.hpp>
 #include <cuopt/linear_programming/solve.hpp>
 #include <cuopt/linear_programming/utilities/remote_solve.hpp>
+#if CUOPT_ENABLE_GRPC
+#include <linear_programming/utilities/remote_solve_grpc.hpp>
+#endif
 #include <mps_parser/parser.hpp>
 #include <utilities/logger.hpp>
 
@@ -20,6 +23,9 @@
 
 #include <unistd.h>
 #include <argparse/argparse.hpp>
+#include <atomic>
+#include <csignal>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>
@@ -31,6 +37,41 @@
 #include <cuopt/version_config.hpp>
 
 static char cuda_module_loading_env[] = "CUDA_MODULE_LOADING=EAGER";
+
+namespace {
+std::atomic<bool> handling_crash_signal{false};
+
+void write_stderr(const char* msg)
+{
+  if (!msg) { return; }
+  ::write(STDERR_FILENO, msg, std::strlen(msg));
+}
+
+void crash_signal_handler(int signum)
+{
+  if (handling_crash_signal.exchange(true)) { _Exit(128 + signum); }
+  write_stderr(
+    "cuopt_cli: received fatal signal; gRPC stream may have been closed due to message size "
+    "mismatch (check --max-message-mb / CUOPT_GRPC_MAX_MESSAGE_MB)\n");
+  std::signal(signum, SIG_DFL);
+  raise(signum);
+}
+
+void terminate_handler()
+{
+  std::cerr << "cuopt_cli: terminating due to unhandled exception; gRPC stream may have been "
+               "closed due to message size mismatch (check --max-message-mb / "
+               "CUOPT_GRPC_MAX_MESSAGE_MB)"
+            << std::endl;
+  std::abort();
+}
+
+void install_crash_handlers()
+{
+  std::set_terminate(terminate_handler);
+  std::signal(SIGABRT, crash_signal_handler);
+}
+}  // namespace
 
 /**
  * @file cuopt_cli.cpp
@@ -364,6 +405,7 @@ int set_cuda_module_loading(int argc, char* argv[])
  */
 int main(int argc, char* argv[])
 {
+  install_crash_handlers();
   if (set_cuda_module_loading(argc, argv) != 0) { return 1; }
 
   // Get the version string from the version_config.hpp file
@@ -375,7 +417,7 @@ int main(int argc, char* argv[])
   argparse::ArgumentParser program("cuopt_cli", version_string);
 
   // Define all arguments with appropriate defaults and help messages
-  program.add_argument("filename").help("input mps file").nargs(1).required();
+  program.add_argument("filename").help("input mps file").nargs(argparse::nargs_pattern::optional);
 
   // FIXME: use a standard format for initial solution file
   program.add_argument("--initial-solution")
@@ -384,6 +426,11 @@ int main(int argc, char* argv[])
 
   program.add_argument("--relaxation")
     .help("solve the LP relaxation of the MIP")
+    .default_value(false)
+    .implicit_value(true);
+
+  program.add_argument("--print-grpc-max")
+    .help("print gRPC max message sizes (client default and server if configured)")
     .default_value(false)
     .implicit_value(true);
 
@@ -454,11 +501,66 @@ int main(int argc, char* argv[])
       settings_strings[param_name] = program.get<std::string>(arg_name.c_str());
     }
   }
-  // Get the values
-  std::string file_name = program.get<std::string>("filename");
-
   const auto initial_solution_file = program.get<std::string>("--initial-solution");
   const auto solve_relaxation      = program.get<bool>("--relaxation");
+  const auto print_grpc_max        = program.get<bool>("--print-grpc-max");
+
+  if (print_grpc_max) {
+#if CUOPT_ENABLE_GRPC
+    constexpr int64_t kMiB             = 1024LL * 1024;
+    const int64_t client_default_bytes = 256LL * kMiB;
+    int64_t client_effective_bytes     = client_default_bytes;
+    if (const char* env_mb = std::getenv("CUOPT_GRPC_MAX_MESSAGE_MB")) {
+      try {
+        int64_t mb = std::stoll(env_mb);
+        if (mb <= 0) {
+          client_effective_bytes = -1;
+        } else {
+          client_effective_bytes = mb * kMiB;
+        }
+      } catch (...) {
+      }
+    }
+    std::cout << "Client default max message MiB: " << (client_default_bytes / kMiB) << "\n";
+    if (client_effective_bytes < 0) {
+      std::cout << "Client effective max message MiB: unlimited\n";
+    } else {
+      std::cout << "Client effective max message MiB: " << (client_effective_bytes / kMiB) << "\n";
+    }
+
+    const char* host = std::getenv("CUOPT_REMOTE_HOST");
+    const char* port = std::getenv("CUOPT_REMOTE_PORT");
+
+    if (host && port) {
+      std::string status;
+      std::string error_message;
+      int64_t result_size_bytes = 0;
+      int64_t max_message_bytes = 0;
+      const std::string address = std::string(host) + ":" + port;
+      cuopt::linear_programming::grpc_remote::check_status(address,
+                                                           "__cuopt_max_message_probe__",
+                                                           status,
+                                                           error_message,
+                                                           &result_size_bytes,
+                                                           &max_message_bytes);
+      std::cout << "Server max message MiB: " << (max_message_bytes / (1024 * 1024)) << "\n";
+    } else {
+      std::cout << "Server max message MiB: (unavailable; set CUOPT_REMOTE_HOST/PORT)\n";
+    }
+#else
+    std::cout << "gRPC support is disabled in this build.\n";
+#endif
+    return 0;
+  }
+
+  if (!program.is_used("filename")) {
+    std::cerr << "filename: 1 argument(s) expected. 0 provided." << std::endl;
+    std::cerr << program;
+    return 1;
+  }
+
+  // Get the values
+  std::string file_name = program.get<std::string>("filename");
 
   // Check for remote solve BEFORE any CUDA initialization
   const bool is_remote_solve = cuopt::linear_programming::is_remote_solve_enabled();

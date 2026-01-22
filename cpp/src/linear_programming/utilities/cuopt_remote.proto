@@ -190,6 +190,7 @@ message SolveMIPRequest {
   RequestHeader header = 1;
   OptimizationProblem problem = 2;
   MIPSolverSettings settings = 3;
+  optional bool enable_incumbents = 4;
 }
 
 // LP solution
@@ -304,6 +305,8 @@ message StatusResponse {
   JobStatus job_status = 1;
   string message = 2;
   double progress = 3;        // 0.0-1.0 (future enhancement)
+  int64 result_size_bytes = 4;    // Size of result payload when COMPLETED (0 if unknown)
+  int64 max_message_bytes = 5;    // Server gRPC max message size (-1 = unlimited)
 }
 
 // Response for get result

@@ -28,17 +28,35 @@ bool upload_and_submit(const std::string& address,
                        std::string& job_id,
                        std::string& error_message);
 
+// Submit as unary if payload fits, otherwise fall back to UploadAndSubmit.
+bool submit_or_upload(const std::string& address,
+                      ProblemType problem_type,
+                      const uint8_t* data,
+                      size_t size,
+                      std::string& job_id,
+                      std::string& error_message,
+                      bool* used_upload_out  = nullptr,
+                      int64_t* max_bytes_out = nullptr);
+
 // Return one of: "QUEUED", "PROCESSING", "COMPLETED", "FAILED", "CANCELLED", "NOT_FOUND"
 bool check_status(const std::string& address,
                   const std::string& job_id,
                   std::string& status_out,
-                  std::string& error_message);
+                  std::string& error_message,
+                  int64_t* result_size_bytes_out = nullptr,
+                  int64_t* max_message_bytes_out = nullptr);
 
 // Stream raw serialized solution bytes (LPSolution or MIPSolution) into out.
 bool stream_result(const std::string& address,
                    const std::string& job_id,
                    std::vector<uint8_t>& out,
                    std::string& error_message);
+
+// Unary GetResult (returns full serialized solution bytes).
+bool get_result(const std::string& address,
+                const std::string& job_id,
+                std::vector<uint8_t>& out,
+                std::string& error_message);
 
 // Best-effort delete of server-side stored result for a job.
 void delete_result(const std::string& address, const std::string& job_id);

@@ -34,7 +34,6 @@ dependencies:
 - libcusolver-dev
 - libcusparse-dev
 - libgrpc
-- libprotobuf
 - libraft-headers==26.2.*,>=0.0.0a0
 - librmm==26.2.*,>=0.0.0a0
 - make

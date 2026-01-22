@@ -152,6 +152,8 @@ class protobuf_serializer_t : public remote_serializer_t<i_t, f_t> {
     pb_settings->set_presolve(settings.presolve);
     pb_settings->set_mip_scaling(settings.mip_scaling);
 
+    request.set_enable_incumbents(!settings.get_mip_callbacks().empty());
+
     // Serialize to bytes
     std::vector<uint8_t> result(request.ByteSizeLong());
     request.SerializeToArray(result.data(), result.size());

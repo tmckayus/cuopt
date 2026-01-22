@@ -35,7 +35,9 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <cstdio>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -45,6 +47,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -71,6 +74,18 @@ using namespace cuopt::linear_programming;
 
 constexpr size_t MAX_JOBS    = 100;
 constexpr size_t MAX_RESULTS = 100;
+
+template <size_t N>
+void copy_cstr(char (&dst)[N], const std::string& src)
+{
+  std::snprintf(dst, N, "%s", src.c_str());
+}
+
+template <size_t N>
+void copy_cstr(char (&dst)[N], const char* src)
+{
+  std::snprintf(dst, N, "%s", src ? src : "");
+}
 
 // Job queue entry - small fixed size, data stored in separate per-job shared memory or sent via
 // pipe
@@ -135,6 +150,7 @@ struct JobWaiter {
   std::string error_message;
   bool success;
   bool ready;
+  std::atomic<int> waiters{0};
   JobWaiter() : success(false), ready(false) {}
 };
 
@@ -157,10 +173,11 @@ SharedMemoryControl* shm_ctrl  = nullptr;
 std::vector<pid_t> worker_pids;
 
 struct ServerConfig {
-  int port        = 8765;
-  int num_workers = 1;
-  bool verbose    = true;
-  bool use_pipes  = true;
+  int port            = 8765;
+  int num_workers     = 1;
+  bool verbose        = true;
+  bool use_pipes      = true;
+  bool log_to_console = false;
   // gRPC max message size in MiB. 0 => unlimited (gRPC uses -1 internally).
   int max_message_mb  = 256;
   bool enable_tls     = false;
@@ -260,6 +277,90 @@ static bool read_job_shm(const char* shm_name, size_t data_size, std::vector<uin
 static std::string write_result_shm(const std::string& job_id, const std::vector<uint8_t>& data);
 static void cleanup_job_shm(const char* shm_name);
 
+constexpr int64_t kMiB = 1024LL * 1024;
+constexpr int64_t kGiB = 1024LL * 1024 * 1024;
+
+class IncumbentPipeCallback : public cuopt::internals::get_solution_callback_t {
+ public:
+  IncumbentPipeCallback(std::string job_id, int fd) : job_id_(std::move(job_id)), fd_(fd) {}
+
+  void get_solution(void* data, void* objective_value) override
+  {
+    if (fd_ < 0 || n_variables == 0) { return; }
+
+    double objective = 0.0;
+    std::vector<double> assignment;
+    assignment.resize(n_variables);
+
+    if (isFloat) {
+      std::vector<float> tmp(n_variables);
+      if (cudaMemcpy(tmp.data(), data, n_variables * sizeof(float), cudaMemcpyDeviceToHost) !=
+          cudaSuccess) {
+        return;
+      }
+      for (size_t i = 0; i < n_variables; ++i) {
+        assignment[i] = static_cast<double>(tmp[i]);
+      }
+      float obj = 0.0f;
+      if (cudaMemcpy(&obj, objective_value, sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        return;
+      }
+      objective = static_cast<double>(obj);
+    } else {
+      if (cudaMemcpy(
+            assignment.data(), data, n_variables * sizeof(double), cudaMemcpyDeviceToHost) !=
+          cudaSuccess) {
+        return;
+      }
+      double obj = 0.0;
+      if (cudaMemcpy(&obj, objective_value, sizeof(double), cudaMemcpyDeviceToHost) !=
+          cudaSuccess) {
+        return;
+      }
+      objective = obj;
+    }
+
+    cuopt::remote::Incumbent msg;
+    msg.set_job_id(job_id_);
+    msg.set_objective(objective);
+    for (double v : assignment) {
+      msg.add_assignment(v);
+    }
+
+    std::vector<uint8_t> buffer(msg.ByteSizeLong());
+    if (!msg.SerializeToArray(buffer.data(), buffer.size())) { return; }
+    std::cout << "[Worker] Incumbent callback job_id=" << job_id_ << " obj=" << objective
+              << " vars=" << assignment.size() << "\n";
+    std::cout.flush();
+    send_incumbent_pipe(fd_, buffer);
+  }
+
+ private:
+  std::string job_id_;
+  int fd_;
+};
+
+static void store_simple_result(const std::string& job_id,
+                                int worker_id,
+                                int status,
+                                const char* error_message)
+{
+  for (size_t i = 0; i < MAX_RESULTS; ++i) {
+    if (!result_queue[i].ready) {
+      copy_cstr(result_queue[i].job_id, job_id);
+      result_queue[i].status           = status;
+      result_queue[i].data_size        = 0;
+      result_queue[i].shm_data_name[0] = '\0';
+      result_queue[i].worker_index     = worker_id;
+      copy_cstr(result_queue[i].error_message, error_message);
+      result_queue[i].error_message[sizeof(result_queue[i].error_message) - 1] = '\0';
+      result_queue[i].retrieved                                                = false;
+      result_queue[i].ready                                                    = true;
+      break;
+    }
+  }
+}
+
 // ============================================================================
 // Worker Infrastructure (copied from cuopt_remote_server.cpp)
 // ============================================================================
@@ -329,21 +430,7 @@ void worker_process(int worker_id)
       if (!config.use_pipes) { cleanup_job_shm(job.shm_data_name); }
 
       // Store cancelled result in result queue
-      for (size_t i = 0; i < MAX_RESULTS; ++i) {
-        if (!result_queue[i].ready) {
-          strncpy(result_queue[i].job_id, job_id.c_str(), sizeof(result_queue[i].job_id) - 1);
-          result_queue[i].status           = 2;  // Cancelled status
-          result_queue[i].data_size        = 0;
-          result_queue[i].shm_data_name[0] = '\0';
-          result_queue[i].worker_index     = worker_id;  // For pipe mode
-          strncpy(result_queue[i].error_message,
-                  "Job was cancelled",
-                  sizeof(result_queue[i].error_message) - 1);
-          result_queue[i].retrieved = false;
-          result_queue[i].ready     = true;
-          break;
-        }
-      }
+      store_simple_result(job_id, worker_id, 2, "Job was cancelled");
 
       // Clear job slot (don't exit/restart worker)
       job.worker_pid   = 0;
@@ -359,42 +446,14 @@ void worker_process(int worker_id)
               << " (type: " << (is_mip ? "MIP" : "LP") << ")\n";
     std::cout.flush();
 
-    // Redirect stdout AND stderr to per-job log file for client log retrieval
-    // (Solver may use either stream for output)
     std::string log_file = get_log_file_path(job_id);
-    int saved_stdout     = dup(STDOUT_FILENO);
-    int saved_stderr     = dup(STDERR_FILENO);
-    int log_fd           = open(log_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (log_fd >= 0) {
-      // Flush C++ streams before changing fd
-      std::cout.flush();
-      std::cerr.flush();
-      fflush(stdout);
-      fflush(stderr);
 
-      dup2(log_fd, STDOUT_FILENO);
-      dup2(log_fd, STDERR_FILENO);
-      close(log_fd);
-
-      // Use unbuffered output for real-time log streaming
-      setvbuf(stdout, NULL, _IONBF, 0);
-      setvbuf(stderr, NULL, _IONBF, 0);
-
-      // Test that redirection works
-      printf("[Worker %d] Log file initialized: %s\n", worker_id, log_file.c_str());
-      fflush(stdout);
-    }
-
-    // Create RAFT handle AFTER stdout redirect so CUDA sees the new streams
-    const char* msg0 = "[Worker] Creating raft::handle_t...\n";
-    write(STDOUT_FILENO, msg0, 36);
-    fsync(STDOUT_FILENO);
+    // Create RAFT handle before calling solver
+    std::cout << "[Worker] Creating raft::handle_t...\n" << std::flush;
 
     raft::handle_t handle;
 
-    const char* msg01 = "[Worker] Handle created, starting solve...\n";
-    write(STDOUT_FILENO, msg01, 44);
-    fsync(STDOUT_FILENO);
+    std::cout << "[Worker] Handle created, starting solve...\n" << std::flush;
 
     // Read problem data (pipe mode or shm mode)
     std::vector<uint8_t> request_data;
@@ -419,21 +478,7 @@ void worker_process(int worker_id)
 
     if (!read_success) {
       // Store error result
-      for (size_t i = 0; i < MAX_RESULTS; ++i) {
-        if (!result_queue[i].ready) {
-          strncpy(result_queue[i].job_id, job_id.c_str(), sizeof(result_queue[i].job_id) - 1);
-          result_queue[i].status           = 1;  // Error status
-          result_queue[i].data_size        = 0;
-          result_queue[i].shm_data_name[0] = '\0';
-          result_queue[i].worker_index     = worker_id;
-          strncpy(result_queue[i].error_message,
-                  "Failed to read job data",
-                  sizeof(result_queue[i].error_message) - 1);
-          result_queue[i].retrieved = false;
-          result_queue[i].ready     = true;
-          break;
-        }
-      }
+      store_simple_result(job_id, worker_id, 1, "Failed to read job data");
       // Clear job slot
       job.worker_pid   = 0;
       job.worker_index = -1;
@@ -448,81 +493,33 @@ void worker_process(int worker_id)
     bool success = false;
 
     try {
+      cuopt::mps_parser::mps_data_model_t<int, double> mps_data;
       if (is_mip) {
-        cuopt::mps_parser::mps_data_model_t<int, double> mps_data;
         mip_solver_settings_t<int, double> settings;
-
-        class IncumbentPipeCallback : public cuopt::internals::get_solution_callback_t {
-         public:
-          IncumbentPipeCallback(std::string job_id, int fd) : job_id_(std::move(job_id)), fd_(fd) {}
-
-          void get_solution(void* data, void* objective_value) override
-          {
-            if (fd_ < 0 || n_variables == 0) { return; }
-
-            double objective = 0.0;
-            std::vector<double> assignment;
-            assignment.resize(n_variables);
-
-            if (isFloat) {
-              std::vector<float> tmp(n_variables);
-              if (cudaMemcpy(
-                    tmp.data(), data, n_variables * sizeof(float), cudaMemcpyDeviceToHost) !=
-                  cudaSuccess) {
-                return;
-              }
-              for (size_t i = 0; i < n_variables; ++i) {
-                assignment[i] = static_cast<double>(tmp[i]);
-              }
-              float obj = 0.0f;
-              if (cudaMemcpy(&obj, objective_value, sizeof(float), cudaMemcpyDeviceToHost) !=
-                  cudaSuccess) {
-                return;
-              }
-              objective = static_cast<double>(obj);
-            } else {
-              if (cudaMemcpy(assignment.data(),
-                             data,
-                             n_variables * sizeof(double),
-                             cudaMemcpyDeviceToHost) != cudaSuccess) {
-                return;
-              }
-              double obj = 0.0;
-              if (cudaMemcpy(&obj, objective_value, sizeof(double), cudaMemcpyDeviceToHost) !=
-                  cudaSuccess) {
-                return;
-              }
-              objective = obj;
-            }
-
-            cuopt::remote::Incumbent msg;
-            msg.set_job_id(job_id_);
-            msg.set_objective(objective);
-            for (double v : assignment) {
-              msg.add_assignment(v);
-            }
-
-            std::vector<uint8_t> buffer(msg.ByteSizeLong());
-            if (!msg.SerializeToArray(buffer.data(), buffer.size())) { return; }
-            std::cout << "[Worker] Incumbent callback job_id=" << job_id_ << " obj=" << objective
-                      << " vars=" << assignment.size() << "\n";
-            std::cout.flush();
-            send_incumbent_pipe(fd_, buffer);
-          }
-
-         private:
-          std::string job_id_;
-          int fd_;
-        };
+        settings.log_file       = log_file;
+        settings.log_to_console = config.log_to_console;
 
         if (serializer->deserialize_mip_request(request_data, mps_data, settings)) {
-          IncumbentPipeCallback incumbent_cb(job_id,
-                                             worker_pipes[worker_id].worker_incumbent_write_fd);
-          settings.set_mip_callback(&incumbent_cb);
-          std::cout << "[Worker] Registered incumbent callback for job_id=" << job_id
-                    << " callbacks=" << settings.get_mip_callbacks().size() << "\n";
-          std::cout.flush();
+          bool enable_incumbents = true;
+          cuopt::remote::SolveMIPRequest mip_request;
+          if (mip_request.ParseFromArray(request_data.data(), request_data.size()) &&
+              mip_request.has_enable_incumbents()) {
+            enable_incumbents = mip_request.enable_incumbents();
+          }
+          if (enable_incumbents) {
+            IncumbentPipeCallback incumbent_cb(job_id,
+                                               worker_pipes[worker_id].worker_incumbent_write_fd);
+            settings.set_mip_callback(&incumbent_cb);
+            std::cout << "[Worker] Registered incumbent callback for job_id=" << job_id
+                      << " callbacks=" << settings.get_mip_callbacks().size() << "\n";
+            std::cout.flush();
+          } else {
+            std::cout << "[Worker] Skipping incumbent callback for job_id=" << job_id << "\n";
+            std::cout.flush();
+          }
+          std::cout << "[Worker] Calling solve_mip...\n" << std::flush;
           auto solution = solve_mip(&handle, mps_data, settings);
+          std::cout << "[Worker] solve_mip done\n" << std::flush;
           solution.to_host(handle.get_stream());
           result_data = serializer->serialize_mip_solution(solution);
           success     = true;
@@ -530,17 +527,14 @@ void worker_process(int worker_id)
           error_message = "Failed to deserialize MIP request";
         }
       } else {
-        cuopt::mps_parser::mps_data_model_t<int, double> mps_data;
         pdlp_solver_settings_t<int, double> settings;
+        settings.log_file       = log_file;
+        settings.log_to_console = config.log_to_console;
 
         if (serializer->deserialize_lp_request(request_data, mps_data, settings)) {
-          const char* msg1 = "[Worker] Calling solve_lp via write()...\n";
-          write(STDOUT_FILENO, msg1, strlen(msg1));
-          fsync(STDOUT_FILENO);
-          auto solution    = solve_lp(&handle, mps_data, settings);
-          const char* msg2 = "[Worker] solve_lp done via write()\n";
-          write(STDOUT_FILENO, msg2, strlen(msg2));
-          fsync(STDOUT_FILENO);
+          std::cout << "[Worker] Calling solve_lp...\n" << std::flush;
+          auto solution = solve_lp(&handle, mps_data, settings);
+          std::cout << "[Worker] solve_lp done\n" << std::flush;
           solution.to_host(handle.get_stream());
           result_data = serializer->serialize_lp_solution(solution);
           success     = true;
@@ -551,14 +545,6 @@ void worker_process(int worker_id)
     } catch (const std::exception& e) {
       error_message = std::string("Exception: ") + e.what();
     }
-
-    // Restore stdout and stderr to console
-    fflush(stdout);
-    fflush(stderr);
-    dup2(saved_stdout, STDOUT_FILENO);
-    dup2(saved_stderr, STDERR_FILENO);
-    close(saved_stdout);
-    close(saved_stderr);
 
     // Store result (pipe mode: write to pipe, shm mode: write to shared memory)
     if (config.use_pipes) {
@@ -574,14 +560,12 @@ void worker_process(int worker_id)
         if (!result_queue[i].ready) {
           result_slot              = i;
           ResultQueueEntry& result = result_queue[i];
-          strncpy(result.job_id, job_id.c_str(), sizeof(result.job_id) - 1);
+          copy_cstr(result.job_id, job_id);
           result.status           = success ? 0 : 1;
           result.data_size        = success ? result_data.size() : 0;
           result.shm_data_name[0] = '\0';  // Not used in pipe mode
           result.worker_index     = worker_id;
-          if (!success) {
-            strncpy(result.error_message, error_message.c_str(), sizeof(result.error_message) - 1);
-          }
+          if (!success) { copy_cstr(result.error_message, error_message); }
           result.retrieved = false;
           // Set ready=true BEFORE writing to pipe so reader thread starts reading
           // This prevents deadlock with large results that exceed pipe buffer size
@@ -610,9 +594,7 @@ void worker_process(int worker_id)
           std::cerr.flush();
           // Mark as failed in result queue
           result_queue[result_slot].status = 1;
-          strncpy(result_queue[result_slot].error_message,
-                  "Failed to write result to pipe",
-                  sizeof(result_queue[result_slot].error_message) - 1);
+          copy_cstr(result_queue[result_slot].error_message, "Failed to write result to pipe");
         } else if (config.verbose) {
           std::cout << "[Worker " << worker_id << "] Finished writing result payload for job "
                     << job_id << "\n";
@@ -629,7 +611,7 @@ void worker_process(int worker_id)
       for (size_t i = 0; i < MAX_RESULTS; ++i) {
         if (!result_queue[i].ready) {
           ResultQueueEntry& result = result_queue[i];
-          strncpy(result.job_id, job_id.c_str(), sizeof(result.job_id) - 1);
+          copy_cstr(result.job_id, job_id);
           result.status       = success ? 0 : 1;
           result.worker_index = worker_id;
           if (success && !result_data.empty()) {
@@ -640,15 +622,13 @@ void worker_process(int worker_id)
               result.status           = 1;
               result.data_size        = 0;
               result.shm_data_name[0] = '\0';
-              strncpy(result.error_message,
-                      "Failed to create shared memory for result",
-                      sizeof(result.error_message) - 1);
+              copy_cstr(result.error_message, "Failed to create shared memory for result");
             } else {
               result.data_size = result_data.size();
-              strncpy(result.shm_data_name, shm_name.c_str(), sizeof(result.shm_data_name) - 1);
+              copy_cstr(result.shm_data_name, shm_name);
             }
           } else if (!success) {
-            strncpy(result.error_message, error_message.c_str(), sizeof(result.error_message) - 1);
+            copy_cstr(result.error_message, error_message);
             result.data_size        = 0;
             result.shm_data_name[0] = '\0';
           } else {
@@ -679,8 +659,8 @@ void worker_process(int worker_id)
   _exit(0);
 }
 
-// Create pipe for worker -> server incumbent updates (always enabled)
-bool create_worker_incumbent_pipe(int worker_id)
+// Create pipes for a worker (incumbent always, data/result in pipe mode)
+bool create_worker_pipes(int worker_id)
 {
   // Ensure worker_pipes has enough slots
   while (static_cast<int>(worker_pipes.size()) <= worker_id) {
@@ -688,48 +668,46 @@ bool create_worker_incumbent_pipe(int worker_id)
   }
 
   WorkerPipes& wp = worker_pipes[worker_id];
+
+  if (config.use_pipes) {
+    // Create pipe for server -> worker data
+    int input_pipe[2];
+    if (pipe(input_pipe) < 0) {
+      std::cerr << "[Server] Failed to create input pipe for worker " << worker_id << "\n";
+      return false;
+    }
+    wp.worker_read_fd = input_pipe[0];  // Worker reads from this
+    wp.to_worker_fd   = input_pipe[1];  // Server writes to this
+
+    // Create pipe for worker -> server results
+    int output_pipe[2];
+    if (pipe(output_pipe) < 0) {
+      std::cerr << "[Server] Failed to create output pipe for worker " << worker_id << "\n";
+      close(input_pipe[0]);
+      close(input_pipe[1]);
+      return false;
+    }
+    wp.from_worker_fd  = output_pipe[0];  // Server reads from this
+    wp.worker_write_fd = output_pipe[1];  // Worker writes to this
+  }
 
   int incumbent_pipe[2];
   if (pipe(incumbent_pipe) < 0) {
     std::cerr << "[Server] Failed to create incumbent pipe for worker " << worker_id << "\n";
+    if (config.use_pipes) {
+      if (wp.worker_read_fd >= 0) close(wp.worker_read_fd);
+      if (wp.to_worker_fd >= 0) close(wp.to_worker_fd);
+      if (wp.from_worker_fd >= 0) close(wp.from_worker_fd);
+      if (wp.worker_write_fd >= 0) close(wp.worker_write_fd);
+      wp.worker_read_fd  = -1;
+      wp.to_worker_fd    = -1;
+      wp.from_worker_fd  = -1;
+      wp.worker_write_fd = -1;
+    }
     return false;
   }
   wp.incumbent_from_worker_fd  = incumbent_pipe[0];  // Server reads from this
   wp.worker_incumbent_write_fd = incumbent_pipe[1];  // Worker writes to this
-  return true;
-}
-
-// Create pipes for a worker (pipe mode only)
-bool create_worker_pipes(int worker_id)
-{
-  if (!config.use_pipes) return true;
-
-  // Ensure worker_pipes has enough slots
-  while (static_cast<int>(worker_pipes.size()) <= worker_id) {
-    worker_pipes.push_back({-1, -1, -1, -1, -1, -1});
-  }
-
-  WorkerPipes& wp = worker_pipes[worker_id];
-
-  // Create pipe for server -> worker data
-  int input_pipe[2];
-  if (pipe(input_pipe) < 0) {
-    std::cerr << "[Server] Failed to create input pipe for worker " << worker_id << "\n";
-    return false;
-  }
-  wp.worker_read_fd = input_pipe[0];  // Worker reads from this
-  wp.to_worker_fd   = input_pipe[1];  // Server writes to this
-
-  // Create pipe for worker -> server results
-  int output_pipe[2];
-  if (pipe(output_pipe) < 0) {
-    std::cerr << "[Server] Failed to create output pipe for worker " << worker_id << "\n";
-    close(input_pipe[0]);
-    close(input_pipe[1]);
-    return false;
-  }
-  wp.from_worker_fd  = output_pipe[0];  // Server reads from this
-  wp.worker_write_fd = output_pipe[1];  // Worker writes to this
 
   return true;
 }
@@ -778,91 +756,20 @@ void close_worker_pipes_child_ends(int worker_id)
   }
 }
 
-void spawn_workers()
+pid_t spawn_worker(int worker_id, bool is_replacement)
 {
-  for (int i = 0; i < config.num_workers; ++i) {
-    // Create pipes before forking (pipe mode)
-    if (config.use_pipes && !create_worker_pipes(i)) {
-      std::cerr << "[Server] Failed to create pipes for worker " << i << "\n";
-      continue;
-    }
-    if (!create_worker_incumbent_pipe(i)) {
-      std::cerr << "[Server] Failed to create incumbent pipe for worker " << i << "\n";
-      close_worker_pipes_server(i);
-      continue;
-    }
+  if (is_replacement) { close_worker_pipes_server(worker_id); }
 
-    pid_t pid = fork();
-    if (pid < 0) {
-      std::cerr << "[Server] Failed to fork worker " << i << "\n";
-      close_worker_pipes_server(i);
-    } else if (pid == 0) {
-      // Child process
-      if (config.use_pipes) {
-        // Close all other workers' pipe fds
-        for (int j = 0; j < static_cast<int>(worker_pipes.size()); ++j) {
-          if (j != i) {
-            if (worker_pipes[j].worker_read_fd >= 0) close(worker_pipes[j].worker_read_fd);
-            if (worker_pipes[j].worker_write_fd >= 0) close(worker_pipes[j].worker_write_fd);
-            if (worker_pipes[j].to_worker_fd >= 0) close(worker_pipes[j].to_worker_fd);
-            if (worker_pipes[j].from_worker_fd >= 0) close(worker_pipes[j].from_worker_fd);
-            if (worker_pipes[j].incumbent_from_worker_fd >= 0) {
-              close(worker_pipes[j].incumbent_from_worker_fd);
-            }
-            if (worker_pipes[j].worker_incumbent_write_fd >= 0) {
-              close(worker_pipes[j].worker_incumbent_write_fd);
-            }
-          }
-        }
-        // Close server ends of our pipes
-        close(worker_pipes[i].to_worker_fd);
-        close(worker_pipes[i].from_worker_fd);
-      }
-      if (worker_pipes[i].incumbent_from_worker_fd >= 0) {
-        close(worker_pipes[i].incumbent_from_worker_fd);
-        worker_pipes[i].incumbent_from_worker_fd = -1;
-      }
-      worker_process(i);
-      _exit(0);  // Should not reach here
-    } else {
-      // Parent process
-      worker_pids.push_back(pid);
-      // Close worker ends of pipes (parent doesn't need them)
-      close_worker_pipes_child_ends(i);
-    }
-  }
-}
-
-void wait_for_workers()
-{
-  for (pid_t pid : worker_pids) {
-    int status;
-    waitpid(pid, &status, 0);
-  }
-  worker_pids.clear();
-}
-
-// Spawn a single replacement worker and return its PID
-pid_t spawn_single_worker(int worker_id)
-{
-  // Create new pipes for the replacement worker (pipe mode)
-  close_worker_pipes_server(worker_id);
-  if (config.use_pipes) {
-    if (!create_worker_pipes(worker_id)) {
-      std::cerr << "[Server] Failed to create pipes for replacement worker " << worker_id << "\n";
-      return -1;
-    }
-  }
-  if (!create_worker_incumbent_pipe(worker_id)) {
-    std::cerr << "[Server] Failed to create incumbent pipe for replacement worker " << worker_id
-              << "\n";
-    close_worker_pipes_server(worker_id);
+  if (!create_worker_pipes(worker_id)) {
+    std::cerr << "[Server] Failed to create pipes for "
+              << (is_replacement ? "replacement worker " : "worker ") << worker_id << "\n";
     return -1;
   }
 
   pid_t pid = fork();
   if (pid < 0) {
-    std::cerr << "[Server] Failed to fork replacement worker " << worker_id << "\n";
+    std::cerr << "[Server] Failed to fork " << (is_replacement ? "replacement worker " : "worker ")
+              << worker_id << "\n";
     close_worker_pipes_server(worker_id);
     return -1;
   } else if (pid == 0) {
@@ -899,6 +806,27 @@ pid_t spawn_single_worker(int worker_id)
   close_worker_pipes_child_ends(worker_id);
   return pid;
 }
+
+void spawn_workers()
+{
+  for (int i = 0; i < config.num_workers; ++i) {
+    pid_t pid = spawn_worker(i, false);
+    if (pid < 0) { continue; }
+    worker_pids.push_back(pid);
+  }
+}
+
+void wait_for_workers()
+{
+  for (pid_t pid : worker_pids) {
+    int status;
+    waitpid(pid, &status, 0);
+  }
+  worker_pids.clear();
+}
+
+// Spawn a single replacement worker and return its PID
+pid_t spawn_single_worker(int worker_id) { return spawn_worker(worker_id, true); }
 
 // Mark jobs being processed by a dead worker as failed (or cancelled if it was cancelled)
 void mark_worker_jobs_failed(pid_t dead_worker_pid)
@@ -939,14 +867,13 @@ void mark_worker_jobs_failed(pid_t dead_worker_pid)
       // Store result in result queue (cancelled or failed)
       for (size_t j = 0; j < MAX_RESULTS; ++j) {
         if (!result_queue[j].ready) {
-          strncpy(result_queue[j].job_id, job_id.c_str(), sizeof(result_queue[j].job_id) - 1);
+          copy_cstr(result_queue[j].job_id, job_id);
           result_queue[j].status           = was_cancelled ? 2 : 1;  // 2=cancelled, 1=error
           result_queue[j].data_size        = 0;
           result_queue[j].shm_data_name[0] = '\0';
           result_queue[j].worker_index     = -1;
-          strncpy(result_queue[j].error_message,
-                  was_cancelled ? "Job was cancelled" : "Worker process died unexpectedly",
-                  sizeof(result_queue[j].error_message) - 1);
+          copy_cstr(result_queue[j].error_message,
+                    was_cancelled ? "Job was cancelled" : "Worker process died unexpectedly");
           result_queue[j].retrieved = false;
           result_queue[j].ready     = true;
           break;
@@ -1187,13 +1114,17 @@ void result_retrieval_thread()
           std::lock_guard<std::mutex> lock(waiters_mutex);
           auto wit = waiting_threads.find(job_id);
           if (wit != waiting_threads.end()) {
-            // Wake up the waiting thread
-            auto waiter           = wit->second;
-            waiter->result_data   = std::move(result_data);
-            waiter->error_message = error_message;
-            waiter->success       = success;
-            waiter->ready         = true;
-            waiter->cv.notify_one();
+            // Wake up all waiting threads sharing this waiter
+            auto waiter = wit->second;
+            {
+              std::lock_guard<std::mutex> waiter_lock(waiter->mutex);
+              waiter->result_data   = std::move(result_data);
+              waiter->error_message = error_message;
+              waiter->success       = success;
+              waiter->ready         = true;
+            }
+            waiter->cv.notify_all();
+            waiting_threads.erase(wit);
           }
         }
 
@@ -1364,11 +1295,11 @@ static int64_t get_upload_mem_threshold_bytes()
   // Default to 1 GiB; set env CUOPT_GRPC_UPLOAD_MEM_THRESHOLD_BYTES to override.
   // 0 => always use file, -1 => always use memory (not recommended for huge uploads).
   const char* val = std::getenv("CUOPT_GRPC_UPLOAD_MEM_THRESHOLD_BYTES");
-  if (!val || val[0] == '\0') { return 1LL << 30; }
+  if (!val || val[0] == '\0') { return kGiB; }
   try {
     return std::stoll(val);
   } catch (...) {
-    return 1LL << 30;
+    return kGiB;
   }
 }
 
@@ -1509,7 +1440,7 @@ static bool send_job_data_pipe_file(int worker_idx, const std::string& path, uin
     return false;
   }
 
-  std::vector<uint8_t> buf(1 << 20);  // 1 MiB
+  std::vector<uint8_t> buf(kMiB);  // 1 MiB
   uint64_t remaining = size;
   while (remaining > 0) {
     size_t to_read = buf.size();
@@ -1627,12 +1558,11 @@ std::pair<bool, std::string> submit_job_async(const std::vector<uint8_t>& reques
   // Find free job slot
   for (size_t i = 0; i < MAX_JOBS; ++i) {
     if (!job_queue[i].ready && !job_queue[i].claimed) {
-      strncpy(job_queue[i].job_id, job_id.c_str(), sizeof(job_queue[i].job_id) - 1);
+      copy_cstr(job_queue[i].job_id, job_id);
       job_queue[i].problem_type = is_mip ? 1 : 0;
       job_queue[i].data_size    = request_data.size();
       if (!config.use_pipes) {
-        strncpy(
-          job_queue[i].shm_data_name, shm_name.c_str(), sizeof(job_queue[i].shm_data_name) - 1);
+        copy_cstr(job_queue[i].shm_data_name, shm_name);
       } else {
         job_queue[i].shm_data_name[0] = '\0';
       }
@@ -1771,28 +1701,29 @@ bool wait_for_result(const std::string& job_id,
     }
   }
 
-  // Job is still running - create a waiter and wait on condition variable
-  auto waiter = std::make_shared<JobWaiter>();
-
+  // Job is still running - reuse or create a shared waiter
+  std::shared_ptr<JobWaiter> waiter;
   {
     std::lock_guard<std::mutex> lock(waiters_mutex);
-    waiting_threads[job_id] = waiter;
+    auto it = waiting_threads.find(job_id);
+    if (it != waiting_threads.end()) {
+      waiter = it->second;
+    } else {
+      waiter                  = std::make_shared<JobWaiter>();
+      waiting_threads[job_id] = waiter;
+    }
   }
 
   if (config.verbose) {
     std::cout << "[Server] WAIT_FOR_RESULT: waiting for job " << job_id << "\n";
   }
 
+  waiter->waiters.fetch_add(1, std::memory_order_relaxed);
+
   // Wait on the condition variable - this thread will sleep until signaled
   {
     std::unique_lock<std::mutex> lock(waiter->mutex);
     waiter->cv.wait(lock, [&waiter] { return waiter->ready; });
-  }
-
-  // Remove from waiting_threads
-  {
-    std::lock_guard<std::mutex> lock(waiters_mutex);
-    waiting_threads.erase(job_id);
   }
 
   if (config.verbose) {
@@ -1801,10 +1732,16 @@ bool wait_for_result(const std::string& job_id,
   }
 
   if (waiter->success) {
-    result_data = std::move(waiter->result_data);
+    if (waiter->waiters.load(std::memory_order_relaxed) > 1) {
+      result_data = waiter->result_data;
+    } else {
+      result_data = std::move(waiter->result_data);
+    }
+    waiter->waiters.fetch_sub(1, std::memory_order_relaxed);
     return true;
   } else {
     error_message = waiter->error_message;
+    waiter->waiters.fetch_sub(1, std::memory_order_relaxed);
     return false;
   }
 }
@@ -1834,24 +1771,6 @@ void delete_upload_file(const std::string& upload_id)
   unlink(f0.c_str());
   std::string f1 = f0 + ".mps";
   unlink(f1.c_str());
-}
-
-// Delete job
-bool delete_job(const std::string& job_id)
-{
-  std::lock_guard<std::mutex> lock(tracker_mutex);
-  auto it = job_tracker.find(job_id);
-
-  if (it == job_tracker.end()) { return false; }
-
-  job_tracker.erase(it);
-
-  // Also delete the log file
-  delete_log_file(job_id);
-
-  if (config.verbose) { std::cout << "[Server] Job deleted: " << job_id << "\n"; }
-
-  return true;
 }
 
 // Cancel job - returns: 0=success, 1=job_not_found, 2=already_completed, 3=already_cancelled
@@ -1926,11 +1845,15 @@ int cancel_job(const std::string& job_id, JobStatus& job_status_out, std::string
         std::lock_guard<std::mutex> wlock(waiters_mutex);
         auto wit = waiting_threads.find(job_id);
         if (wit != waiting_threads.end()) {
-          auto waiter           = wit->second;
-          waiter->error_message = "Job cancelled by user";
-          waiter->success       = false;
-          waiter->ready         = true;
-          waiter->cv.notify_one();
+          auto waiter = wit->second;
+          {
+            std::lock_guard<std::mutex> waiter_lock(waiter->mutex);
+            waiter->error_message = "Job cancelled by user";
+            waiter->success       = false;
+            waiter->ready         = true;
+          }
+          waiter->cv.notify_all();
+          waiting_threads.erase(wit);
         }
       }
 
@@ -1957,11 +1880,15 @@ int cancel_job(const std::string& job_id, JobStatus& job_status_out, std::string
     std::lock_guard<std::mutex> wlock(waiters_mutex);
     auto wit = waiting_threads.find(job_id);
     if (wit != waiting_threads.end()) {
-      auto waiter           = wit->second;
-      waiter->error_message = "Job cancelled by user";
-      waiter->success       = false;
-      waiter->ready         = true;
-      waiter->cv.notify_one();
+      auto waiter = wit->second;
+      {
+        std::lock_guard<std::mutex> waiter_lock(waiter->mutex);
+        waiter->error_message = "Job cancelled by user";
+        waiter->success       = false;
+        waiter->ready         = true;
+      }
+      waiter->cv.notify_all();
+      waiting_threads.erase(wit);
     }
   }
 
@@ -2047,7 +1974,7 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
     if (job_idx < 0) { return Status(StatusCode::RESOURCE_EXHAUSTED, "Job queue full"); }
 
     // Initialize job queue entry
-    strncpy(job_queue[job_idx].job_id, job_id.c_str(), sizeof(job_queue[job_idx].job_id) - 1);
+    copy_cstr(job_queue[job_idx].job_id, job_id);
     job_queue[job_idx].problem_type = is_lp ? 0 : 1;
     job_queue[job_idx].data_size    = job_data.size();
     // `claimed` currently true as a reservation; keep it until the entry is fully initialized.
@@ -2103,11 +2030,25 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
     cuopt::remote::UploadJobRequest in;
     cuopt::remote::UploadJobResponse out;
 
+    const int64_t max_message_bytes =
+      (config.max_message_mb <= 0) ? -1 : (static_cast<int64_t>(config.max_message_mb) * kMiB);
+    auto set_upload_error =
+      [&](const std::string& upload_id, const std::string& message, int64_t committed_size) {
+        std::string full_message = message;
+        if (full_message.find("max_message_mb=") == std::string::npos) {
+          full_message += " (max_message_mb=" + std::to_string(config.max_message_mb) + ")";
+        }
+        out.Clear();
+        auto* err = out.mutable_error();
+        err->set_upload_id(upload_id);
+        err->set_message(full_message);
+        err->set_committed_size(committed_size);
+        err->set_max_message_bytes(max_message_bytes);
+      };
+
     // First message must be UploadStart.
     if (!stream->Read(&in) || !in.has_start()) {
-      out.mutable_error()->set_upload_id("");
-      out.mutable_error()->set_message("First message must be UploadStart");
-      out.mutable_error()->set_committed_size(0);
+      set_upload_error("", "First message must be UploadStart", 0);
       stream->Write(out);
       return Status(StatusCode::INVALID_ARGUMENT, "Missing UploadStart");
     }
@@ -2150,10 +2091,8 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
       flags |= resume ? O_APPEND : O_TRUNC;
       fd = open(upload_path.c_str(), flags | O_CLOEXEC, 0600);
       if (fd < 0) {
-        out.mutable_error()->set_upload_id(upload_id);
-        out.mutable_error()->set_message(std::string("Failed to open upload file: ") +
-                                         strerror(errno));
-        out.mutable_error()->set_committed_size(committed);
+        set_upload_error(
+          upload_id, std::string("Failed to open upload file: ") + strerror(errno), committed);
         stream->Write(out);
         return false;
       }
@@ -2184,8 +2123,10 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
 
     // Ack start with committed size (resume point).
     out.Clear();
-    out.mutable_ack()->set_upload_id(upload_id);
-    out.mutable_ack()->set_committed_size(committed);
+    auto* ack = out.mutable_ack();
+    ack->set_upload_id(upload_id);
+    ack->set_committed_size(committed);
+    ack->set_max_message_bytes(max_message_bytes);
     stream->Write(out);
 
     // Read chunks until finish.
@@ -2193,19 +2134,13 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
       if (in.has_chunk()) {
         const auto& ch = in.chunk();
         if (ch.upload_id() != upload_id) {
-          out.Clear();
-          out.mutable_error()->set_upload_id(upload_id);
-          out.mutable_error()->set_message("upload_id mismatch");
-          out.mutable_error()->set_committed_size(committed);
+          set_upload_error(upload_id, "upload_id mismatch", committed);
           stream->Write(out);
           cleanup_file();
           return Status(StatusCode::INVALID_ARGUMENT, "upload_id mismatch");
         }
         if (ch.offset() != committed) {
-          out.Clear();
-          out.mutable_error()->set_upload_id(upload_id);
-          out.mutable_error()->set_message("Non-sequential chunk offset");
-          out.mutable_error()->set_committed_size(committed);
+          set_upload_error(upload_id, "Non-sequential chunk offset", committed);
           stream->Write(out);
           close(fd);
           return Status(StatusCode::OUT_OF_RANGE, "Non-sequential chunk offset");
@@ -2228,10 +2163,7 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
               }
               if (!mem_buffer.empty()) {
                 if (!write_to_pipe(fd, mem_buffer.data(), mem_buffer.size())) {
-                  out.Clear();
-                  out.mutable_error()->set_upload_id(upload_id);
-                  out.mutable_error()->set_message("Failed to spill memory buffer to disk");
-                  out.mutable_error()->set_committed_size(committed);
+                  set_upload_error(upload_id, "Failed to spill memory buffer to disk", committed);
                   stream->Write(out);
                   cleanup_file();
                   return Status(StatusCode::INTERNAL, "Failed to spill buffer");
@@ -2246,10 +2178,7 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
             mem_buffer.insert(mem_buffer.end(), data.begin(), data.end());
           } else {
             if (!write_to_pipe(fd, data.data(), data.size())) {
-              out.Clear();
-              out.mutable_error()->set_upload_id(upload_id);
-              out.mutable_error()->set_message("Failed to write chunk to disk");
-              out.mutable_error()->set_committed_size(committed);
+              set_upload_error(upload_id, "Failed to write chunk to disk", committed);
               stream->Write(out);
               cleanup_file();
               return Status(StatusCode::INTERNAL, "Failed to write chunk");
@@ -2259,16 +2188,17 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
         }
 
         // Light progress logging for large uploads
-        if (config.verbose &&
-            (committed % (256LL * 1024 * 1024) < static_cast<int64_t>(data.size()))) {
+        if (config.verbose && (committed % (256LL * kMiB) < static_cast<int64_t>(data.size()))) {
           std::cout << "[gRPC] Upload progress upload_id=" << upload_id
                     << " committed=" << committed << " bytes\n";
           std::cout.flush();
         }
 
         out.Clear();
-        out.mutable_ack()->set_upload_id(upload_id);
-        out.mutable_ack()->set_committed_size(committed);
+        auto* chunk_ack = out.mutable_ack();
+        chunk_ack->set_upload_id(upload_id);
+        chunk_ack->set_committed_size(committed);
+        chunk_ack->set_max_message_bytes(max_message_bytes);
         stream->Write(out);
         continue;
       }
@@ -2276,10 +2206,7 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
       if (in.has_finish()) {
         const auto& fin = in.finish();
         if (fin.upload_id() != upload_id) {
-          out.Clear();
-          out.mutable_error()->set_upload_id(upload_id);
-          out.mutable_error()->set_message("upload_id mismatch on finish");
-          out.mutable_error()->set_committed_size(committed);
+          set_upload_error(upload_id, "upload_id mismatch on finish", committed);
           stream->Write(out);
           cleanup_file();
           return Status(StatusCode::INVALID_ARGUMENT, "upload_id mismatch on finish");
@@ -2287,16 +2214,23 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
         break;
       }
 
-      out.Clear();
-      out.mutable_error()->set_upload_id(upload_id);
-      out.mutable_error()->set_message("Unexpected message type during upload");
-      out.mutable_error()->set_committed_size(committed);
+      set_upload_error(upload_id, "Unexpected message type during upload", committed);
       stream->Write(out);
       cleanup_file();
       return Status(StatusCode::INVALID_ARGUMENT, "Unexpected message type");
     }
 
     if (fd >= 0) { close(fd); }
+
+    if (total_size_hint > 0 && committed != total_size_hint) {
+      set_upload_error(upload_id,
+                       std::string("Upload incomplete: committed size mismatch (max_message_mb=") +
+                         std::to_string(config.max_message_mb) + ")",
+                       committed);
+      stream->Write(out);
+      cleanup_file();
+      return Status(StatusCode::OUT_OF_RANGE, "Upload incomplete: committed size mismatch");
+    }
 
     // Enqueue job using file-backed payload or in-memory buffer
     std::string job_id = generate_job_id();
@@ -2311,16 +2245,13 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
       }
     }
     if (job_idx < 0) {
-      out.Clear();
-      out.mutable_error()->set_upload_id(upload_id);
-      out.mutable_error()->set_message("Job queue full");
-      out.mutable_error()->set_committed_size(committed);
+      set_upload_error(upload_id, "Job queue full", committed);
       stream->Write(out);
       cleanup_file();
       return Status(StatusCode::RESOURCE_EXHAUSTED, "Job queue full");
     }
 
-    strncpy(job_queue[job_idx].job_id, job_id.c_str(), sizeof(job_queue[job_idx].job_id) - 1);
+    copy_cstr(job_queue[job_idx].job_id, job_id);
     job_queue[job_idx].problem_type = is_mip ? 1 : 0;
     job_queue[job_idx].data_size    = static_cast<uint64_t>(committed);
     job_queue[job_idx].cancelled.store(false);
@@ -2387,6 +2318,18 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
       default: response->set_job_status(cuopt::remote::NOT_FOUND); break;
     }
     response->set_message(message);
+
+    const int64_t max_bytes =
+      (config.max_message_mb <= 0) ? -1 : (static_cast<int64_t>(config.max_message_mb) * kMiB);
+    response->set_max_message_bytes(max_bytes);
+
+    int64_t result_size_bytes = 0;
+    if (status == JobStatus::COMPLETED) {
+      std::lock_guard<std::mutex> lock(tracker_mutex);
+      auto it = job_tracker.find(job_id);
+      if (it != job_tracker.end()) { result_size_bytes = it->second.result_data.size(); }
+    }
+    response->set_result_size_bytes(result_size_bytes);
 
     return Status::OK;
   }
@@ -2471,7 +2414,7 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
       is_mip = it->second.is_mip;
     }
 
-    const size_t chunk_size = 1 << 20;  // 1 MiB
+    const size_t chunk_size = kMiB;  // 1 MiB
     size_t offset           = 0;
     while (offset < bytes.size()) {
       size_t n = bytes.size() - offset;
@@ -2795,6 +2738,7 @@ void print_usage(const char* prog)
     << "      --tls-key PATH      Path to PEM-encoded server private key\n"
     << "      --tls-root PATH     Path to PEM root certs for client verification\n"
     << "      --require-client-cert  Require and verify client certs (mTLS)\n"
+    << "      --log-to-console    Enable solver log output to console (default: off)\n"
     << "  -q, --quiet             Reduce verbosity\n"
     << "  -h, --help              Show this help\n";
 }
@@ -2825,6 +2769,8 @@ int main(int argc, char** argv)
       if (i + 1 < argc) { config.tls_root_path = argv[++i]; }
     } else if (arg == "--require-client-cert") {
       config.require_client = true;
+    } else if (arg == "--log-to-console") {
+      config.log_to_console = true;
     } else if (arg == "-q" || arg == "--quiet") {
       config.verbose = false;
     } else if (arg == "-h" || arg == "--help") {
@@ -3020,9 +2966,14 @@ int main(int argc, char** argv)
   builder.RegisterService(&service);
   // Allow large LP/MIP payloads (e.g. large MPS problems).
   // Note: gRPC uses -1 to mean unlimited.
-  int max_bytes = (config.max_message_mb <= 0) ? -1 : (config.max_message_mb * 1024 * 1024);
-  builder.SetMaxReceiveMessageSize(max_bytes);
-  builder.SetMaxSendMessageSize(max_bytes);
+  const int64_t max_bytes =
+    (config.max_message_mb <= 0) ? -1 : (static_cast<int64_t>(config.max_message_mb) * kMiB);
+  const int channel_limit =
+    (max_bytes <= 0)
+      ? -1
+      : static_cast<int>(std::min<int64_t>(max_bytes, std::numeric_limits<int>::max()));
+  builder.SetMaxReceiveMessageSize(channel_limit);
+  builder.SetMaxSendMessageSize(channel_limit);
 
   std::unique_ptr<Server> server(builder.BuildAndStart());
   std::cout << "[gRPC Server] Listening on " << server_address << std::endl;

@@ -137,7 +137,7 @@ files:
       - depends_on_librmm
       - depends_on_rapids_logger
       - depends_on_mps_parser
-      - depends_on_protobuf
+      - depends_on_grpc
   py_run_libcuopt:
     output: pyproject
     pyproject_dir: python/libcuopt
@@ -303,7 +303,6 @@ dependencies:
           - tbb-devel
           - zlib
           - bzip2
-          - libprotobuf
           - grpc-cpp
           - libgrpc
   test_cpp:
@@ -509,11 +508,15 @@ dependencies:
           # pip recognizes the index as a global option for the requirements.txt file
           - --extra-index-url=https://pypi.nvidia.com
           - --extra-index-url=https://pypi.anaconda.org/rapidsai-wheels-nightly/simple
-  depends_on_protobuf:
+  depends_on_grpc:
     common:
-      - output_types: [conda, requirements, pyproject]
+      - output_types: [conda]
         packages:
-          - protobuf
+          - grpc-cpp
+          - libgrpc
+      - output_types: [requirements, pyproject]
+        packages:
+          - grpcio
   depends_on_libraft_headers:
     common:
       - output_types: conda

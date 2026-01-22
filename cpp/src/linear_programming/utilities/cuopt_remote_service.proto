@@ -132,12 +132,14 @@ message UploadJobRequest {
 message UploadAck {
   string upload_id = 1;
   int64 committed_size = 2;
+  int64 max_message_bytes = 3;  // Server gRPC max message size (-1 = unlimited)
 }
 
 message UploadError {
   string upload_id = 1;
   string message = 2;
   int64 committed_size = 3;
+  int64 max_message_bytes = 4;  // Server gRPC max message size (-1 = unlimited)
 }
 
 message UploadJobResponse {

@@ -559,6 +559,11 @@ mip_solution_t<i_t, f_t> solve_mip(raft::handle_t const* handle_ptr,
   }
 
   // Local solve with CPU data: copy to GPU and solve
+  if (handle_ptr == nullptr) {
+    CUOPT_LOG_ERROR("[solve_mip] Local solve requested but handle_ptr is null.");
+    return mip_solution_t<i_t, f_t>(
+      cuopt::logic_error("No CUDA handle for CPU->GPU copy", cuopt::error_type_t::RuntimeError));
+  }
   auto op_problem = data_model_view_to_optimization_problem(handle_ptr, view);
   return solve_mip(op_problem, settings);
 }

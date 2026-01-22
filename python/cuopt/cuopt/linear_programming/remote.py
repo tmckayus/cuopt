@@ -146,20 +146,23 @@ def cancel_job(
 
         # Send request (length-prefixed)
         data = request.SerializeToString()
-        sock.sendall(struct.pack("<I", len(data)))
+        sock.sendall(struct.pack("<Q", len(data)))
         sock.sendall(data)
 
         # Receive response
-        size_data = sock.recv(4)
-        if len(size_data) < 4:
-            sock.close()
-            return CancelResult(
-                success=False,
-                message="Failed to receive response size",
-                job_status=JobStatus.NOT_FOUND,
-            )
+        size_data = b""
+        while len(size_data) < 8:
+            chunk = sock.recv(8 - len(size_data))
+            if not chunk:
+                sock.close()
+                return CancelResult(
+                    success=False,
+                    message="Failed to receive response size",
+                    job_status=JobStatus.NOT_FOUND,
+                )
+            size_data += chunk
 
-        size = struct.unpack("<I", size_data)[0]
+        size = struct.unpack("<Q", size_data)[0]
         response_data = b""
         while len(response_data) < size:
             chunk = sock.recv(size - len(response_data))
