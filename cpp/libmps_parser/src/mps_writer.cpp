@@ -286,5 +286,7 @@ void mps_writer_t<i_t, f_t>::write(const std::string& mps_file_path)
 
 template class mps_writer_t<int, float>;
 template class mps_writer_t<int, double>;
+template class mps_writer_t<long, float>;
+template class mps_writer_t<long, double>;
 
 }  // namespace cuopt::mps_parser

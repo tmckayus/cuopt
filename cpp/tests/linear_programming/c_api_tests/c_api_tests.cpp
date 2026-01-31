@@ -196,8 +196,9 @@ static bool test_mps_roundtrip(const std::string& mps_file_path)
     auto* original_problem_wrapper = static_cast<problem_and_stream_view_t*>(original_handle);
     auto* reread_problem_wrapper   = static_cast<problem_and_stream_view_t*>(reread_handle);
 
-    result =
-      original_problem_wrapper->op_problem->is_equivalent(*reread_problem_wrapper->op_problem);
+    // Use the interface method to compare (works for both CPU and GPU backends)
+    result = original_problem_wrapper->get_problem()->is_equivalent(
+      *reread_problem_wrapper->get_problem());
   }
 
 cleanup:

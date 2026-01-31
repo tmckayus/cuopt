@@ -613,6 +613,80 @@ void optimization_problem_t<i_t, f_t>::set_row_names(const std::vector<std::stri
   row_names_ = row_names;
 }
 
+// ============================================================================
+// Move-based setters (zero-copy, transfers ownership)
+// ============================================================================
+
+template <typename i_t, typename f_t>
+void optimization_problem_t<i_t, f_t>::set_csr_constraint_matrix_move(
+  rmm::device_uvector<f_t>&& A_values,
+  rmm::device_uvector<i_t>&& A_indices,
+  rmm::device_uvector<i_t>&& A_offsets)
+{
+  A_             = std::move(A_values);
+  A_indices_     = std::move(A_indices);
+  A_offsets_     = std::move(A_offsets);
+  n_constraints_ = A_offsets_.size() - 1;
+}
+
+template <typename i_t, typename f_t>
+void optimization_problem_t<i_t, f_t>::set_constraint_bounds_move(rmm::device_uvector<f_t>&& b)
+{
+  b_ = std::move(b);
+}
+
+template <typename i_t, typename f_t>
+void optimization_problem_t<i_t, f_t>::set_objective_coefficients_move(rmm::device_uvector<f_t>&& c)
+{
+  c_      = std::move(c);
+  n_vars_ = c_.size();
+}
+
+template <typename i_t, typename f_t>
+void optimization_problem_t<i_t, f_t>::set_variable_lower_bounds_move(
+  rmm::device_uvector<f_t>&& variable_lower_bounds)
+{
+  variable_lower_bounds_ = std::move(variable_lower_bounds);
+}
+
+template <typename i_t, typename f_t>
+void optimization_problem_t<i_t, f_t>::set_variable_upper_bounds_move(
+  rmm::device_uvector<f_t>&& variable_upper_bounds)
+{
+  variable_upper_bounds_ = std::move(variable_upper_bounds);
+}
+
+template <typename i_t, typename f_t>
+void optimization_problem_t<i_t, f_t>::set_variable_types_move(
+  rmm::device_uvector<var_t>&& variable_types)
+{
+  variable_types_ = std::move(variable_types);
+}
+
+template <typename i_t, typename f_t>
+void optimization_problem_t<i_t, f_t>::set_constraint_lower_bounds_move(
+  rmm::device_uvector<f_t>&& constraint_lower_bounds)
+{
+  constraint_lower_bounds_ = std::move(constraint_lower_bounds);
+}
+
+template <typename i_t, typename f_t>
+void optimization_problem_t<i_t, f_t>::set_constraint_upper_bounds_move(
+  rmm::device_uvector<f_t>&& constraint_upper_bounds)
+{
+  constraint_upper_bounds_ = std::move(constraint_upper_bounds);
+}
+
+template <typename i_t, typename f_t>
+void optimization_problem_t<i_t, f_t>::set_row_types_move(rmm::device_uvector<char>&& row_types)
+{
+  row_types_ = std::move(row_types);
+}
+
+// ============================================================================
+// Getters
+// ============================================================================
+
 template <typename i_t, typename f_t>
 i_t optimization_problem_t<i_t, f_t>::get_n_variables() const
 {
@@ -1064,9 +1138,11 @@ bool optimization_problem_t<i_t, f_t>::has_quadratic_objective() const
 // NOTE: Explicitly instantiate all types here in order to avoid linker error
 #if MIP_INSTANTIATE_FLOAT
 template class optimization_problem_t<int, float>;
+template class optimization_problem_t<long, float>;
 #endif
 #if MIP_INSTANTIATE_DOUBLE
 template class optimization_problem_t<int, double>;
+template class optimization_problem_t<long, double>;
 #endif
 
 // TODO current raft to cusparse wrappers only support int64_t

@@ -8,6 +8,7 @@
 #include <cuopt/linear_programming/cuopt_c.h>
 
 #include <cuopt/linear_programming/optimization_problem.hpp>
+#include <cuopt/linear_programming/optimization_problem_utils.hpp>
 #include <cuopt/linear_programming/solve.hpp>
 #include <cuopt/linear_programming/solver_settings.hpp>
 #include <cuopt/utilities/timestamp_utils.hpp>
@@ -98,7 +99,7 @@ cuopt_int_t cuOptGetVersion(cuopt_int_t* version_major,
 
 cuopt_int_t cuOptReadProblem(const char* filename, cuOptOptimizationProblem* problem_ptr)
 {
-  problem_and_stream_view_t* problem_and_stream = new problem_and_stream_view_t();
+  problem_and_stream_view_t* problem_and_stream = new problem_and_stream_view_t(get_backend_type());
   std::string filename_str(filename);
   bool input_mps_strict = false;
   std::unique_ptr<mps_data_model_t<cuopt_int_t, cuopt_float_t>> mps_data_model_ptr;
@@ -107,6 +108,7 @@ cuopt_int_t cuOptReadProblem(const char* filename, cuOptOptimizationProblem* pro
       parse_mps<cuopt_int_t, cuopt_float_t>(filename_str, input_mps_strict));
   } catch (const std::exception& e) {
     CUOPT_LOG_INFO("Error parsing MPS file: %s", e.what());
+    delete problem_and_stream;
     *problem_ptr = nullptr;
     if (std::string(e.what()).find("Error opening MPS file") != std::string::npos) {
       return CUOPT_MPS_FILE_ERROR;
@@ -114,11 +116,11 @@ cuopt_int_t cuOptReadProblem(const char* filename, cuOptOptimizationProblem* pro
       return CUOPT_MPS_PARSE_ERROR;
     }
   }
-  optimization_problem_t<cuopt_int_t, cuopt_float_t>* op_problem =
-    new optimization_problem_t<cuopt_int_t, cuopt_float_t>(mps_data_model_to_optimization_problem(
-      problem_and_stream->get_handle_ptr(), *mps_data_model_ptr));
-  problem_and_stream->op_problem = op_problem;
-  *problem_ptr                   = static_cast<cuOptOptimizationProblem>(problem_and_stream);
+
+  // Populate interface directly from MPS data model (avoids temporary GPU allocation)
+  populate_from_mps_data_model(problem_and_stream->get_problem(), *mps_data_model_ptr);
+
+  *problem_ptr = static_cast<cuOptOptimizationProblem>(problem_and_stream);
   return CUOPT_SUCCESS;
 }
 
@@ -134,7 +136,8 @@ cuopt_int_t cuOptWriteProblem(cuOptOptimizationProblem problem,
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
   try {
-    problem_and_stream_view->op_problem->write_to_mps(std::string(filename));
+    // Use the write_to_mps method from the interface (works for both CPU and GPU)
+    problem_and_stream_view->get_problem()->write_to_mps(std::string(filename));
   } catch (const std::exception& e) {
     CUOPT_LOG_INFO("Error writing MPS file: %s", e.what());
     return CUOPT_MPS_FILE_ERROR;
@@ -167,33 +170,44 @@ cuopt_int_t cuOptCreateProblem(cuopt_int_t num_constraints,
     return CUOPT_INVALID_ARGUMENT;
   }
 
-  problem_and_stream_view_t* problem_and_stream = new problem_and_stream_view_t();
-  problem_and_stream->op_problem =
-    new optimization_problem_t<cuopt_int_t, cuopt_float_t>(problem_and_stream->get_handle_ptr());
+  problem_and_stream_view_t* problem_and_stream = new problem_and_stream_view_t(get_backend_type());
   try {
-    problem_and_stream->op_problem->set_maximize(objective_sense == CUOPT_MAXIMIZE);
-    problem_and_stream->op_problem->set_objective_offset(objective_offset);
-    problem_and_stream->op_problem->set_objective_coefficients(objective_coefficients,
-                                                               num_variables);
+    auto* problem = problem_and_stream->get_problem();
+    problem->set_maximize(objective_sense == CUOPT_MAXIMIZE);
+    problem->set_objective_offset(objective_offset);
+    problem->set_objective_coefficients(objective_coefficients, num_variables);
     cuopt_int_t nnz = constraint_matrix_row_offsets[num_constraints];
-    problem_and_stream->op_problem->set_csr_constraint_matrix(constraint_matrix_coefficent_values,
-                                                              nnz,
-                                                              constraint_matrix_column_indices,
-                                                              nnz,
-                                                              constraint_matrix_row_offsets,
-                                                              num_constraints + 1);
-    problem_and_stream->op_problem->set_row_types(constraint_sense, num_constraints);
-    problem_and_stream->op_problem->set_constraint_bounds(rhs, num_constraints);
-    problem_and_stream->op_problem->set_variable_lower_bounds(lower_bounds, num_variables);
-    problem_and_stream->op_problem->set_variable_upper_bounds(upper_bounds, num_variables);
+    problem->set_csr_constraint_matrix(constraint_matrix_coefficent_values,
+                                       nnz,
+                                       constraint_matrix_column_indices,
+                                       nnz,
+                                       constraint_matrix_row_offsets,
+                                       num_constraints + 1);
+    problem->set_row_types(constraint_sense, num_constraints);
+    problem->set_constraint_bounds(rhs, num_constraints);
+    problem->set_variable_lower_bounds(lower_bounds, num_variables);
+    problem->set_variable_upper_bounds(upper_bounds, num_variables);
+
+    // Set variable types and detect if problem is MIP
     std::vector<var_t> variable_types_host(num_variables);
+    bool has_integers = false;
     for (int j = 0; j < num_variables; j++) {
       variable_types_host[j] =
         variable_types[j] == CUOPT_CONTINUOUS ? var_t::CONTINUOUS : var_t::INTEGER;
+      if (variable_types_host[j] == var_t::INTEGER) { has_integers = true; }
     }
-    problem_and_stream->op_problem->set_variable_types(variable_types_host.data(), num_variables);
+    problem->set_variable_types(variable_types_host.data(), num_variables);
+
+    // Set problem category based on variable types
+    if (has_integers) {
+      problem->set_problem_category(problem_category_t::MIP);
+    } else {
+      problem->set_problem_category(problem_category_t::LP);
+    }
+
     *problem_ptr = static_cast<cuOptOptimizationProblem>(problem_and_stream);
   } catch (const raft::exception& e) {
+    delete problem_and_stream;
     return CUOPT_INVALID_ARGUMENT;
   }
   return CUOPT_SUCCESS;
@@ -220,39 +234,55 @@ cuopt_int_t cuOptCreateRangedProblem(cuopt_int_t num_constraints,
       constraint_matrix_row_offsets == nullptr || constraint_matrix_column_indices == nullptr ||
       constraint_matrix_coefficent_values == nullptr || constraint_lower_bounds == nullptr ||
       constraint_upper_bounds == nullptr || variable_lower_bounds == nullptr ||
-      variable_upper_bounds == nullptr || variable_types == nullptr) {
+      variable_upper_bounds == nullptr) {
     return CUOPT_INVALID_ARGUMENT;
   }
 
-  problem_and_stream_view_t* problem_and_stream = new problem_and_stream_view_t();
-  problem_and_stream->op_problem =
-    new optimization_problem_t<cuopt_int_t, cuopt_float_t>(problem_and_stream->get_handle_ptr());
+  problem_and_stream_view_t* problem_and_stream = new problem_and_stream_view_t(get_backend_type());
   try {
-    problem_and_stream->op_problem->set_maximize(objective_sense == CUOPT_MAXIMIZE);
-    problem_and_stream->op_problem->set_objective_offset(objective_offset);
-    problem_and_stream->op_problem->set_objective_coefficients(objective_coefficients,
-                                                               num_variables);
+    auto* problem = problem_and_stream->get_problem();
+    problem->set_maximize(objective_sense == CUOPT_MAXIMIZE);
+    problem->set_objective_offset(objective_offset);
+    problem->set_objective_coefficients(objective_coefficients, num_variables);
     cuopt_int_t nnz = constraint_matrix_row_offsets[num_constraints];
-    problem_and_stream->op_problem->set_csr_constraint_matrix(constraint_matrix_coefficent_values,
-                                                              nnz,
-                                                              constraint_matrix_column_indices,
-                                                              nnz,
-                                                              constraint_matrix_row_offsets,
-                                                              num_constraints + 1);
-    problem_and_stream->op_problem->set_constraint_lower_bounds(constraint_lower_bounds,
-                                                                num_constraints);
-    problem_and_stream->op_problem->set_constraint_upper_bounds(constraint_upper_bounds,
-                                                                num_constraints);
-    problem_and_stream->op_problem->set_variable_lower_bounds(variable_lower_bounds, num_variables);
-    problem_and_stream->op_problem->set_variable_upper_bounds(variable_upper_bounds, num_variables);
+    problem->set_csr_constraint_matrix(constraint_matrix_coefficent_values,
+                                       nnz,
+                                       constraint_matrix_column_indices,
+                                       nnz,
+                                       constraint_matrix_row_offsets,
+                                       num_constraints + 1);
+    problem->set_constraint_lower_bounds(constraint_lower_bounds, num_constraints);
+    problem->set_constraint_upper_bounds(constraint_upper_bounds, num_constraints);
+    problem->set_variable_lower_bounds(variable_lower_bounds, num_variables);
+    problem->set_variable_upper_bounds(variable_upper_bounds, num_variables);
+
+    // Set variable types (NULL means all continuous) and detect if problem is MIP
     std::vector<var_t> variable_types_host(num_variables);
-    for (int j = 0; j < num_variables; j++) {
-      variable_types_host[j] =
-        variable_types[j] == CUOPT_CONTINUOUS ? var_t::CONTINUOUS : var_t::INTEGER;
+    bool has_integers = false;
+    if (variable_types != nullptr) {
+      for (int j = 0; j < num_variables; j++) {
+        variable_types_host[j] =
+          variable_types[j] == CUOPT_CONTINUOUS ? var_t::CONTINUOUS : var_t::INTEGER;
+        if (variable_types_host[j] == var_t::INTEGER) { has_integers = true; }
+      }
+    } else {
+      // Default to all continuous
+      for (int j = 0; j < num_variables; j++) {
+        variable_types_host[j] = var_t::CONTINUOUS;
+      }
     }
-    problem_and_stream->op_problem->set_variable_types(variable_types_host.data(), num_variables);
+    problem->set_variable_types(variable_types_host.data(), num_variables);
+
+    // Set problem category based on variable types
+    if (has_integers) {
+      problem->set_problem_category(problem_category_t::MIP);
+    } else {
+      problem->set_problem_category(problem_category_t::LP);
+    }
+
     *problem_ptr = static_cast<cuOptOptimizationProblem>(problem_and_stream);
   } catch (const raft::exception& e) {
+    delete problem_and_stream;
     return CUOPT_INVALID_ARGUMENT;
   }
   return CUOPT_SUCCESS;
@@ -288,35 +318,37 @@ cuopt_int_t cuOptCreateQuadraticProblem(
     return CUOPT_INVALID_ARGUMENT;
   }
 
-  problem_and_stream_view_t* problem_and_stream = new problem_and_stream_view_t();
-  problem_and_stream->op_problem =
-    new optimization_problem_t<cuopt_int_t, cuopt_float_t>(problem_and_stream->get_handle_ptr());
+  problem_and_stream_view_t* problem_and_stream = new problem_and_stream_view_t(get_backend_type());
   try {
-    problem_and_stream->op_problem->set_maximize(objective_sense == CUOPT_MAXIMIZE);
-    problem_and_stream->op_problem->set_objective_offset(objective_offset);
-    problem_and_stream->op_problem->set_objective_coefficients(objective_coefficients,
-                                                               num_variables);
+    auto* problem = problem_and_stream->get_problem();
+    problem->set_maximize(objective_sense == CUOPT_MAXIMIZE);
+    problem->set_objective_offset(objective_offset);
+    problem->set_objective_coefficients(objective_coefficients, num_variables);
     cuopt_int_t Q_nnz = quadratic_objective_matrix_row_offsets[num_variables];
-    problem_and_stream->op_problem->set_quadratic_objective_matrix(
-      quadratic_objective_matrix_coefficent_values,
-      Q_nnz,
-      quadratic_objective_matrix_column_indices,
-      Q_nnz,
-      quadratic_objective_matrix_row_offsets,
-      num_variables + 1);
+    problem->set_quadratic_objective_matrix(quadratic_objective_matrix_coefficent_values,
+                                            Q_nnz,
+                                            quadratic_objective_matrix_column_indices,
+                                            Q_nnz,
+                                            quadratic_objective_matrix_row_offsets,
+                                            num_variables + 1);
     cuopt_int_t nnz = constraint_matrix_row_offsets[num_constraints];
-    problem_and_stream->op_problem->set_csr_constraint_matrix(constraint_matrix_coefficent_values,
-                                                              nnz,
-                                                              constraint_matrix_column_indices,
-                                                              nnz,
-                                                              constraint_matrix_row_offsets,
-                                                              num_constraints + 1);
-    problem_and_stream->op_problem->set_row_types(constraint_sense, num_constraints);
-    problem_and_stream->op_problem->set_constraint_bounds(rhs, num_constraints);
-    problem_and_stream->op_problem->set_variable_lower_bounds(lower_bounds, num_variables);
-    problem_and_stream->op_problem->set_variable_upper_bounds(upper_bounds, num_variables);
+    problem->set_csr_constraint_matrix(constraint_matrix_coefficent_values,
+                                       nnz,
+                                       constraint_matrix_column_indices,
+                                       nnz,
+                                       constraint_matrix_row_offsets,
+                                       num_constraints + 1);
+    problem->set_row_types(constraint_sense, num_constraints);
+    problem->set_constraint_bounds(rhs, num_constraints);
+    problem->set_variable_lower_bounds(lower_bounds, num_variables);
+    problem->set_variable_upper_bounds(upper_bounds, num_variables);
+
+    // Quadratic problems are categorized as LP (no QP category in the enum)
+    problem->set_problem_category(problem_category_t::LP);
+
     *problem_ptr = static_cast<cuOptOptimizationProblem>(problem_and_stream);
   } catch (const raft::exception& e) {
+    delete problem_and_stream;
     return CUOPT_INVALID_ARGUMENT;
   }
   return CUOPT_SUCCESS;
@@ -353,37 +385,37 @@ cuopt_int_t cuOptCreateQuadraticRangedProblem(
     return CUOPT_INVALID_ARGUMENT;
   }
 
-  problem_and_stream_view_t* problem_and_stream = new problem_and_stream_view_t();
-  problem_and_stream->op_problem =
-    new optimization_problem_t<cuopt_int_t, cuopt_float_t>(problem_and_stream->get_handle_ptr());
+  problem_and_stream_view_t* problem_and_stream = new problem_and_stream_view_t(get_backend_type());
   try {
-    problem_and_stream->op_problem->set_maximize(objective_sense == CUOPT_MAXIMIZE);
-    problem_and_stream->op_problem->set_objective_offset(objective_offset);
-    problem_and_stream->op_problem->set_objective_coefficients(objective_coefficients,
-                                                               num_variables);
+    auto* problem = problem_and_stream->get_problem();
+    problem->set_maximize(objective_sense == CUOPT_MAXIMIZE);
+    problem->set_objective_offset(objective_offset);
+    problem->set_objective_coefficients(objective_coefficients, num_variables);
     cuopt_int_t Q_nnz = quadratic_objective_matrix_row_offsets[num_variables];
-    problem_and_stream->op_problem->set_quadratic_objective_matrix(
-      quadratic_objective_matrix_coefficent_values,
-      Q_nnz,
-      quadratic_objective_matrix_column_indices,
-      Q_nnz,
-      quadratic_objective_matrix_row_offsets,
-      num_variables + 1);
+    problem->set_quadratic_objective_matrix(quadratic_objective_matrix_coefficent_values,
+                                            Q_nnz,
+                                            quadratic_objective_matrix_column_indices,
+                                            Q_nnz,
+                                            quadratic_objective_matrix_row_offsets,
+                                            num_variables + 1);
     cuopt_int_t nnz = constraint_matrix_row_offsets[num_constraints];
-    problem_and_stream->op_problem->set_csr_constraint_matrix(constraint_matrix_coefficent_values,
-                                                              nnz,
-                                                              constraint_matrix_column_indices,
-                                                              nnz,
-                                                              constraint_matrix_row_offsets,
-                                                              num_constraints + 1);
-    problem_and_stream->op_problem->set_constraint_lower_bounds(constraint_lower_bounds,
-                                                                num_constraints);
-    problem_and_stream->op_problem->set_constraint_upper_bounds(constraint_upper_bounds,
-                                                                num_constraints);
-    problem_and_stream->op_problem->set_variable_lower_bounds(variable_lower_bounds, num_variables);
-    problem_and_stream->op_problem->set_variable_upper_bounds(variable_upper_bounds, num_variables);
+    problem->set_csr_constraint_matrix(constraint_matrix_coefficent_values,
+                                       nnz,
+                                       constraint_matrix_column_indices,
+                                       nnz,
+                                       constraint_matrix_row_offsets,
+                                       num_constraints + 1);
+    problem->set_constraint_lower_bounds(constraint_lower_bounds, num_constraints);
+    problem->set_constraint_upper_bounds(constraint_upper_bounds, num_constraints);
+    problem->set_variable_lower_bounds(variable_lower_bounds, num_variables);
+    problem->set_variable_upper_bounds(variable_upper_bounds, num_variables);
+
+    // Quadratic problems are categorized as LP (no QP category in the enum)
+    problem->set_problem_category(problem_category_t::LP);
+
     *problem_ptr = static_cast<cuOptOptimizationProblem>(problem_and_stream);
   } catch (const raft::exception& e) {
+    delete problem_and_stream;
     return CUOPT_INVALID_ARGUMENT;
   }
   return CUOPT_SUCCESS;
@@ -404,7 +436,7 @@ cuopt_int_t cuOptGetNumConstraints(cuOptOptimizationProblem problem,
   if (num_constraints_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
-  *num_constraints_ptr = problem_and_stream_view->op_problem->get_n_constraints();
+  *num_constraints_ptr = problem_and_stream_view->get_problem()->get_n_constraints();
   return CUOPT_SUCCESS;
 }
 
@@ -414,7 +446,7 @@ cuopt_int_t cuOptGetNumVariables(cuOptOptimizationProblem problem, cuopt_int_t* 
   if (num_variables_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
-  *num_variables_ptr = problem_and_stream_view->op_problem->get_n_variables();
+  *num_variables_ptr = problem_and_stream_view->get_problem()->get_n_variables();
   return CUOPT_SUCCESS;
 }
 
@@ -426,7 +458,7 @@ cuopt_int_t cuOptGetObjectiveSense(cuOptOptimizationProblem problem,
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
   *objective_sense_ptr =
-    problem_and_stream_view->op_problem->get_sense() ? CUOPT_MAXIMIZE : CUOPT_MINIMIZE;
+    problem_and_stream_view->get_problem()->get_sense() ? CUOPT_MAXIMIZE : CUOPT_MINIMIZE;
   return CUOPT_SUCCESS;
 }
 
@@ -437,7 +469,7 @@ cuopt_int_t cuOptGetObjectiveOffset(cuOptOptimizationProblem problem,
   if (objective_offset_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
-  *objective_offset_ptr = problem_and_stream_view->op_problem->get_objective_offset();
+  *objective_offset_ptr = problem_and_stream_view->get_problem()->get_objective_offset();
   return CUOPT_SUCCESS;
 }
 
@@ -448,13 +480,22 @@ cuopt_int_t cuOptGetObjectiveCoefficients(cuOptOptimizationProblem problem,
   if (objective_coefficients_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
-  const rmm::device_uvector<cuopt_float_t>& objective_coefficients =
-    problem_and_stream_view->op_problem->get_objective_coefficients();
-  raft::copy(objective_coefficients_ptr,
-             objective_coefficients.data(),
-             objective_coefficients.size(),
-             problem_and_stream_view->stream_view);
-  problem_and_stream_view->stream_view.synchronize();
+
+  if (problem_and_stream_view->backend_type == problem_backend_t::CPU) {
+    // CPU backend - use host getters
+    std::vector<cuopt_float_t> host_data =
+      problem_and_stream_view->get_problem()->get_objective_coefficients_host();
+    std::copy(host_data.begin(), host_data.end(), objective_coefficients_ptr);
+  } else {
+    // GPU backend - copy from device
+    const rmm::device_uvector<cuopt_float_t>& objective_coefficients =
+      problem_and_stream_view->get_problem()->get_objective_coefficients();
+    raft::copy(objective_coefficients_ptr,
+               objective_coefficients.data(),
+               objective_coefficients.size(),
+               *problem_and_stream_view->stream_view_ptr);
+    problem_and_stream_view->stream_view_ptr->synchronize();
+  }
   return CUOPT_SUCCESS;
 }
 
@@ -465,7 +506,7 @@ cuopt_int_t cuOptGetNumNonZeros(cuOptOptimizationProblem problem,
   if (num_non_zero_elements_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
-  *num_non_zero_elements_ptr = problem_and_stream_view->op_problem->get_nnz();
+  *num_non_zero_elements_ptr = problem_and_stream_view->get_problem()->get_nnz();
   return CUOPT_SUCCESS;
 }
 
@@ -480,25 +521,40 @@ cuopt_int_t cuOptGetConstraintMatrix(cuOptOptimizationProblem problem,
   if (constraint_matrix_coefficients_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
-  const rmm::device_uvector<cuopt_float_t>& constraint_matrix_coefficients =
-    problem_and_stream_view->op_problem->get_constraint_matrix_values();
-  const rmm::device_uvector<cuopt_int_t>& constraint_matrix_column_indices =
-    problem_and_stream_view->op_problem->get_constraint_matrix_indices();
-  const rmm::device_uvector<cuopt_int_t>& constraint_matrix_row_offsets =
-    problem_and_stream_view->op_problem->get_constraint_matrix_offsets();
-  raft::copy(constraint_matrix_coefficients_ptr,
-             constraint_matrix_coefficients.data(),
-             constraint_matrix_coefficients.size(),
-             problem_and_stream_view->stream_view);
-  raft::copy(constraint_matrix_column_indices_ptr,
-             constraint_matrix_column_indices.data(),
-             constraint_matrix_column_indices.size(),
-             problem_and_stream_view->stream_view);
-  raft::copy(constraint_matrix_row_offsets_ptr,
-             constraint_matrix_row_offsets.data(),
-             constraint_matrix_row_offsets.size(),
-             problem_and_stream_view->stream_view);
-  problem_and_stream_view->stream_view.synchronize();
+
+  if (problem_and_stream_view->backend_type == problem_backend_t::CPU) {
+    // CPU backend - use host getters
+    std::vector<cuopt_float_t> values_host =
+      problem_and_stream_view->get_problem()->get_constraint_matrix_values_host();
+    std::vector<cuopt_int_t> indices_host =
+      problem_and_stream_view->get_problem()->get_constraint_matrix_indices_host();
+    std::vector<cuopt_int_t> offsets_host =
+      problem_and_stream_view->get_problem()->get_constraint_matrix_offsets_host();
+    std::copy(values_host.begin(), values_host.end(), constraint_matrix_coefficients_ptr);
+    std::copy(indices_host.begin(), indices_host.end(), constraint_matrix_column_indices_ptr);
+    std::copy(offsets_host.begin(), offsets_host.end(), constraint_matrix_row_offsets_ptr);
+  } else {
+    // GPU backend - copy from device
+    const rmm::device_uvector<cuopt_float_t>& constraint_matrix_coefficients =
+      problem_and_stream_view->get_problem()->get_constraint_matrix_values();
+    const rmm::device_uvector<cuopt_int_t>& constraint_matrix_column_indices =
+      problem_and_stream_view->get_problem()->get_constraint_matrix_indices();
+    const rmm::device_uvector<cuopt_int_t>& constraint_matrix_row_offsets =
+      problem_and_stream_view->get_problem()->get_constraint_matrix_offsets();
+    raft::copy(constraint_matrix_coefficients_ptr,
+               constraint_matrix_coefficients.data(),
+               constraint_matrix_coefficients.size(),
+               *problem_and_stream_view->stream_view_ptr);
+    raft::copy(constraint_matrix_column_indices_ptr,
+               constraint_matrix_column_indices.data(),
+               constraint_matrix_column_indices.size(),
+               *problem_and_stream_view->stream_view_ptr);
+    raft::copy(constraint_matrix_row_offsets_ptr,
+               constraint_matrix_row_offsets.data(),
+               constraint_matrix_row_offsets.size(),
+               *problem_and_stream_view->stream_view_ptr);
+    problem_and_stream_view->stream_view_ptr->synchronize();
+  }
   return CUOPT_SUCCESS;
 }
 
@@ -508,13 +564,19 @@ cuopt_int_t cuOptGetConstraintSense(cuOptOptimizationProblem problem, char* cons
   if (constraint_sense_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
-  const rmm::device_uvector<char>& constraint_sense =
-    problem_and_stream_view->op_problem->get_row_types();
-  raft::copy(constraint_sense_ptr,
-             constraint_sense.data(),
-             constraint_sense.size(),
-             problem_and_stream_view->stream_view);
-  problem_and_stream_view->stream_view.synchronize();
+
+  if (problem_and_stream_view->backend_type == problem_backend_t::CPU) {
+    std::vector<char> host_data = problem_and_stream_view->get_problem()->get_row_types_host();
+    std::copy(host_data.begin(), host_data.end(), constraint_sense_ptr);
+  } else {
+    const rmm::device_uvector<char>& constraint_sense =
+      problem_and_stream_view->get_problem()->get_row_types();
+    raft::copy(constraint_sense_ptr,
+               constraint_sense.data(),
+               constraint_sense.size(),
+               *problem_and_stream_view->stream_view_ptr);
+    problem_and_stream_view->stream_view_ptr->synchronize();
+  }
   return CUOPT_SUCCESS;
 }
 
@@ -525,10 +587,17 @@ cuopt_int_t cuOptGetConstraintRightHandSide(cuOptOptimizationProblem problem,
   if (rhs_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
-  const rmm::device_uvector<cuopt_float_t>& rhs =
-    problem_and_stream_view->op_problem->get_constraint_bounds();
-  raft::copy(rhs_ptr, rhs.data(), rhs.size(), problem_and_stream_view->stream_view);
-  problem_and_stream_view->stream_view.synchronize();
+
+  if (problem_and_stream_view->backend_type == problem_backend_t::CPU) {
+    std::vector<cuopt_float_t> host_data =
+      problem_and_stream_view->get_problem()->get_constraint_bounds_host();
+    std::copy(host_data.begin(), host_data.end(), rhs_ptr);
+  } else {
+    const rmm::device_uvector<cuopt_float_t>& rhs =
+      problem_and_stream_view->get_problem()->get_constraint_bounds();
+    raft::copy(rhs_ptr, rhs.data(), rhs.size(), *problem_and_stream_view->stream_view_ptr);
+    problem_and_stream_view->stream_view_ptr->synchronize();
+  }
   return CUOPT_SUCCESS;
 }
 
@@ -539,13 +608,20 @@ cuopt_int_t cuOptGetConstraintLowerBounds(cuOptOptimizationProblem problem,
   if (lower_bounds_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
-  const rmm::device_uvector<cuopt_float_t>& lower_bounds =
-    problem_and_stream_view->op_problem->get_constraint_lower_bounds();
-  raft::copy(lower_bounds_ptr,
-             lower_bounds.data(),
-             lower_bounds.size(),
-             problem_and_stream_view->stream_view);
-  problem_and_stream_view->stream_view.synchronize();
+
+  if (problem_and_stream_view->backend_type == problem_backend_t::CPU) {
+    std::vector<cuopt_float_t> host_data =
+      problem_and_stream_view->get_problem()->get_constraint_lower_bounds_host();
+    std::copy(host_data.begin(), host_data.end(), lower_bounds_ptr);
+  } else {
+    const rmm::device_uvector<cuopt_float_t>& lower_bounds =
+      problem_and_stream_view->get_problem()->get_constraint_lower_bounds();
+    raft::copy(lower_bounds_ptr,
+               lower_bounds.data(),
+               lower_bounds.size(),
+               *problem_and_stream_view->stream_view_ptr);
+    problem_and_stream_view->stream_view_ptr->synchronize();
+  }
   return CUOPT_SUCCESS;
 }
 
@@ -556,13 +632,20 @@ cuopt_int_t cuOptGetConstraintUpperBounds(cuOptOptimizationProblem problem,
   if (upper_bounds_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
-  const rmm::device_uvector<cuopt_float_t>& upper_bounds =
-    problem_and_stream_view->op_problem->get_constraint_upper_bounds();
-  raft::copy(upper_bounds_ptr,
-             upper_bounds.data(),
-             upper_bounds.size(),
-             problem_and_stream_view->stream_view);
-  problem_and_stream_view->stream_view.synchronize();
+
+  if (problem_and_stream_view->backend_type == problem_backend_t::CPU) {
+    std::vector<cuopt_float_t> host_data =
+      problem_and_stream_view->get_problem()->get_constraint_upper_bounds_host();
+    std::copy(host_data.begin(), host_data.end(), upper_bounds_ptr);
+  } else {
+    const rmm::device_uvector<cuopt_float_t>& upper_bounds =
+      problem_and_stream_view->get_problem()->get_constraint_upper_bounds();
+    raft::copy(upper_bounds_ptr,
+               upper_bounds.data(),
+               upper_bounds.size(),
+               *problem_and_stream_view->stream_view_ptr);
+    problem_and_stream_view->stream_view_ptr->synchronize();
+  }
   return CUOPT_SUCCESS;
 }
 
@@ -573,13 +656,20 @@ cuopt_int_t cuOptGetVariableLowerBounds(cuOptOptimizationProblem problem,
   if (lower_bounds_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
-  const rmm::device_uvector<cuopt_float_t>& lower_bounds =
-    problem_and_stream_view->op_problem->get_variable_lower_bounds();
-  raft::copy(lower_bounds_ptr,
-             lower_bounds.data(),
-             lower_bounds.size(),
-             problem_and_stream_view->stream_view);
-  problem_and_stream_view->stream_view.synchronize();
+
+  if (problem_and_stream_view->backend_type == problem_backend_t::CPU) {
+    std::vector<cuopt_float_t> host_data =
+      problem_and_stream_view->get_problem()->get_variable_lower_bounds_host();
+    std::copy(host_data.begin(), host_data.end(), lower_bounds_ptr);
+  } else {
+    const rmm::device_uvector<cuopt_float_t>& lower_bounds =
+      problem_and_stream_view->get_problem()->get_variable_lower_bounds();
+    raft::copy(lower_bounds_ptr,
+               lower_bounds.data(),
+               lower_bounds.size(),
+               *problem_and_stream_view->stream_view_ptr);
+    problem_and_stream_view->stream_view_ptr->synchronize();
+  }
   return CUOPT_SUCCESS;
 }
 
@@ -590,13 +680,20 @@ cuopt_int_t cuOptGetVariableUpperBounds(cuOptOptimizationProblem problem,
   if (upper_bounds_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
-  const rmm::device_uvector<cuopt_float_t>& upper_bounds =
-    problem_and_stream_view->op_problem->get_variable_upper_bounds();
-  raft::copy(upper_bounds_ptr,
-             upper_bounds.data(),
-             upper_bounds.size(),
-             problem_and_stream_view->stream_view);
-  problem_and_stream_view->stream_view.synchronize();
+
+  if (problem_and_stream_view->backend_type == problem_backend_t::CPU) {
+    std::vector<cuopt_float_t> host_data =
+      problem_and_stream_view->get_problem()->get_variable_upper_bounds_host();
+    std::copy(host_data.begin(), host_data.end(), upper_bounds_ptr);
+  } else {
+    const rmm::device_uvector<cuopt_float_t>& upper_bounds =
+      problem_and_stream_view->get_problem()->get_variable_upper_bounds();
+    raft::copy(upper_bounds_ptr,
+               upper_bounds.data(),
+               upper_bounds.size(),
+               *problem_and_stream_view->stream_view_ptr);
+    problem_and_stream_view->stream_view_ptr->synchronize();
+  }
   return CUOPT_SUCCESS;
 }
 
@@ -606,14 +703,20 @@ cuopt_int_t cuOptGetVariableTypes(cuOptOptimizationProblem problem, char* variab
   if (variable_types_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
-  const rmm::device_uvector<var_t>& variable_types =
-    problem_and_stream_view->op_problem->get_variable_types();
-  std::vector<cuopt::linear_programming::var_t> variable_types_host(variable_types.size());
-  raft::copy(variable_types_host.data(),
-             variable_types.data(),
-             variable_types.size(),
-             problem_and_stream_view->stream_view);
-  problem_and_stream_view->stream_view.synchronize();
+
+  std::vector<cuopt::linear_programming::var_t> variable_types_host;
+  if (problem_and_stream_view->backend_type == problem_backend_t::CPU) {
+    variable_types_host = problem_and_stream_view->get_problem()->get_variable_types_host();
+  } else {
+    const rmm::device_uvector<var_t>& variable_types =
+      problem_and_stream_view->get_problem()->get_variable_types();
+    variable_types_host.resize(variable_types.size());
+    raft::copy(variable_types_host.data(),
+               variable_types.data(),
+               variable_types.size(),
+               *problem_and_stream_view->stream_view_ptr);
+    problem_and_stream_view->stream_view_ptr->synchronize();
+  }
   for (size_t j = 0; j < variable_types_host.size(); j++) {
     variable_types_ptr[j] =
       variable_types_host[j] == var_t::INTEGER ? CUOPT_INTEGER : CUOPT_CONTINUOUS;
@@ -841,9 +944,8 @@ cuopt_int_t cuOptIsMIP(cuOptOptimizationProblem problem, cuopt_int_t* is_mip_ptr
   if (is_mip_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
-  bool is_mip =
-    (problem_and_stream_view->op_problem->get_problem_category() == problem_category_t::MIP) ||
-    (problem_and_stream_view->op_problem->get_problem_category() == problem_category_t::IP);
+  problem_category_t category = problem_and_stream_view->get_problem()->get_problem_category();
+  bool is_mip = (category == problem_category_t::MIP) || (category == problem_category_t::IP);
   *is_mip_ptr = static_cast<cuopt_int_t>(is_mip);
   return CUOPT_SUCCESS;
 }
@@ -857,44 +959,68 @@ cuopt_int_t cuOptSolve(cuOptOptimizationProblem problem,
   if (problem == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   if (settings == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   if (solution_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
+
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
-  if (problem_and_stream_view->op_problem->get_problem_category() == problem_category_t::MIP ||
-      problem_and_stream_view->op_problem->get_problem_category() == problem_category_t::IP) {
-    solver_settings_t<cuopt_int_t, cuopt_float_t>* solver_settings =
-      get_settings_handle(settings)->settings;
-    mip_solver_settings_t<cuopt_int_t, cuopt_float_t>& mip_settings =
-      solver_settings->get_mip_settings();
-    optimization_problem_t<cuopt_int_t, cuopt_float_t>* op_problem =
-      problem_and_stream_view->op_problem;
-    solution_and_stream_view_t* solution_and_stream_view =
-      new solution_and_stream_view_t(true, problem_and_stream_view->stream_view);
-    solution_and_stream_view->mip_solution_ptr = new mip_solution_t<cuopt_int_t, cuopt_float_t>(
-      solve_mip<cuopt_int_t, cuopt_float_t>(*op_problem, mip_settings));
-    *solution_ptr = static_cast<cuOptSolution>(solution_and_stream_view);
 
-    cuopt::utilities::printTimestamp("CUOPT_SOLVE_RETURN");
+  // Get the problem interface (GPU or CPU backed)
+  optimization_problem_interface_t<cuopt_int_t, cuopt_float_t>* problem_interface =
+    problem_and_stream_view->get_problem();
 
-    return static_cast<cuopt_int_t>(
-      solution_and_stream_view->mip_solution_ptr->get_error_status().get_error_type());
-  } else {
-    solver_settings_t<cuopt_int_t, cuopt_float_t>* solver_settings =
-      get_settings_handle(settings)->settings;
-    pdlp_solver_settings_t<cuopt_int_t, cuopt_float_t>& pdlp_settings =
-      solver_settings->get_pdlp_settings();
-    optimization_problem_t<cuopt_int_t, cuopt_float_t>* op_problem =
-      problem_and_stream_view->op_problem;
-    solution_and_stream_view_t* solution_and_stream_view =
-      new solution_and_stream_view_t(false, problem_and_stream_view->stream_view);
-    solution_and_stream_view->lp_solution_ptr =
-      new optimization_problem_solution_t<cuopt_int_t, cuopt_float_t>(
-        solve_lp<cuopt_int_t, cuopt_float_t>(*op_problem, pdlp_settings));
-    *solution_ptr = static_cast<cuOptSolution>(solution_and_stream_view);
+  try {
+    if (problem_interface->get_problem_category() == problem_category_t::MIP ||
+        problem_interface->get_problem_category() == problem_category_t::IP) {
+      solver_settings_t<cuopt_int_t, cuopt_float_t>* solver_settings =
+        get_settings_handle(settings)->settings;
+      mip_solver_settings_t<cuopt_int_t, cuopt_float_t>& mip_settings =
+        solver_settings->get_mip_settings();
 
-    cuopt::utilities::printTimestamp("CUOPT_SOLVE_RETURN");
+      // For CPU backend, stream_view_ptr is nullptr
+      // Solution wrapper needs a stream, so for CPU we need to handle this specially
+      rmm::cuda_stream_view stream = problem_and_stream_view->stream_view_ptr
+                                       ? *problem_and_stream_view->stream_view_ptr
+                                       : rmm::cuda_stream_view{};
 
-    return static_cast<cuopt_int_t>(
-      solution_and_stream_view->lp_solution_ptr->get_error_status().get_error_type());
+      solution_and_stream_view_t* solution_and_stream_view =
+        new solution_and_stream_view_t(true, stream);
+      solution_and_stream_view->mip_solution_ptr = new mip_solution_t<cuopt_int_t, cuopt_float_t>(
+        solve_mip<cuopt_int_t, cuopt_float_t>(problem_interface, mip_settings));
+      *solution_ptr = static_cast<cuOptSolution>(solution_and_stream_view);
+
+      cuopt::utilities::printTimestamp("CUOPT_SOLVE_RETURN");
+
+      return static_cast<cuopt_int_t>(
+        solution_and_stream_view->mip_solution_ptr->get_error_status().get_error_type());
+    } else {
+      solver_settings_t<cuopt_int_t, cuopt_float_t>* solver_settings =
+        get_settings_handle(settings)->settings;
+      pdlp_solver_settings_t<cuopt_int_t, cuopt_float_t>& pdlp_settings =
+        solver_settings->get_pdlp_settings();
+
+      // For CPU backend, stream_view_ptr is nullptr
+      rmm::cuda_stream_view stream = problem_and_stream_view->stream_view_ptr
+                                       ? *problem_and_stream_view->stream_view_ptr
+                                       : rmm::cuda_stream_view{};
+
+      solution_and_stream_view_t* solution_and_stream_view =
+        new solution_and_stream_view_t(false, stream);
+      solution_and_stream_view->lp_solution_ptr =
+        new optimization_problem_solution_t<cuopt_int_t, cuopt_float_t>(
+          solve_lp<cuopt_int_t, cuopt_float_t>(problem_interface, pdlp_settings));
+      *solution_ptr = static_cast<cuOptSolution>(solution_and_stream_view);
+
+      cuopt::utilities::printTimestamp("CUOPT_SOLVE_RETURN");
+
+      return static_cast<cuopt_int_t>(
+        solution_and_stream_view->lp_solution_ptr->get_error_status().get_error_type());
+    }
+  } catch (const cuopt::logic_error& e) {
+    // Remote execution not yet implemented or other logic errors
+    CUOPT_LOG_ERROR("Solve failed: %s", e.what());
+    return static_cast<cuopt_int_t>(e.get_error_type());
+  } catch (const std::exception& e) {
+    CUOPT_LOG_ERROR("Solve failed with exception: %s", e.what());
+    return CUOPT_RUNTIME_ERROR;
   }
 }
 
