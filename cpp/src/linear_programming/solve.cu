@@ -1320,37 +1320,138 @@ optimization_problem_solution_t<i_t, f_t> solve_lp(
   return solve_lp(op_problem, settings, problem_checking, use_pdlp_solver_mode);
 }
 
-#define INSTANTIATE(F_TYPE)                                                            \
-  template optimization_problem_solution_t<int, F_TYPE> solve_lp(                      \
-    optimization_problem_t<int, F_TYPE>& op_problem,                                   \
-    pdlp_solver_settings_t<int, F_TYPE> const& settings,                               \
-    bool problem_checking,                                                             \
-    bool use_pdlp_solver_mode,                                                         \
-    bool is_batch_mode);                                                               \
-                                                                                       \
-  template optimization_problem_solution_t<int, F_TYPE> solve_lp(                      \
-    raft::handle_t const* handle_ptr,                                                  \
-    const cuopt::mps_parser::mps_data_model_t<int, F_TYPE>& mps_data_model,            \
-    pdlp_solver_settings_t<int, F_TYPE> const& settings,                               \
-    bool problem_checking,                                                             \
-    bool use_pdlp_solver_mode);                                                        \
-                                                                                       \
-  template optimization_problem_solution_t<int, F_TYPE> solve_lp_with_method(          \
-    detail::problem_t<int, F_TYPE>& problem,                                           \
-    pdlp_solver_settings_t<int, F_TYPE> const& settings,                               \
-    const timer_t& timer,                                                              \
-    bool is_batch_mode);                                                               \
-                                                                                       \
-  template optimization_problem_solution_t<int, F_TYPE> batch_pdlp_solve(              \
-    raft::handle_t const* handle_ptr,                                                  \
-    const cuopt::mps_parser::mps_data_model_t<int, F_TYPE>& mps_data_model,            \
-    const std::vector<int>& fractional,                                                \
-    const std::vector<F_TYPE>& root_soln_x,                                            \
-    pdlp_solver_settings_t<int, F_TYPE> const& settings);                              \
-                                                                                       \
-  template optimization_problem_t<int, F_TYPE> mps_data_model_to_optimization_problem( \
-    raft::handle_t const* handle_ptr,                                                  \
-    const cuopt::mps_parser::mps_data_model_t<int, F_TYPE>& data_model);               \
+// ============================================================================
+// Interface-based solve overloads with remote execution support
+// ============================================================================
+
+template <typename i_t, typename f_t>
+optimization_problem_solution_t<i_t, f_t> solve_lp(
+  optimization_problem_interface_t<i_t, f_t>* problem_interface,
+  pdlp_solver_settings_t<i_t, f_t> const& settings,
+  bool problem_checking,
+  bool use_pdlp_solver_mode,
+  bool is_batch_mode)
+{
+  // Check if remote execution is enabled
+  if (is_remote_execution_enabled()) {
+    CUOPT_LOG_INFO("Remote LP solve requested");
+
+    // Try CPU problem first
+    auto* cpu_problem = dynamic_cast<cpu_optimization_problem_t<i_t, f_t>*>(problem_interface);
+    if (cpu_problem) { return solve_lp_remote(*cpu_problem, settings); }
+
+    // Try GPU problem
+    auto* gpu_problem = dynamic_cast<gpu_optimization_problem_t<i_t, f_t>*>(problem_interface);
+    if (gpu_problem) { return solve_lp_remote(*gpu_problem, settings); }
+
+    throw cuopt::logic_error("Unknown problem type for remote solving",
+                             cuopt::error_type_t::ValidationError);
+  } else {
+    // Local execution - convert to optimization_problem_t and call original solve_lp
+    CUOPT_LOG_INFO("Local LP solve");
+
+    // NOTE: We could theoretically allocate GPU resources here for a CPU problem,
+    // but we are not currently supporting local solve of a problem that has been
+    // built on the CPU. CPU problems are intended for remote execution only.
+    // If local solving is needed, create the problem with GPU backend from the start.
+    auto* cpu_prob = dynamic_cast<cpu_optimization_problem_t<i_t, f_t>*>(problem_interface);
+    if (cpu_prob != nullptr) {
+      CUOPT_LOG_ERROR("Attempted local solve of CPU-backed problem without CUDA resources");
+      throw cuopt::logic_error(
+        "Local solve of CPU-backed problems is not supported. "
+        "CPU problems are intended for remote execution only. "
+        "For local solving, create the problem with GPU backend (CUOPT_USE_GPU_MEM=true).",
+        cuopt::error_type_t::ValidationError);
+    }
+
+    auto op_problem = problem_interface->to_optimization_problem();
+    return solve_lp<i_t, f_t>(
+      op_problem, settings, problem_checking, use_pdlp_solver_mode, is_batch_mode);
+  }
+}
+
+template <typename i_t, typename f_t>
+mip_solution_t<i_t, f_t> solve_mip(optimization_problem_interface_t<i_t, f_t>* problem_interface,
+                                   mip_solver_settings_t<i_t, f_t> const& settings)
+{
+  // Check if remote execution is enabled
+  if (is_remote_execution_enabled()) {
+    CUOPT_LOG_INFO("Remote MIP solve requested");
+
+    // Try CPU problem first
+    auto* cpu_problem = dynamic_cast<cpu_optimization_problem_t<i_t, f_t>*>(problem_interface);
+    if (cpu_problem) { return solve_mip_remote(*cpu_problem, settings); }
+
+    // Try GPU problem
+    auto* gpu_problem = dynamic_cast<gpu_optimization_problem_t<i_t, f_t>*>(problem_interface);
+    if (gpu_problem) { return solve_mip_remote(*gpu_problem, settings); }
+
+    throw cuopt::logic_error("Unknown problem type for remote solving",
+                             cuopt::error_type_t::ValidationError);
+  } else {
+    // Local execution - convert to optimization_problem_t and call original solve_mip
+    CUOPT_LOG_INFO("Local MIP solve");
+
+    // NOTE: We could theoretically allocate GPU resources here for a CPU problem,
+    // but we are not currently supporting local solve of a problem that has been
+    // built on the CPU. CPU problems are intended for remote execution only.
+    // If local solving is needed, create the problem with GPU backend from the start.
+    auto* cpu_prob = dynamic_cast<cpu_optimization_problem_t<i_t, f_t>*>(problem_interface);
+    if (cpu_prob != nullptr) {
+      CUOPT_LOG_ERROR("Attempted local solve of CPU-backed problem without CUDA resources");
+      throw cuopt::logic_error(
+        "Local solve of CPU-backed problems is not supported. "
+        "CPU problems are intended for remote execution only. "
+        "For local solving, create the problem with GPU backend (CUOPT_USE_GPU_MEM=true).",
+        cuopt::error_type_t::ValidationError);
+    }
+
+    auto op_problem = problem_interface->to_optimization_problem();
+    return solve_mip<i_t, f_t>(op_problem, settings);
+  }
+}
+
+#define INSTANTIATE(F_TYPE)                                                                      \
+  template optimization_problem_solution_t<int, F_TYPE> solve_lp(                                \
+    optimization_problem_t<int, F_TYPE>& op_problem,                                             \
+    pdlp_solver_settings_t<int, F_TYPE> const& settings,                                         \
+    bool problem_checking,                                                                       \
+    bool use_pdlp_solver_mode,                                                                   \
+    bool is_batch_mode);                                                                         \
+                                                                                                 \
+  template optimization_problem_solution_t<int, F_TYPE> solve_lp(                                \
+    raft::handle_t const* handle_ptr,                                                            \
+    const cuopt::mps_parser::mps_data_model_t<int, F_TYPE>& mps_data_model,                      \
+    pdlp_solver_settings_t<int, F_TYPE> const& settings,                                         \
+    bool problem_checking,                                                                       \
+    bool use_pdlp_solver_mode);                                                                  \
+                                                                                                 \
+  template optimization_problem_solution_t<int, F_TYPE> solve_lp(                                \
+    optimization_problem_interface_t<int, F_TYPE>*,                                              \
+    pdlp_solver_settings_t<int, F_TYPE> const&,                                                  \
+    bool,                                                                                        \
+    bool,                                                                                        \
+    bool);                                                                                       \
+                                                                                                 \
+  template mip_solution_t<int, F_TYPE> solve_mip(optimization_problem_interface_t<int, F_TYPE>*, \
+                                                 mip_solver_settings_t<int, F_TYPE> const&);     \
+                                                                                                 \
+  template optimization_problem_solution_t<int, F_TYPE> solve_lp_with_method(                    \
+    detail::problem_t<int, F_TYPE>& problem,                                                     \
+    pdlp_solver_settings_t<int, F_TYPE> const& settings,                                         \
+    const timer_t& timer,                                                                        \
+    bool is_batch_mode);                                                                         \
+                                                                                                 \
+  template optimization_problem_solution_t<int, F_TYPE> batch_pdlp_solve(                        \
+    raft::handle_t const* handle_ptr,                                                            \
+    const cuopt::mps_parser::mps_data_model_t<int, F_TYPE>& mps_data_model,                      \
+    const std::vector<int>& fractional,                                                          \
+    const std::vector<F_TYPE>& root_soln_x,                                                      \
+    pdlp_solver_settings_t<int, F_TYPE> const& settings);                                        \
+                                                                                                 \
+  template optimization_problem_t<int, F_TYPE> mps_data_model_to_optimization_problem(           \
+    raft::handle_t const* handle_ptr,                                                            \
+    const cuopt::mps_parser::mps_data_model_t<int, F_TYPE>& data_model);                         \
   template void set_pdlp_solver_mode(pdlp_solver_settings_t<int, F_TYPE>& settings);
 
 #if MIP_INSTANTIATE_FLOAT

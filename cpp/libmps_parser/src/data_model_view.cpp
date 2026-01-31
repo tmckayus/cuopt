@@ -1,6 +1,6 @@
 /* clang-format off */
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 /* clang-format on */
@@ -348,7 +348,8 @@ bool data_model_view_t<i_t, f_t>::has_quadratic_objective() const noexcept
 
 // NOTE: Explicitly instantiate all types here in order to avoid linker error
 template class data_model_view_t<int, float>;
-
 template class data_model_view_t<int, double>;
+template class data_model_view_t<long, float>;
+template class data_model_view_t<long, double>;
 
 }  // namespace cuopt::mps_parser
