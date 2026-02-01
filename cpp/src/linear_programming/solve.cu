@@ -24,6 +24,9 @@
 #include <mip/solver.cuh>
 #include <mip/utilities/sort_csr.cuh>
 
+#include <cuopt/linear_programming/cpu_optimization_problem_solution.hpp>
+#include <cuopt/linear_programming/gpu_optimization_problem_solution.hpp>
+#include <cuopt/linear_programming/optimization_problem_interface.hpp>
 #include <cuopt/linear_programming/pdlp/pdlp_hyper_params.cuh>
 #include <cuopt/linear_programming/pdlp/solver_settings.hpp>
 #include <cuopt/linear_programming/solve.hpp>
@@ -1325,7 +1328,7 @@ optimization_problem_solution_t<i_t, f_t> solve_lp(
 // ============================================================================
 
 template <typename i_t, typename f_t>
-optimization_problem_solution_t<i_t, f_t> solve_lp(
+std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp(
   optimization_problem_interface_t<i_t, f_t>* problem_interface,
   pdlp_solver_settings_t<i_t, f_t> const& settings,
   bool problem_checking,
@@ -1364,15 +1367,19 @@ optimization_problem_solution_t<i_t, f_t> solve_lp(
         cuopt::error_type_t::ValidationError);
     }
 
-    auto op_problem = problem_interface->to_optimization_problem();
-    return solve_lp<i_t, f_t>(
+    auto op_problem   = problem_interface->to_optimization_problem();
+    auto gpu_solution = solve_lp<i_t, f_t>(
       op_problem, settings, problem_checking, use_pdlp_solver_mode, is_batch_mode);
+
+    // Wrap GPU solution in interface and return
+    return std::make_unique<gpu_lp_solution_t<i_t, f_t>>(std::move(gpu_solution));
   }
 }
 
 template <typename i_t, typename f_t>
-mip_solution_t<i_t, f_t> solve_mip(optimization_problem_interface_t<i_t, f_t>* problem_interface,
-                                   mip_solver_settings_t<i_t, f_t> const& settings)
+std::unique_ptr<mip_solution_interface_t<i_t, f_t>> solve_mip(
+  optimization_problem_interface_t<i_t, f_t>* problem_interface,
+  mip_solver_settings_t<i_t, f_t> const& settings)
 {
   // Check if remote execution is enabled
   if (is_remote_execution_enabled()) {
@@ -1406,52 +1413,55 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_interface_t<i_t, f_t>* p
         cuopt::error_type_t::ValidationError);
     }
 
-    auto op_problem = problem_interface->to_optimization_problem();
-    return solve_mip<i_t, f_t>(op_problem, settings);
+    auto op_problem   = problem_interface->to_optimization_problem();
+    auto gpu_solution = solve_mip<i_t, f_t>(op_problem, settings);
+
+    // Wrap GPU solution in interface and return
+    return std::make_unique<gpu_mip_solution_t<i_t, f_t>>(std::move(gpu_solution));
   }
 }
 
-#define INSTANTIATE(F_TYPE)                                                                      \
-  template optimization_problem_solution_t<int, F_TYPE> solve_lp(                                \
-    optimization_problem_t<int, F_TYPE>& op_problem,                                             \
-    pdlp_solver_settings_t<int, F_TYPE> const& settings,                                         \
-    bool problem_checking,                                                                       \
-    bool use_pdlp_solver_mode,                                                                   \
-    bool is_batch_mode);                                                                         \
-                                                                                                 \
-  template optimization_problem_solution_t<int, F_TYPE> solve_lp(                                \
-    raft::handle_t const* handle_ptr,                                                            \
-    const cuopt::mps_parser::mps_data_model_t<int, F_TYPE>& mps_data_model,                      \
-    pdlp_solver_settings_t<int, F_TYPE> const& settings,                                         \
-    bool problem_checking,                                                                       \
-    bool use_pdlp_solver_mode);                                                                  \
-                                                                                                 \
-  template optimization_problem_solution_t<int, F_TYPE> solve_lp(                                \
-    optimization_problem_interface_t<int, F_TYPE>*,                                              \
-    pdlp_solver_settings_t<int, F_TYPE> const&,                                                  \
-    bool,                                                                                        \
-    bool,                                                                                        \
-    bool);                                                                                       \
-                                                                                                 \
-  template mip_solution_t<int, F_TYPE> solve_mip(optimization_problem_interface_t<int, F_TYPE>*, \
-                                                 mip_solver_settings_t<int, F_TYPE> const&);     \
-                                                                                                 \
-  template optimization_problem_solution_t<int, F_TYPE> solve_lp_with_method(                    \
-    detail::problem_t<int, F_TYPE>& problem,                                                     \
-    pdlp_solver_settings_t<int, F_TYPE> const& settings,                                         \
-    const timer_t& timer,                                                                        \
-    bool is_batch_mode);                                                                         \
-                                                                                                 \
-  template optimization_problem_solution_t<int, F_TYPE> batch_pdlp_solve(                        \
-    raft::handle_t const* handle_ptr,                                                            \
-    const cuopt::mps_parser::mps_data_model_t<int, F_TYPE>& mps_data_model,                      \
-    const std::vector<int>& fractional,                                                          \
-    const std::vector<F_TYPE>& root_soln_x,                                                      \
-    pdlp_solver_settings_t<int, F_TYPE> const& settings);                                        \
-                                                                                                 \
-  template optimization_problem_t<int, F_TYPE> mps_data_model_to_optimization_problem(           \
-    raft::handle_t const* handle_ptr,                                                            \
-    const cuopt::mps_parser::mps_data_model_t<int, F_TYPE>& data_model);                         \
+#define INSTANTIATE(F_TYPE)                                                                     \
+  template optimization_problem_solution_t<int, F_TYPE> solve_lp(                               \
+    optimization_problem_t<int, F_TYPE>& op_problem,                                            \
+    pdlp_solver_settings_t<int, F_TYPE> const& settings,                                        \
+    bool problem_checking,                                                                      \
+    bool use_pdlp_solver_mode,                                                                  \
+    bool is_batch_mode);                                                                        \
+                                                                                                \
+  template optimization_problem_solution_t<int, F_TYPE> solve_lp(                               \
+    raft::handle_t const* handle_ptr,                                                           \
+    const cuopt::mps_parser::mps_data_model_t<int, F_TYPE>& mps_data_model,                     \
+    pdlp_solver_settings_t<int, F_TYPE> const& settings,                                        \
+    bool problem_checking,                                                                      \
+    bool use_pdlp_solver_mode);                                                                 \
+                                                                                                \
+  template std::unique_ptr<lp_solution_interface_t<int, F_TYPE>> solve_lp(                      \
+    optimization_problem_interface_t<int, F_TYPE>*,                                             \
+    pdlp_solver_settings_t<int, F_TYPE> const&,                                                 \
+    bool,                                                                                       \
+    bool,                                                                                       \
+    bool);                                                                                      \
+                                                                                                \
+  template std::unique_ptr<mip_solution_interface_t<int, F_TYPE>> solve_mip(                    \
+    optimization_problem_interface_t<int, F_TYPE>*, mip_solver_settings_t<int, F_TYPE> const&); \
+                                                                                                \
+  template optimization_problem_solution_t<int, F_TYPE> solve_lp_with_method(                   \
+    detail::problem_t<int, F_TYPE>& problem,                                                    \
+    pdlp_solver_settings_t<int, F_TYPE> const& settings,                                        \
+    const timer_t& timer,                                                                       \
+    bool is_batch_mode);                                                                        \
+                                                                                                \
+  template optimization_problem_solution_t<int, F_TYPE> batch_pdlp_solve(                       \
+    raft::handle_t const* handle_ptr,                                                           \
+    const cuopt::mps_parser::mps_data_model_t<int, F_TYPE>& mps_data_model,                     \
+    const std::vector<int>& fractional,                                                         \
+    const std::vector<F_TYPE>& root_soln_x,                                                     \
+    pdlp_solver_settings_t<int, F_TYPE> const& settings);                                       \
+                                                                                                \
+  template optimization_problem_t<int, F_TYPE> mps_data_model_to_optimization_problem(          \
+    raft::handle_t const* handle_ptr,                                                           \
+    const cuopt::mps_parser::mps_data_model_t<int, F_TYPE>& data_model);                        \
   template void set_pdlp_solver_mode(pdlp_solver_settings_t<int, F_TYPE>& settings);
 
 #if MIP_INSTANTIATE_FLOAT

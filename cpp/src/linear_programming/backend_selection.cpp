@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 
@@ -37,13 +38,14 @@ bool force_gpu_memory()
 problem_backend_t get_backend_type()
 {
   if (force_gpu_memory()) {
-    CUOPT_LOG_INFO("CUOPT_USE_GPU_MEM=true - forcing GPU backend");
+    fprintf(stderr, "[cuOpt] CUOPT_USE_GPU_MEM=true - forcing GPU backend\n");
     return problem_backend_t::GPU;
   }
   if (is_remote_execution_enabled()) {
-    CUOPT_LOG_INFO("Remote execution enabled - using CPU backend");
+    fprintf(stderr, "[cuOpt] Remote execution enabled - using CPU backend\n");
     return problem_backend_t::CPU;
   }
+  fprintf(stderr, "[cuOpt] Using GPU backend\n");
   return problem_backend_t::GPU;
 }
 

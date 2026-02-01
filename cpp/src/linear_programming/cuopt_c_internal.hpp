@@ -11,6 +11,7 @@
 #include <cuopt/linear_programming/mip/solver_solution.hpp>
 #include <cuopt/linear_programming/optimization_problem.hpp>
 #include <cuopt/linear_programming/optimization_problem_interface.hpp>
+#include <cuopt/linear_programming/optimization_problem_solution_interface.hpp>
 #include <cuopt/linear_programming/pdlp/solver_solution.hpp>
 
 #include <raft/core/handle.hpp>
@@ -72,17 +73,24 @@ struct problem_and_stream_view_t {
 };
 
 struct solution_and_stream_view_t {
-  solution_and_stream_view_t(bool solution_for_mip, rmm::cuda_stream_view stream_view)
+  solution_and_stream_view_t(bool solution_for_mip, problem_backend_t backend)
     : is_mip(solution_for_mip),
-      mip_solution_ptr(nullptr),
-      lp_solution_ptr(nullptr),
-      stream_view(stream_view)
+      mip_solution_interface_ptr(nullptr),
+      lp_solution_interface_ptr(nullptr),
+      backend_type(backend)
   {
   }
+
+  ~solution_and_stream_view_t()
+  {
+    if (mip_solution_interface_ptr) delete mip_solution_interface_ptr;
+    if (lp_solution_interface_ptr) delete lp_solution_interface_ptr;
+  }
+
   bool is_mip;
-  mip_solution_t<cuopt_int_t, cuopt_float_t>* mip_solution_ptr;
-  optimization_problem_solution_t<cuopt_int_t, cuopt_float_t>* lp_solution_ptr;
-  rmm::cuda_stream_view stream_view;
+  mip_solution_interface_t<cuopt_int_t, cuopt_float_t>* mip_solution_interface_ptr;
+  lp_solution_interface_t<cuopt_int_t, cuopt_float_t>* lp_solution_interface_ptr;
+  problem_backend_t backend_type;  // Track if GPU or CPU backend for data access
 };
 
 }  // namespace cuopt::linear_programming

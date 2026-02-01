@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved. # noqa
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved. # noqa
 # SPDX-License-Identifier: Apache-2.0
 
 
@@ -95,6 +95,10 @@ cdef extern from "cuopt/error.hpp" namespace "cuopt": # noqa
         OutOfMemoryError "cuopt::error_type_t::OutOfMemoryError" # noqa
         RuntimeError "cuopt::error_type_t::RuntimeError" # noqa
 
+    cdef cppclass logic_error:
+        error_type_t get_error_type() except +
+        const char* what() except +
+
 cdef extern from "cuopt/linear_programming/mip/solver_solution.hpp" namespace "cuopt::linear_programming": # noqa
     ctypedef enum mip_termination_status_t "cuopt::linear_programming::mip_termination_status_t": # noqa
         NoTermination "cuopt::linear_programming::mip_termination_status_t::NoTermination" # noqa
@@ -118,67 +122,94 @@ cdef extern from "cuopt/linear_programming/pdlp/solver_solution.hpp" namespace "
         PrimalFeasible "cuopt::linear_programming::pdlp_termination_status_t::PrimalFeasible" # noqa
 
 
+cdef extern from "cuopt/linear_programming/pdlp/pdlp_warm_start_data.hpp" namespace "cuopt::linear_programming": # noqa
+    cdef cppclass pdlp_warm_start_data_t[i_t, f_t]:
+        pass  # Opaque type for warm start data
+
+cdef extern from "cuopt/linear_programming/optimization_problem_solution_interface.hpp" namespace "cuopt::linear_programming": # noqa
+    # LP Solution Interface
+    cdef cppclass lp_solution_interface_t[i_t, f_t]:
+        # Host memory accessors (work for both CPU and GPU solutions)
+        const vector[f_t]& get_primal_solution_host() except +
+        const vector[f_t]& get_dual_solution_host() except +
+        const vector[f_t]& get_reduced_cost_host() except +
+
+        # Error and metadata accessors
+        logic_error get_error_status() except +
+        pdlp_termination_status_t get_termination_status(i_t id) except +
+        f_t get_solve_time() except +
+        f_t get_objective_value(i_t id) except +
+        f_t get_dual_objective_value(i_t id) except +
+        i_t get_primal_solution_size() except +
+        i_t get_dual_solution_size() except +
+        i_t get_reduced_cost_size() except +
+
+        # Additional termination info
+        f_t get_l2_primal_residual(i_t id) except +
+        f_t get_l2_dual_residual(i_t id) except +
+        f_t get_gap(i_t id) except +
+        i_t get_num_iterations(i_t id) except +
+        bool is_solved_by_pdlp(i_t id) except +
+
+        # Warm start data (throws for CPU solutions)
+        const pdlp_warm_start_data_t[i_t, f_t]& get_pdlp_warm_start_data() except +
+
+        # Individual warm start accessors (work for both GPU and CPU)
+        bool has_warm_start_data() except +
+        vector[f_t] get_current_primal_solution_host() except +
+        vector[f_t] get_current_dual_solution_host() except +
+        vector[f_t] get_initial_primal_average_host() except +
+        vector[f_t] get_initial_dual_average_host() except +
+        vector[f_t] get_current_ATY_host() except +
+        vector[f_t] get_sum_primal_solutions_host() except +
+        vector[f_t] get_sum_dual_solutions_host() except +
+        vector[f_t] get_last_restart_duality_gap_primal_solution_host() except +
+        vector[f_t] get_last_restart_duality_gap_dual_solution_host() except +
+        f_t get_initial_primal_weight() except +
+        f_t get_initial_step_size() except +
+        i_t get_total_pdlp_iterations() except +
+        i_t get_total_pdhg_iterations() except +
+        f_t get_last_candidate_kkt_score() except +
+        f_t get_last_restart_kkt_score() except +
+        f_t get_sum_solution_weight() except +
+        i_t get_iterations_since_last_restart() except +
+
+    # MIP Solution Interface
+    cdef cppclass mip_solution_interface_t[i_t, f_t]:
+        # Host memory accessors (work for both CPU and GPU solutions)
+        const vector[f_t]& get_solution_host() except +
+
+        # Error and metadata accessors
+        logic_error get_error_status() except +
+        mip_termination_status_t get_termination_status() except +
+        f_t get_objective_value() except +
+        f_t get_mip_gap() except +
+        f_t get_solution_bound() except +
+        f_t get_solve_time() except +
+        i_t get_solution_size() except +
+
+        # Additional MIP stats
+        f_t get_presolve_time() except +
+        f_t get_max_constraint_violation() except +
+        f_t get_max_int_violation() except +
+        f_t get_max_variable_bound_violation() except +
+        i_t get_num_nodes() except +
+        i_t get_num_simplex_iterations() except +
+
 cdef extern from "cuopt/linear_programming/utilities/cython_solve.hpp" namespace "cuopt::cython": # noqa
-    cdef cppclass linear_programming_ret_t:
-        unique_ptr[device_buffer] primal_solution_
-        unique_ptr[device_buffer] dual_solution_
-        unique_ptr[device_buffer] reduced_cost_
-        # PDLP warm start data
-        unique_ptr[device_buffer] current_primal_solution_
-        unique_ptr[device_buffer] current_dual_solution_
-        unique_ptr[device_buffer] initial_primal_average_
-        unique_ptr[device_buffer] initial_dual_average_
-        unique_ptr[device_buffer] current_ATY_
-        unique_ptr[device_buffer] sum_primal_solutions_
-        unique_ptr[device_buffer] sum_dual_solutions_
-        unique_ptr[device_buffer] last_restart_duality_gap_primal_solution_
-        unique_ptr[device_buffer] last_restart_duality_gap_dual_solution_
-        double initial_primal_weight_
-        double initial_step_size_
-        int total_pdlp_iterations_
-        int total_pdhg_iterations_
-        double last_candidate_kkt_score_
-        double last_restart_kkt_score_
-        double sum_solution_weight_
-        int iterations_since_last_restart_
-        # /PDLP warm start data
-        pdlp_termination_status_t termination_status_
-        error_type_t error_status_
-        string error_message_
-        double l2_primal_residual_
-        double l2_dual_residual_
-        double primal_objective_
-        double dual_objective_
-        double gap_
-        int nb_iterations_
-        double solve_time_
-        bool solved_by_pdlp_
-
-    cdef cppclass mip_ret_t:
-        unique_ptr[device_buffer] solution_
-        mip_termination_status_t termination_status_
-        error_type_t error_status_
-        string error_message_
-        double objective_
-        double mip_gap_
-        double solution_bound_
-        double total_solve_time_
-        double presolve_time_
-        double max_constraint_violation_
-        double max_int_violation_
-        double max_variable_bound_violation_
-        int nodes_
-        int simplex_iterations_
-
     cdef cppclass solver_ret_t:
         problem_category_t problem_type
-        linear_programming_ret_t lp_ret
-        mip_ret_t mip_ret
+        lp_solution_interface_t[int, double]* lp_solution
+        mip_solution_interface_t[int, double]* mip_solution
 
     cdef unique_ptr[solver_ret_t] call_solve(
         data_model_view_t[int, double]* data_model,
         solver_settings_t[int, double]* solver_settings,
     ) except +
+
+    # Helper functions to delete solution pointers (avoids Cython template issues)
+    cdef void delete_lp_solution(lp_solution_interface_t[int, double]* ptr)
+    cdef void delete_mip_solution(mip_solution_interface_t[int, double]* ptr)
 
     cdef pair[vector[unique_ptr[solver_ret_t]], double] call_batch_solve( # noqa
         vector[data_model_view_t[int, double] *] data_models,
