@@ -1138,11 +1138,9 @@ bool optimization_problem_t<i_t, f_t>::has_quadratic_objective() const
 // NOTE: Explicitly instantiate all types here in order to avoid linker error
 #if MIP_INSTANTIATE_FLOAT
 template class optimization_problem_t<int, float>;
-template class optimization_problem_t<long, float>;
 #endif
 #if MIP_INSTANTIATE_DOUBLE
 template class optimization_problem_t<int, double>;
-template class optimization_problem_t<long, double>;
 #endif
 
 // TODO current raft to cusparse wrappers only support int64_t
