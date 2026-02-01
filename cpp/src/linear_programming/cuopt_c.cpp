@@ -7,6 +7,8 @@
 
 #include <cuopt/linear_programming/cuopt_c.h>
 
+#include <cuopt/linear_programming/cpu_optimization_problem_solution.hpp>
+#include <cuopt/linear_programming/gpu_optimization_problem_solution.hpp>
 #include <cuopt/linear_programming/optimization_problem.hpp>
 #include <cuopt/linear_programming/optimization_problem_utils.hpp>
 #include <cuopt/linear_programming/solve.hpp>
@@ -975,44 +977,40 @@ cuopt_int_t cuOptSolve(cuOptOptimizationProblem problem,
       mip_solver_settings_t<cuopt_int_t, cuopt_float_t>& mip_settings =
         solver_settings->get_mip_settings();
 
-      // For CPU backend, stream_view_ptr is nullptr
-      // Solution wrapper needs a stream, so for CPU we need to handle this specially
-      rmm::cuda_stream_view stream = problem_and_stream_view->stream_view_ptr
-                                       ? *problem_and_stream_view->stream_view_ptr
-                                       : rmm::cuda_stream_view{};
+      // Solve returns unique_ptr<mip_solution_interface_t>
+      auto solution_interface =
+        solve_mip<cuopt_int_t, cuopt_float_t>(problem_interface, mip_settings);
 
+      // Store interface pointer directly (works on both GPU and CPU-only hosts)
       solution_and_stream_view_t* solution_and_stream_view =
-        new solution_and_stream_view_t(true, stream);
-      solution_and_stream_view->mip_solution_ptr = new mip_solution_t<cuopt_int_t, cuopt_float_t>(
-        solve_mip<cuopt_int_t, cuopt_float_t>(problem_interface, mip_settings));
+        new solution_and_stream_view_t(true, problem_and_stream_view->backend_type);
+      solution_and_stream_view->mip_solution_interface_ptr = solution_interface.release();
       *solution_ptr = static_cast<cuOptSolution>(solution_and_stream_view);
 
       cuopt::utilities::printTimestamp("CUOPT_SOLVE_RETURN");
 
       return static_cast<cuopt_int_t>(
-        solution_and_stream_view->mip_solution_ptr->get_error_status().get_error_type());
+        solution_and_stream_view->mip_solution_interface_ptr->get_error_status().get_error_type());
     } else {
       solver_settings_t<cuopt_int_t, cuopt_float_t>* solver_settings =
         get_settings_handle(settings)->settings;
       pdlp_solver_settings_t<cuopt_int_t, cuopt_float_t>& pdlp_settings =
         solver_settings->get_pdlp_settings();
 
-      // For CPU backend, stream_view_ptr is nullptr
-      rmm::cuda_stream_view stream = problem_and_stream_view->stream_view_ptr
-                                       ? *problem_and_stream_view->stream_view_ptr
-                                       : rmm::cuda_stream_view{};
+      // Solve returns unique_ptr<lp_solution_interface_t>
+      auto solution_interface =
+        solve_lp<cuopt_int_t, cuopt_float_t>(problem_interface, pdlp_settings);
 
+      // Store interface pointer directly (works on both GPU and CPU-only hosts)
       solution_and_stream_view_t* solution_and_stream_view =
-        new solution_and_stream_view_t(false, stream);
-      solution_and_stream_view->lp_solution_ptr =
-        new optimization_problem_solution_t<cuopt_int_t, cuopt_float_t>(
-          solve_lp<cuopt_int_t, cuopt_float_t>(problem_interface, pdlp_settings));
+        new solution_and_stream_view_t(false, problem_and_stream_view->backend_type);
+      solution_and_stream_view->lp_solution_interface_ptr = solution_interface.release();
       *solution_ptr = static_cast<cuOptSolution>(solution_and_stream_view);
 
       cuopt::utilities::printTimestamp("CUOPT_SOLVE_RETURN");
 
       return static_cast<cuopt_int_t>(
-        solution_and_stream_view->lp_solution_ptr->get_error_status().get_error_type());
+        solution_and_stream_view->lp_solution_interface_ptr->get_error_status().get_error_type());
     }
   } catch (const cuopt::logic_error& e) {
     // Remote execution not yet implemented or other logic errors
@@ -1030,17 +1028,7 @@ void cuOptDestroySolution(cuOptSolution* solution_ptr)
   if (*solution_ptr == nullptr) { return; }
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(*solution_ptr);
-  if (solution_and_stream_view->is_mip) {
-    mip_solution_t<cuopt_int_t, cuopt_float_t>* mip_solution =
-      static_cast<mip_solution_t<cuopt_int_t, cuopt_float_t>*>(
-        solution_and_stream_view->mip_solution_ptr);
-    delete mip_solution;
-  } else {
-    optimization_problem_solution_t<cuopt_int_t, cuopt_float_t>* optimization_problem_solution =
-      static_cast<optimization_problem_solution_t<cuopt_int_t, cuopt_float_t>*>(
-        solution_and_stream_view->lp_solution_ptr);
-    delete optimization_problem_solution;
-  }
+  // Destructor handles cleanup of interface pointers
   delete solution_and_stream_view;
   *solution_ptr = nullptr;
 }
@@ -1052,16 +1040,11 @@ cuopt_int_t cuOptGetTerminationStatus(cuOptSolution solution, cuopt_int_t* termi
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
   if (solution_and_stream_view->is_mip) {
-    mip_solution_t<cuopt_int_t, cuopt_float_t>* mip_solution =
-      static_cast<mip_solution_t<cuopt_int_t, cuopt_float_t>*>(
-        solution_and_stream_view->mip_solution_ptr);
-    *termination_status_ptr = static_cast<cuopt_int_t>(mip_solution->get_termination_status());
+    *termination_status_ptr = static_cast<cuopt_int_t>(
+      solution_and_stream_view->mip_solution_interface_ptr->get_termination_status());
   } else {
-    pdlp_termination_status_t termination_status =
-      static_cast<optimization_problem_solution_t<cuopt_int_t, cuopt_float_t>*>(
-        solution_and_stream_view->lp_solution_ptr)
-        ->get_termination_status();
-    *termination_status_ptr = static_cast<cuopt_int_t>(termination_status);
+    *termination_status_ptr = static_cast<cuopt_int_t>(
+      solution_and_stream_view->lp_solution_interface_ptr->get_termination_status());
   }
   return CUOPT_SUCCESS;
 }
@@ -1074,10 +1057,10 @@ cuopt_int_t cuOptGetErrorStatus(cuOptSolution solution, cuopt_int_t* error_statu
     static_cast<solution_and_stream_view_t*>(solution);
   if (solution_and_stream_view->is_mip) {
     *error_status_ptr = static_cast<cuopt_int_t>(
-      solution_and_stream_view->mip_solution_ptr->get_error_status().get_error_type());
+      solution_and_stream_view->mip_solution_interface_ptr->get_error_status().get_error_type());
   } else {
     *error_status_ptr = static_cast<cuopt_int_t>(
-      solution_and_stream_view->lp_solution_ptr->get_error_status().get_error_type());
+      solution_and_stream_view->lp_solution_interface_ptr->get_error_status().get_error_type());
   }
   return CUOPT_SUCCESS;
 }
@@ -1092,10 +1075,11 @@ cuopt_int_t cuOptGetErrorString(cuOptSolution solution,
     static_cast<solution_and_stream_view_t*>(solution);
   if (solution_and_stream_view->is_mip) {
     std::string error_string =
-      solution_and_stream_view->mip_solution_ptr->get_error_status().what();
+      solution_and_stream_view->mip_solution_interface_ptr->get_error_status().what();
     std::snprintf(error_string_ptr, error_string_size, "%s", error_string.c_str());
   } else {
-    std::string error_string = solution_and_stream_view->lp_solution_ptr->get_error_status().what();
+    std::string error_string =
+      solution_and_stream_view->lp_solution_interface_ptr->get_error_status().what();
     std::snprintf(error_string_ptr, error_string_size, "%s", error_string.c_str());
   }
   return CUOPT_SUCCESS;
@@ -1107,28 +1091,20 @@ cuopt_int_t cuOptGetPrimalSolution(cuOptSolution solution, cuopt_float_t* soluti
   if (solution_values_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
+
+  // Use interface methods to get solution data
+  // For GPU backend: access device memory directly
+  // For CPU backend: copy from host memory
   if (solution_and_stream_view->is_mip) {
-    mip_solution_t<cuopt_int_t, cuopt_float_t>* mip_solution =
-      static_cast<mip_solution_t<cuopt_int_t, cuopt_float_t>*>(
-        solution_and_stream_view->mip_solution_ptr);
-    const rmm::device_uvector<cuopt_float_t>& solution_values = mip_solution->get_solution();
-    rmm::cuda_stream_view stream_view{};
-    raft::copy(solution_values_ptr,
-               solution_values.data(),
-               solution_values.size(),
-               solution_and_stream_view->stream_view);
-    solution_and_stream_view->stream_view.synchronize();
+    auto* mip_interface       = solution_and_stream_view->mip_solution_interface_ptr;
+    const auto& solution_host = mip_interface->get_solution_host();
+    std::memcpy(
+      solution_values_ptr, solution_host.data(), solution_host.size() * sizeof(cuopt_float_t));
   } else {
-    optimization_problem_solution_t<cuopt_int_t, cuopt_float_t>* optimization_problem_solution =
-      static_cast<optimization_problem_solution_t<cuopt_int_t, cuopt_float_t>*>(
-        solution_and_stream_view->lp_solution_ptr);
-    const rmm::device_uvector<cuopt_float_t>& solution_values =
-      optimization_problem_solution->get_primal_solution();
-    raft::copy(solution_values_ptr,
-               solution_values.data(),
-               solution_values.size(),
-               solution_and_stream_view->stream_view);
-    solution_and_stream_view->stream_view.synchronize();
+    auto* lp_interface        = solution_and_stream_view->lp_solution_interface_ptr;
+    const auto& solution_host = lp_interface->get_primal_solution_host();
+    std::memcpy(
+      solution_values_ptr, solution_host.data(), solution_host.size() * sizeof(cuopt_float_t));
   }
   return CUOPT_SUCCESS;
 }
@@ -1140,15 +1116,11 @@ cuopt_int_t cuOptGetObjectiveValue(cuOptSolution solution, cuopt_float_t* object
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
   if (solution_and_stream_view->is_mip) {
-    mip_solution_t<cuopt_int_t, cuopt_float_t>* mip_solution =
-      static_cast<mip_solution_t<cuopt_int_t, cuopt_float_t>*>(
-        solution_and_stream_view->mip_solution_ptr);
-    *objective_value_ptr = mip_solution->get_objective_value();
+    *objective_value_ptr =
+      solution_and_stream_view->mip_solution_interface_ptr->get_objective_value();
   } else {
-    optimization_problem_solution_t<cuopt_int_t, cuopt_float_t>* optimization_problem_solution =
-      static_cast<optimization_problem_solution_t<cuopt_int_t, cuopt_float_t>*>(
-        solution_and_stream_view->lp_solution_ptr);
-    *objective_value_ptr = optimization_problem_solution->get_objective_value();
+    *objective_value_ptr =
+      solution_and_stream_view->lp_solution_interface_ptr->get_objective_value();
   }
   return CUOPT_SUCCESS;
 }
@@ -1160,15 +1132,9 @@ cuopt_int_t cuOptGetSolveTime(cuOptSolution solution, cuopt_float_t* solve_time_
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
   if (solution_and_stream_view->is_mip) {
-    mip_solution_t<cuopt_int_t, cuopt_float_t>* mip_solution =
-      static_cast<mip_solution_t<cuopt_int_t, cuopt_float_t>*>(
-        solution_and_stream_view->mip_solution_ptr);
-    *solve_time_ptr = mip_solution->get_total_solve_time();
+    *solve_time_ptr = solution_and_stream_view->mip_solution_interface_ptr->get_solve_time();
   } else {
-    optimization_problem_solution_t<cuopt_int_t, cuopt_float_t>* optimization_problem_solution =
-      static_cast<optimization_problem_solution_t<cuopt_int_t, cuopt_float_t>*>(
-        solution_and_stream_view->lp_solution_ptr);
-    *solve_time_ptr = (optimization_problem_solution->get_solve_time());
+    *solve_time_ptr = solution_and_stream_view->lp_solution_interface_ptr->get_solve_time();
   }
   return CUOPT_SUCCESS;
 }
@@ -1180,10 +1146,7 @@ cuopt_int_t cuOptGetMIPGap(cuOptSolution solution, cuopt_float_t* mip_gap_ptr)
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
   if (solution_and_stream_view->is_mip) {
-    mip_solution_t<cuopt_int_t, cuopt_float_t>* mip_solution =
-      static_cast<mip_solution_t<cuopt_int_t, cuopt_float_t>*>(
-        solution_and_stream_view->mip_solution_ptr);
-    *mip_gap_ptr = mip_solution->get_mip_gap();
+    *mip_gap_ptr = solution_and_stream_view->mip_solution_interface_ptr->get_mip_gap();
   } else {
     return CUOPT_INVALID_ARGUMENT;
   }
@@ -1197,10 +1160,8 @@ cuopt_int_t cuOptGetSolutionBound(cuOptSolution solution, cuopt_float_t* solutio
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
   if (solution_and_stream_view->is_mip) {
-    mip_solution_t<cuopt_int_t, cuopt_float_t>* mip_solution =
-      static_cast<mip_solution_t<cuopt_int_t, cuopt_float_t>*>(
-        solution_and_stream_view->mip_solution_ptr);
-    *solution_bound_ptr = mip_solution->get_solution_bound();
+    *solution_bound_ptr =
+      solution_and_stream_view->mip_solution_interface_ptr->get_solution_bound();
   } else {
     return CUOPT_INVALID_ARGUMENT;
   }
@@ -1216,16 +1177,10 @@ cuopt_int_t cuOptGetDualSolution(cuOptSolution solution, cuopt_float_t* dual_sol
   if (solution_and_stream_view->is_mip) {
     return CUOPT_INVALID_ARGUMENT;
   } else {
-    optimization_problem_solution_t<cuopt_int_t, cuopt_float_t>* optimization_problem_solution =
-      static_cast<optimization_problem_solution_t<cuopt_int_t, cuopt_float_t>*>(
-        solution_and_stream_view->lp_solution_ptr);
-    const rmm::device_uvector<cuopt_float_t>& dual_solution =
-      optimization_problem_solution->get_dual_solution();
-    raft::copy(dual_solution_ptr,
-               dual_solution.data(),
-               dual_solution.size(),
-               solution_and_stream_view->stream_view);
-    solution_and_stream_view->stream_view.synchronize();
+    // Use interface to get dual solution (works for both GPU and CPU)
+    auto* lp_interface    = solution_and_stream_view->lp_solution_interface_ptr;
+    const auto& dual_host = lp_interface->get_dual_solution_host();
+    std::memcpy(dual_solution_ptr, dual_host.data(), dual_host.size() * sizeof(cuopt_float_t));
     return CUOPT_SUCCESS;
   }
 }
@@ -1240,10 +1195,8 @@ cuopt_int_t cuOptGetDualObjectiveValue(cuOptSolution solution,
   if (solution_and_stream_view->is_mip) {
     return CUOPT_INVALID_ARGUMENT;
   } else {
-    optimization_problem_solution_t<cuopt_int_t, cuopt_float_t>* optimization_problem_solution =
-      static_cast<optimization_problem_solution_t<cuopt_int_t, cuopt_float_t>*>(
-        solution_and_stream_view->lp_solution_ptr);
-    *dual_objective_value_ptr = optimization_problem_solution->get_dual_objective_value();
+    *dual_objective_value_ptr =
+      solution_and_stream_view->lp_solution_interface_ptr->get_dual_objective_value();
     return CUOPT_SUCCESS;
   }
 }
@@ -1257,16 +1210,11 @@ cuopt_int_t cuOptGetReducedCosts(cuOptSolution solution, cuopt_float_t* reduced_
   if (solution_and_stream_view->is_mip) {
     return CUOPT_INVALID_ARGUMENT;
   } else {
-    optimization_problem_solution_t<cuopt_int_t, cuopt_float_t>* optimization_problem_solution =
-      static_cast<optimization_problem_solution_t<cuopt_int_t, cuopt_float_t>*>(
-        solution_and_stream_view->lp_solution_ptr);
-    const rmm::device_uvector<cuopt_float_t>& reduced_cost =
-      optimization_problem_solution->get_reduced_cost();
-    raft::copy(reduced_cost_ptr,
-               reduced_cost.data(),
-               reduced_cost.size(),
-               solution_and_stream_view->stream_view);
-    solution_and_stream_view->stream_view.synchronize();
+    // Use interface to get reduced costs (works for both GPU and CPU)
+    auto* lp_interface            = solution_and_stream_view->lp_solution_interface_ptr;
+    const auto& reduced_cost_host = lp_interface->get_reduced_cost_host();
+    std::memcpy(
+      reduced_cost_ptr, reduced_cost_host.data(), reduced_cost_host.size() * sizeof(cuopt_float_t));
     return CUOPT_SUCCESS;
   }
 }

@@ -33,6 +33,10 @@ enum class error_type_t {
  */
 
 struct logic_error : public std::logic_error {
+  // Default constructor (for Cython/Python binding compatibility)
+  // Represents a "no error" state. Primarily used for Cython temporary variables.
+  logic_error() : std::logic_error(""), msg_(""), error_type_(error_type_t::Success) {}
+
   logic_error(const logic_error& exception) = default;
 
   // Move constructor

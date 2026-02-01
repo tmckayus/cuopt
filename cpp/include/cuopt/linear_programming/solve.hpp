@@ -186,10 +186,10 @@ std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp(
  * @tparam f_t Data type of the variables and their weights in the equations
  * @param[in] problem_interface  Interface to optimization problem (GPU or CPU backed)
  * @param[in] settings  MIP solver settings
- * @return mip_solution_t<i_t, f_t> Solver solution
+ * @return std::unique_ptr<mip_solution_interface_t<i_t, f_t>> Polymorphic solution interface
  */
 template <typename i_t, typename f_t>
-mip_solution_t<i_t, f_t> solve_mip(
+std::unique_ptr<mip_solution_interface_t<i_t, f_t>> solve_mip(
   optimization_problem_interface_t<i_t, f_t>* problem_interface,
   mip_solver_settings_t<i_t, f_t> const& settings = mip_solver_settings_t<i_t, f_t>{});
 
@@ -204,10 +204,10 @@ mip_solution_t<i_t, f_t> solve_mip(
  * @tparam f_t Data type of the variables and their weights in the equations
  * @param[in] cpu_problem  CPU-backed optimization problem
  * @param[in] settings  PDLP solver settings
- * @return optimization_problem_solution_t<i_t, f_t> Fake solution for now
+ * @return std::unique_ptr<lp_solution_interface_t<i_t, f_t>> Solution interface
  */
 template <typename i_t, typename f_t>
-optimization_problem_solution_t<i_t, f_t> solve_lp_remote(
+std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp_remote(
   cpu_optimization_problem_t<i_t, f_t>& cpu_problem,
   pdlp_solver_settings_t<i_t, f_t> const& settings = pdlp_solver_settings_t<i_t, f_t>{});
 
@@ -218,10 +218,10 @@ optimization_problem_solution_t<i_t, f_t> solve_lp_remote(
  * @tparam f_t Data type of the variables and their weights in the equations
  * @param[in] cpu_problem  CPU-backed optimization problem
  * @param[in] settings  MIP solver settings
- * @return mip_solution_t<i_t, f_t> Fake solution for now
+ * @return std::unique_ptr<mip_solution_interface_t<i_t, f_t>> Solution interface
  */
 template <typename i_t, typename f_t>
-mip_solution_t<i_t, f_t> solve_mip_remote(
+std::unique_ptr<mip_solution_interface_t<i_t, f_t>> solve_mip_remote(
   cpu_optimization_problem_t<i_t, f_t>& cpu_problem,
   mip_solver_settings_t<i_t, f_t> const& settings = mip_solver_settings_t<i_t, f_t>{});
 
@@ -235,10 +235,10 @@ mip_solution_t<i_t, f_t> solve_mip_remote(
  * @tparam f_t Data type of the variables and their weights in the equations
  * @param[in] gpu_problem  GPU-backed optimization problem
  * @param[in] settings  PDLP solver settings
- * @return optimization_problem_solution_t<i_t, f_t> Solution from remote solver
+ * @return std::unique_ptr<lp_solution_interface_t<i_t, f_t>> Solution interface
  */
 template <typename i_t, typename f_t>
-optimization_problem_solution_t<i_t, f_t> solve_lp_remote(
+std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp_remote(
   gpu_optimization_problem_t<i_t, f_t>& gpu_problem,
   pdlp_solver_settings_t<i_t, f_t> const& settings = pdlp_solver_settings_t<i_t, f_t>{});
 
@@ -252,10 +252,10 @@ optimization_problem_solution_t<i_t, f_t> solve_lp_remote(
  * @tparam f_t Data type of the variables and their weights in the equations
  * @param[in] gpu_problem  GPU-backed optimization problem
  * @param[in] settings  MIP solver settings
- * @return mip_solution_t<i_t, f_t> Solution from remote solver
+ * @return std::unique_ptr<mip_solution_interface_t<i_t, f_t>> Solution interface
  */
 template <typename i_t, typename f_t>
-mip_solution_t<i_t, f_t> solve_mip_remote(
+std::unique_ptr<mip_solution_interface_t<i_t, f_t>> solve_mip_remote(
   gpu_optimization_problem_t<i_t, f_t>& gpu_problem,
   mip_solver_settings_t<i_t, f_t> const& settings = mip_solver_settings_t<i_t, f_t>{});
 

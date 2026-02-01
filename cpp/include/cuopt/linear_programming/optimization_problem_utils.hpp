@@ -84,7 +84,9 @@ void populate_from_mps_data_model(optimization_problem_interface_t<i_t, f_t>* pr
   if (!char_variable_types.empty()) {
     std::vector<var_t> enum_variable_types(char_variable_types.size());
     for (size_t i = 0; i < char_variable_types.size(); ++i) {
-      enum_variable_types[i] = (char_variable_types[i] == 'I') ? var_t::INTEGER : var_t::CONTINUOUS;
+      enum_variable_types[i] = (char_variable_types[i] == 'I' || char_variable_types[i] == 'B')
+                                 ? var_t::INTEGER
+                                 : var_t::CONTINUOUS;
     }
     problem->set_variable_types(enum_variable_types.data(), n_vars);
   }
@@ -200,8 +202,28 @@ void populate_from_data_model_view(optimization_problem_interface_t<i_t, f_t>* p
       data_model->get_variable_types().data(),
       data_model->get_variable_types().data() + data_model->get_variable_types().size(),
       enum_variable_types.begin(),
-      [](const auto val) -> var_t { return val == 'I' ? var_t::INTEGER : var_t::CONTINUOUS; });
+      [](const auto val) -> var_t {
+        return (val == 'I' || val == 'B') ? var_t::INTEGER : var_t::CONTINUOUS;
+      });
     problem->set_variable_types(enum_variable_types.data(), enum_variable_types.size());
+  }
+
+  // Set problem category based on variable types
+  bool has_integers = false;
+  if (data_model->get_variable_types().size() != 0) {
+    for (size_t i = 0; i < data_model->get_variable_types().size(); ++i) {
+      char vt = data_model->get_variable_types().data()[i];
+      if (vt == 'I' || vt == 'B') {
+        has_integers = true;
+        break;
+      }
+    }
+  }
+
+  if (has_integers) {
+    problem->set_problem_category(problem_category_t::MIP);
+  } else {
+    problem->set_problem_category(problem_category_t::LP);
   }
 
   if (data_model->get_variable_names().size() != 0) {

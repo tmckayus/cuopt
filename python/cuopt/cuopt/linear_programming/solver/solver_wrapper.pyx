@@ -32,6 +32,8 @@ from cuopt.linear_programming.data_model.data_model_wrapper cimport DataModel
 from cuopt.linear_programming.solver.solver cimport (
     call_batch_solve,
     call_solve,
+    delete_lp_solution,
+    delete_mip_solution,
     error_type_t,
     mip_termination_status_t,
     pdlp_solver_mode_t,
@@ -105,6 +107,15 @@ cdef char* c_get_string(string in_str):
     # copy except the terminating char
     strcpy(c_string, in_str.c_str())
     return c_string
+
+
+cdef object _vector_to_numpy(const vector[double]& vec):
+    """Convert C++ std::vector<double> to numpy array"""
+    cdef Py_ssize_t size = vec.size()
+    if size == 0:
+        return np.array([], dtype=np.float64)
+    cdef const double* data_ptr = vec.data()
+    return np.asarray(<double[:size]> data_ptr, dtype=np.float64).copy()
 
 
 def get_data_ptr(array):
@@ -304,191 +315,146 @@ cdef create_solution(unique_ptr[solver_ret_t] sol_ret_ptr,
 
     from cuopt.linear_programming.solution.solution import Solution
 
-    sol_ret = move(sol_ret_ptr.get()[0])
+    # Declare all cdef variables at the top (Cython requirement)
+    cdef solver_ret_t* sol_ret
+
+    # Access the solver_ret_t struct
+    sol_ret = sol_ret_ptr.get()
 
     if sol_ret.problem_type == ProblemCategory.MIP or sol_ret.problem_type == ProblemCategory.IP: # noqa
-        solution = DeviceBuffer.c_from_unique_ptr(
-            move(sol_ret.mip_ret.solution_)
-        )
-        termination_status = sol_ret.mip_ret.termination_status_
-        error_status = sol_ret.mip_ret.error_status_
-        error_message = sol_ret.mip_ret.error_message_
-        objective = sol_ret.mip_ret.objective_
-        mip_gap = sol_ret.mip_ret.mip_gap_
-        solution_bound = sol_ret.mip_ret.solution_bound_
-        solve_time = sol_ret.mip_ret.total_solve_time_
-        presolve_time = sol_ret.mip_ret.presolve_time_
-        max_constraint_violation = sol_ret.mip_ret.max_constraint_violation_
-        max_int_violation = sol_ret.mip_ret.max_int_violation_
-        max_variable_bound_violation = sol_ret.mip_ret.max_variable_bound_violation_ # noqa
-        num_nodes = sol_ret.mip_ret.nodes_
-        num_simplex_iterations = sol_ret.mip_ret.simplex_iterations_
+        # Get solution data from interface (works for both GPU and CPU)
+        solution = _vector_to_numpy(sol_ret.mip_solution.get_solution_host())
 
-        solution = series_from_buf(solution, pa.float64()).to_numpy()
-
-        return Solution(
+        result = Solution(
             ProblemCategory(sol_ret.problem_type),
             dict(zip(data_model_obj.get_variable_names(), solution)),
-            solve_time,
+            sol_ret.mip_solution.get_solve_time(),
             primal_solution=solution,
-            termination_status=MILPTerminationStatus(termination_status),
-            error_status=ErrorStatus(error_status),
-            error_message=str(error_message),
-            primal_objective=objective,
-            mip_gap=mip_gap,
-            solution_bound=solution_bound,
-            presolve_time=presolve_time,
-            max_variable_bound_violation=max_variable_bound_violation,
-            max_int_violation=max_int_violation,
-            max_constraint_violation=max_constraint_violation,
-            num_nodes=num_nodes,
-            num_simplex_iterations=num_simplex_iterations
+            termination_status=MILPTerminationStatus(sol_ret.mip_solution.get_termination_status()),
+            error_status=ErrorStatus(int(sol_ret.mip_solution.get_error_status().get_error_type())),
+            error_message=sol_ret.mip_solution.get_error_status().what().decode('utf-8'),
+            primal_objective=sol_ret.mip_solution.get_objective_value(),
+            mip_gap=sol_ret.mip_solution.get_mip_gap(),
+            solution_bound=sol_ret.mip_solution.get_solution_bound(),
+            presolve_time=sol_ret.mip_solution.get_presolve_time(),
+            max_variable_bound_violation=sol_ret.mip_solution.get_max_variable_bound_violation(),
+            max_int_violation=sol_ret.mip_solution.get_max_int_violation(),
+            max_constraint_violation=sol_ret.mip_solution.get_max_constraint_violation(),
+            num_nodes=sol_ret.mip_solution.get_num_nodes(),
+            num_simplex_iterations=sol_ret.mip_solution.get_num_simplex_iterations()
         )
+
+        # Clean up C++ solution object now that we've copied all data to Python
+        delete_mip_solution(sol_ret.mip_solution)
+        return result
 
     else:
-        primal_solution = DeviceBuffer.c_from_unique_ptr(
-            move(sol_ret.lp_ret.primal_solution_)
-        )
-        dual_solution = DeviceBuffer.c_from_unique_ptr(move(sol_ret.lp_ret.dual_solution_)) # noqa
-        reduced_cost = DeviceBuffer.c_from_unique_ptr(move(sol_ret.lp_ret.reduced_cost_)) # noqa
+        # LP problem - get solution data from interface (works for both GPU and CPU)
+        primal_solution = _vector_to_numpy(sol_ret.lp_solution.get_primal_solution_host())
+        dual_solution = _vector_to_numpy(sol_ret.lp_solution.get_dual_solution_host())
+        reduced_cost = _vector_to_numpy(sol_ret.lp_solution.get_reduced_cost_host())
 
-        primal_solution = series_from_buf(primal_solution, pa.float64()).to_numpy()
-        dual_solution = series_from_buf(dual_solution, pa.float64()).to_numpy()
-        reduced_cost = series_from_buf(reduced_cost, pa.float64()).to_numpy()
-
-        termination_status = sol_ret.lp_ret.termination_status_
-        error_status = sol_ret.lp_ret.error_status_
-        error_message = sol_ret.lp_ret.error_message_
-        l2_primal_residual = sol_ret.lp_ret.l2_primal_residual_
-        l2_dual_residual = sol_ret.lp_ret.l2_dual_residual_
-        primal_objective = sol_ret.lp_ret.primal_objective_
-        dual_objective = sol_ret.lp_ret.dual_objective_
-        gap = sol_ret.lp_ret.gap_
-        nb_iterations = sol_ret.lp_ret.nb_iterations_
-        solve_time = sol_ret.lp_ret.solve_time_
-        solved_by_pdlp = sol_ret.lp_ret.solved_by_pdlp_
-
-        # In BatchSolve, we don't get the warm start data
+        # Extract warm start data if available (works for both GPU and CPU)
         if not is_batch:
-            current_primal_solution = DeviceBuffer.c_from_unique_ptr(
-                move(sol_ret.lp_ret.current_primal_solution_)
-            )
-            current_dual_solution = DeviceBuffer.c_from_unique_ptr(
-                move(sol_ret.lp_ret.current_dual_solution_)
-            )
-            initial_primal_average = DeviceBuffer.c_from_unique_ptr(
-                move(sol_ret.lp_ret.initial_primal_average_)
-            )
-            initial_dual_average = DeviceBuffer.c_from_unique_ptr(
-                move(sol_ret.lp_ret.initial_dual_average_)
-            )
-            current_ATY = DeviceBuffer.c_from_unique_ptr(
-                move(sol_ret.lp_ret.current_ATY_)
-            )
-            sum_primal_solutions = DeviceBuffer.c_from_unique_ptr(
-                move(sol_ret.lp_ret.sum_primal_solutions_)
-            )
-            sum_dual_solutions = DeviceBuffer.c_from_unique_ptr(
-                move(sol_ret.lp_ret.sum_dual_solutions_)
-            )
-            last_restart_duality_gap_primal_solution = DeviceBuffer.c_from_unique_ptr( # noqa
-                move(sol_ret.lp_ret.last_restart_duality_gap_primal_solution_)
-            )
-            last_restart_duality_gap_dual_solution = DeviceBuffer.c_from_unique_ptr( # noqa
-                move(sol_ret.lp_ret.last_restart_duality_gap_dual_solution_)
-            )
-            initial_primal_weight = sol_ret.lp_ret.initial_primal_weight_
-            initial_step_size = sol_ret.lp_ret.initial_step_size_
-            total_pdlp_iterations = sol_ret.lp_ret.total_pdlp_iterations_
-            total_pdhg_iterations = sol_ret.lp_ret.total_pdhg_iterations_
-            last_candidate_kkt_score = sol_ret.lp_ret.last_candidate_kkt_score_
-            last_restart_kkt_score = sol_ret.lp_ret.last_restart_kkt_score_
-            sum_solution_weight = sol_ret.lp_ret.sum_solution_weight_
-            iterations_since_last_restart = sol_ret.lp_ret.iterations_since_last_restart_ # noqa
+            if sol_ret.lp_solution.has_warm_start_data():
+                current_primal = _vector_to_numpy(sol_ret.lp_solution.get_current_primal_solution_host())
+                current_dual = _vector_to_numpy(sol_ret.lp_solution.get_current_dual_solution_host())
+                initial_primal_avg = _vector_to_numpy(sol_ret.lp_solution.get_initial_primal_average_host())
+                initial_dual_avg = _vector_to_numpy(sol_ret.lp_solution.get_initial_dual_average_host())
+                current_ATY = _vector_to_numpy(sol_ret.lp_solution.get_current_ATY_host())
+                sum_primal = _vector_to_numpy(sol_ret.lp_solution.get_sum_primal_solutions_host())
+                sum_dual = _vector_to_numpy(sol_ret.lp_solution.get_sum_dual_solutions_host())
+                last_restart_primal = _vector_to_numpy(sol_ret.lp_solution.get_last_restart_duality_gap_primal_solution_host())
+                last_restart_dual = _vector_to_numpy(sol_ret.lp_solution.get_last_restart_duality_gap_dual_solution_host())
+                initial_primal_weight = sol_ret.lp_solution.get_initial_primal_weight()
+                initial_step_size = sol_ret.lp_solution.get_initial_step_size()
+                total_pdlp_iters = sol_ret.lp_solution.get_total_pdlp_iterations()
+                total_pdhg_iters = sol_ret.lp_solution.get_total_pdhg_iterations()
+                last_candidate_kkt = sol_ret.lp_solution.get_last_candidate_kkt_score()
+                last_restart_kkt = sol_ret.lp_solution.get_last_restart_kkt_score()
+                sum_weight = sol_ret.lp_solution.get_sum_solution_weight()
+                iters_since_restart = sol_ret.lp_solution.get_iterations_since_last_restart()
+            else:
+                current_primal = None
+                current_dual = None
+                initial_primal_avg = None
+                initial_dual_avg = None
+                current_ATY = None
+                sum_primal = None
+                sum_dual = None
+                last_restart_primal = None
+                last_restart_dual = None
+                initial_primal_weight = 0.0
+                initial_step_size = 0.0
+                total_pdlp_iters = 0
+                total_pdhg_iters = 0
+                last_candidate_kkt = 0.0
+                last_restart_kkt = 0.0
+                sum_weight = 0.0
+                iters_since_restart = 0
 
-            current_primal_solution = series_from_buf(
-                current_primal_solution, pa.float64()
-            ).to_numpy()
-            current_dual_solution = series_from_buf(
-                current_dual_solution, pa.float64()
-            ).to_numpy()
-            initial_primal_average = series_from_buf(
-                initial_primal_average, pa.float64()
-            ).to_numpy()
-            initial_dual_average = series_from_buf(
-                initial_dual_average, pa.float64()
-            ).to_numpy()
-            current_ATY = series_from_buf(
-                current_ATY, pa.float64()
-            ).to_numpy()
-            sum_primal_solutions = series_from_buf(
-                sum_primal_solutions, pa.float64()
-            ).to_numpy()
-            sum_dual_solutions = series_from_buf(
-                sum_dual_solutions, pa.float64()
-            ).to_numpy()
-            last_restart_duality_gap_primal_solution = series_from_buf(
-                last_restart_duality_gap_primal_solution,
-                pa.float64()
-            ).to_numpy()
-            last_restart_duality_gap_dual_solution = series_from_buf(
-                last_restart_duality_gap_dual_solution,
-                pa.float64()
-            ).to_numpy()
-
-            return Solution(
+            result = Solution(
                 ProblemCategory(sol_ret.problem_type),
                 dict(zip(data_model_obj.get_variable_names(), primal_solution)), # noqa
-                solve_time,
+                sol_ret.lp_solution.get_solve_time(),
                 primal_solution,
                 dual_solution,
                 reduced_cost,
-                current_primal_solution,
-                current_dual_solution,
-                initial_primal_average,
-                initial_dual_average,
+                current_primal,
+                current_dual,
+                initial_primal_avg,
+                initial_dual_avg,
                 current_ATY,
-                sum_primal_solutions,
-                sum_dual_solutions,
-                last_restart_duality_gap_primal_solution,
-                last_restart_duality_gap_dual_solution,
+                sum_primal,
+                sum_dual,
+                last_restart_primal,
+                last_restart_dual,
                 initial_primal_weight,
                 initial_step_size,
-                total_pdlp_iterations,
-                total_pdhg_iterations,
-                last_candidate_kkt_score,
-                last_restart_kkt_score,
-                sum_solution_weight,
-                iterations_since_last_restart,
-                LPTerminationStatus(termination_status),
-                ErrorStatus(error_status),
-                str(error_message),
-                l2_primal_residual,
-                l2_dual_residual,
-                primal_objective,
-                dual_objective,
-                gap,
-                nb_iterations,
-                solved_by_pdlp,
+                total_pdlp_iters,
+                total_pdhg_iters,
+                last_candidate_kkt,
+                last_restart_kkt,
+                sum_weight,
+                iters_since_restart,
+                LPTerminationStatus(sol_ret.lp_solution.get_termination_status(0)),
+                ErrorStatus(int(sol_ret.lp_solution.get_error_status().get_error_type())),
+                sol_ret.lp_solution.get_error_status().what().decode('utf-8'),
+                sol_ret.lp_solution.get_l2_primal_residual(0),
+                sol_ret.lp_solution.get_l2_dual_residual(0),
+                sol_ret.lp_solution.get_objective_value(0),
+                sol_ret.lp_solution.get_dual_objective_value(0),
+                sol_ret.lp_solution.get_gap(0),
+                sol_ret.lp_solution.get_num_iterations(0),
+                sol_ret.lp_solution.is_solved_by_pdlp(0),
             )
-        return Solution(
-            problem_category=ProblemCategory(sol_ret.problem_type),
-            vars=dict(zip(data_model_obj.get_variable_names(), primal_solution)), # noqa
-            solve_time=solve_time,
-            primal_solution=primal_solution,
-            dual_solution=dual_solution,
-            reduced_cost=reduced_cost,
-            termination_status=LPTerminationStatus(termination_status),
-            error_status=ErrorStatus(error_status),
-            error_message=str(error_message),
-            primal_residual=l2_primal_residual,
-            dual_residual=l2_dual_residual,
-            primal_objective=primal_objective,
-            dual_objective=dual_objective,
-            gap=gap,
-            nb_iterations=nb_iterations,
-            solved_by_pdlp=solved_by_pdlp,
-        )
+            # Clean up C++ solution object now that we've copied all data to Python
+            delete_lp_solution(sol_ret.lp_solution)
+            return result
+        else:
+            # Batch mode - simpler return structure
+            result = Solution(
+                problem_category=ProblemCategory(sol_ret.problem_type),
+                vars=dict(zip(data_model_obj.get_variable_names(), primal_solution)), # noqa
+                solve_time=sol_ret.lp_solution.get_solve_time(),
+                primal_solution=primal_solution,
+                dual_solution=dual_solution,
+                reduced_cost=reduced_cost,
+                termination_status=LPTerminationStatus(sol_ret.lp_solution.get_termination_status(0)),
+                error_status=ErrorStatus(int(sol_ret.lp_solution.get_error_status().get_error_type())),
+                error_message=sol_ret.lp_solution.get_error_status().what().decode('utf-8'),
+                primal_residual=sol_ret.lp_solution.get_l2_primal_residual(0),
+                dual_residual=sol_ret.lp_solution.get_l2_dual_residual(0),
+                primal_objective=sol_ret.lp_solution.get_objective_value(0),
+                dual_objective=sol_ret.lp_solution.get_dual_objective_value(0),
+                gap=sol_ret.lp_solution.get_gap(0),
+                nb_iterations=sol_ret.lp_solution.get_num_iterations(0),
+                solved_by_pdlp=sol_ret.lp_solution.is_solved_by_pdlp(0),
+            )
+
+        # Clean up C++ solution object now that we've copied all data to Python
+        delete_lp_solution(sol_ret.lp_solution)
+        return result
 
 
 def Solve(py_data_model_obj, settings, mip=False):
