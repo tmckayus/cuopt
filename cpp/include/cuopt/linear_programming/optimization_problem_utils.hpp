@@ -91,23 +91,7 @@ void populate_from_mps_data_model(optimization_problem_interface_t<i_t, f_t>* pr
                                  : var_t::CONTINUOUS;
     }
     problem->set_variable_types(enum_variable_types.data(), n_vars);
-  }
-
-  // Set problem category
-  bool has_integers = false;
-  if (!char_variable_types.empty()) {
-    for (const auto& vt : char_variable_types) {
-      if (vt == 'I' || vt == 'B') {
-        has_integers = true;
-        break;
-      }
-    }
-  }
-
-  if (has_integers) {
-    problem->set_problem_category(problem_category_t::MIP);
-  } else {
-    problem->set_problem_category(problem_category_t::LP);
+    // Problem category (LP/MIP/IP) is auto-detected by set_variable_types
   }
 
   // Handle quadratic objective if present
@@ -255,24 +239,7 @@ void populate_from_data_model_view(optimization_problem_interface_t<i_t, f_t>* p
         return (val == 'I' || val == 'B') ? var_t::INTEGER : var_t::CONTINUOUS;
       });
     problem->set_variable_types(enum_variable_types.data(), enum_variable_types.size());
-  }
-
-  // Set problem category based on variable types
-  bool has_integers = false;
-  if (data_model->get_variable_types().size() != 0) {
-    for (size_t i = 0; i < data_model->get_variable_types().size(); ++i) {
-      char vt = data_model->get_variable_types().data()[i];
-      if (vt == 'I' || vt == 'B') {
-        has_integers = true;
-        break;
-      }
-    }
-  }
-
-  if (has_integers) {
-    problem->set_problem_category(problem_category_t::MIP);
-  } else {
-    problem->set_problem_category(problem_category_t::LP);
+    // Problem category (LP/MIP/IP) is auto-detected by set_variable_types
   }
 
   if (data_model->get_variable_names().size() != 0) {

@@ -190,22 +190,13 @@ cuopt_int_t cuOptCreateProblem(cuopt_int_t num_constraints,
     problem->set_variable_lower_bounds(lower_bounds, num_variables);
     problem->set_variable_upper_bounds(upper_bounds, num_variables);
 
-    // Set variable types and detect if problem is MIP
+    // Set variable types (problem category is auto-detected)
     std::vector<var_t> variable_types_host(num_variables);
-    bool has_integers = false;
     for (int j = 0; j < num_variables; j++) {
       variable_types_host[j] =
         variable_types[j] == CUOPT_CONTINUOUS ? var_t::CONTINUOUS : var_t::INTEGER;
-      if (variable_types_host[j] == var_t::INTEGER) { has_integers = true; }
     }
     problem->set_variable_types(variable_types_host.data(), num_variables);
-
-    // Set problem category based on variable types
-    if (has_integers) {
-      problem->set_problem_category(problem_category_t::MIP);
-    } else {
-      problem->set_problem_category(problem_category_t::LP);
-    }
 
     *problem_ptr = static_cast<cuOptOptimizationProblem>(problem_and_stream);
   } catch (const raft::exception& e) {
@@ -258,14 +249,13 @@ cuopt_int_t cuOptCreateRangedProblem(cuopt_int_t num_constraints,
     problem->set_variable_lower_bounds(variable_lower_bounds, num_variables);
     problem->set_variable_upper_bounds(variable_upper_bounds, num_variables);
 
-    // Set variable types (NULL means all continuous) and detect if problem is MIP
+    // Set variable types (NULL means all continuous)
+    // Problem category (LP/MIP/IP) is auto-detected by set_variable_types
     std::vector<var_t> variable_types_host(num_variables);
-    bool has_integers = false;
     if (variable_types != nullptr) {
       for (int j = 0; j < num_variables; j++) {
         variable_types_host[j] =
           variable_types[j] == CUOPT_CONTINUOUS ? var_t::CONTINUOUS : var_t::INTEGER;
-        if (variable_types_host[j] == var_t::INTEGER) { has_integers = true; }
       }
     } else {
       // Default to all continuous
@@ -274,13 +264,6 @@ cuopt_int_t cuOptCreateRangedProblem(cuopt_int_t num_constraints,
       }
     }
     problem->set_variable_types(variable_types_host.data(), num_variables);
-
-    // Set problem category based on variable types
-    if (has_integers) {
-      problem->set_problem_category(problem_category_t::MIP);
-    } else {
-      problem->set_problem_category(problem_category_t::LP);
-    }
 
     *problem_ptr = static_cast<cuOptOptimizationProblem>(problem_and_stream);
   } catch (const raft::exception& e) {
@@ -345,8 +328,7 @@ cuopt_int_t cuOptCreateQuadraticProblem(
     problem->set_variable_lower_bounds(lower_bounds, num_variables);
     problem->set_variable_upper_bounds(upper_bounds, num_variables);
 
-    // Quadratic problems are categorized as LP (no QP category in the enum)
-    problem->set_problem_category(problem_category_t::LP);
+    // Quadratic problems default to LP category (no variable types set, so no MIP detection)
 
     *problem_ptr = static_cast<cuOptOptimizationProblem>(problem_and_stream);
   } catch (const raft::exception& e) {
@@ -412,8 +394,7 @@ cuopt_int_t cuOptCreateQuadraticRangedProblem(
     problem->set_variable_lower_bounds(variable_lower_bounds, num_variables);
     problem->set_variable_upper_bounds(variable_upper_bounds, num_variables);
 
-    // Quadratic problems are categorized as LP (no QP category in the enum)
-    problem->set_problem_category(problem_category_t::LP);
+    // Quadratic problems default to LP category (no variable types set, so no MIP detection)
 
     *problem_ptr = static_cast<cuOptOptimizationProblem>(problem_and_stream);
   } catch (const raft::exception& e) {

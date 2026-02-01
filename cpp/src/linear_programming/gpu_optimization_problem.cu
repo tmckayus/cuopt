@@ -21,6 +21,7 @@
 #include <rmm/device_uvector.hpp>
 
 #include <thrust/copy.h>
+#include <thrust/count.h>
 #include <thrust/execution_policy.h>
 
 #include <cmath>
@@ -149,6 +150,18 @@ void gpu_optimization_problem_t<i_t, f_t>::set_variable_types(const var_t* varia
 {
   variable_types_.resize(size, stream_view_);
   raft::copy(variable_types_.data(), variable_types, size, stream_view_);
+
+  // Auto-detect problem category based on variable types (matching original optimization_problem_t)
+  i_t n_integer = thrust::count_if(handle_ptr_->get_thrust_policy(),
+                                   variable_types_.begin(),
+                                   variable_types_.end(),
+                                   [] __device__(auto val) { return val == var_t::INTEGER; });
+  // By default it is LP
+  if (n_integer == size) {
+    problem_category_ = problem_category_t::IP;
+  } else if (n_integer > 0) {
+    problem_category_ = problem_category_t::MIP;
+  }
 }
 
 template <typename i_t, typename f_t>
@@ -840,11 +853,9 @@ bool gpu_optimization_problem_t<i_t, f_t>::is_equivalent(
 // Explicit template instantiations matching optimization_problem_t
 #if MIP_INSTANTIATE_FLOAT
 template class gpu_optimization_problem_t<int32_t, float>;
-template class gpu_optimization_problem_t<int64_t, float>;
 #endif
 #if MIP_INSTANTIATE_DOUBLE
 template class gpu_optimization_problem_t<int32_t, double>;
-template class gpu_optimization_problem_t<int64_t, double>;
 #endif
 
 }  // namespace cuopt::linear_programming
