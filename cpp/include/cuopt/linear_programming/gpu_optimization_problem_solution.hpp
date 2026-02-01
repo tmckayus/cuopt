@@ -16,6 +16,12 @@
 
 #include <optional>
 
+// Forward declarations for Cython structs
+namespace cuopt::cython {
+struct linear_programming_ret_t;
+struct mip_ret_t;
+}  // namespace cuopt::cython
+
 namespace cuopt::linear_programming {
 
 /**
@@ -330,6 +336,12 @@ class gpu_lp_solution_t : public lp_solution_interface_t<i_t, f_t> {
     return std::move(solution_);
   }
 
+  /**
+   * @brief Convert to GPU-backed linear_programming_ret_t struct for Python/Cython
+   * Moves device_uvector data into device_buffer wrappers with zero-copy.
+   */
+  cuopt::cython::linear_programming_ret_t to_linear_programming_ret_t() &&;
+
  private:
   optimization_problem_solution_t<i_t, f_t> solution_;
   // Cached host data (lazy initialization)
@@ -416,6 +428,12 @@ class gpu_mip_solution_t : public mip_solution_interface_t<i_t, f_t> {
     // Already GPU, just move
     return std::move(solution_);
   }
+
+  /**
+   * @brief Convert to GPU-backed mip_ret_t struct for Python/Cython
+   * Moves device_uvector data into device_buffer wrappers with zero-copy.
+   */
+  cuopt::cython::mip_ret_t to_mip_ret_t() &&;
 
  private:
   mip_solution_t<i_t, f_t> solution_;

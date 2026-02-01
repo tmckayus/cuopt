@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <cuopt/linear_programming/cpu_pdlp_warm_start_data.hpp>
 #include <cuopt/linear_programming/mip/solver_solution.hpp>
 #include <cuopt/linear_programming/mip/solver_stats.hpp>
 #include <cuopt/linear_programming/optimization_problem_solution_interface.hpp>
@@ -15,6 +16,12 @@
 #include <raft/core/copy.hpp>
 
 #include <vector>
+
+// Forward declarations for Cython structs
+namespace cuopt::cython {
+struct cpu_linear_programming_ret_t;
+struct cpu_mip_ret_t;
+}  // namespace cuopt::cython
 
 namespace cuopt::linear_programming {
 
@@ -142,26 +149,61 @@ class cpu_lp_solution_t : public lp_solution_interface_t<i_t, f_t> {
       l2_dual_residual_(l2_dual_residual),
       gap_(gap),
       num_iterations_(num_iterations),
+      solved_by_pdlp_(solved_by_pdlp)
+  {
+    // Initialize warmstart data
+    pdlp_warm_start_data_.current_primal_solution_ = std::move(current_primal_solution_ws);
+    pdlp_warm_start_data_.current_dual_solution_   = std::move(current_dual_solution_ws);
+    pdlp_warm_start_data_.initial_primal_average_  = std::move(initial_primal_average_ws);
+    pdlp_warm_start_data_.initial_dual_average_    = std::move(initial_dual_average_ws);
+    pdlp_warm_start_data_.current_ATY_             = std::move(current_ATY_ws);
+    pdlp_warm_start_data_.sum_primal_solutions_    = std::move(sum_primal_solutions_ws);
+    pdlp_warm_start_data_.sum_dual_solutions_      = std::move(sum_dual_solutions_ws);
+    pdlp_warm_start_data_.last_restart_duality_gap_primal_solution_ =
+      std::move(last_restart_duality_gap_primal_solution_ws);
+    pdlp_warm_start_data_.last_restart_duality_gap_dual_solution_ =
+      std::move(last_restart_duality_gap_dual_solution_ws);
+    pdlp_warm_start_data_.initial_primal_weight_         = initial_primal_weight;
+    pdlp_warm_start_data_.initial_step_size_             = initial_step_size;
+    pdlp_warm_start_data_.total_pdlp_iterations_         = total_pdlp_iterations;
+    pdlp_warm_start_data_.total_pdhg_iterations_         = total_pdhg_iterations;
+    pdlp_warm_start_data_.last_candidate_kkt_score_      = last_candidate_kkt_score;
+    pdlp_warm_start_data_.last_restart_kkt_score_        = last_restart_kkt_score;
+    pdlp_warm_start_data_.sum_solution_weight_           = sum_solution_weight;
+    pdlp_warm_start_data_.iterations_since_last_restart_ = iterations_since_last_restart;
+  }
+
+  /**
+   * @brief Construct CPU LP solution with warmstart data struct (cleaner version)
+   * Used for remote execution with warmstart support
+   */
+  cpu_lp_solution_t(std::vector<f_t>&& primal_solution,
+                    std::vector<f_t>&& dual_solution,
+                    std::vector<f_t>&& reduced_cost,
+                    pdlp_termination_status_t termination_status,
+                    f_t primal_objective,
+                    f_t dual_objective,
+                    double solve_time,
+                    f_t l2_primal_residual,
+                    f_t l2_dual_residual,
+                    f_t gap,
+                    i_t num_iterations,
+                    bool solved_by_pdlp,
+                    cpu_pdlp_warm_start_data_t<i_t, f_t>&& warmstart_data)
+    : primal_solution_(std::move(primal_solution)),
+      dual_solution_(std::move(dual_solution)),
+      reduced_cost_(std::move(reduced_cost)),
+      termination_status_(termination_status),
+      error_status_("", cuopt::error_type_t::Success),
+      solve_time_(solve_time),
+      primal_objective_(primal_objective),
+      dual_objective_(dual_objective),
+      l2_primal_residual_(l2_primal_residual),
+      l2_dual_residual_(l2_dual_residual),
+      gap_(gap),
+      num_iterations_(num_iterations),
       solved_by_pdlp_(solved_by_pdlp),
-      current_primal_solution_ws_(std::move(current_primal_solution_ws)),
-      current_dual_solution_ws_(std::move(current_dual_solution_ws)),
-      initial_primal_average_ws_(std::move(initial_primal_average_ws)),
-      initial_dual_average_ws_(std::move(initial_dual_average_ws)),
-      current_ATY_ws_(std::move(current_ATY_ws)),
-      sum_primal_solutions_ws_(std::move(sum_primal_solutions_ws)),
-      sum_dual_solutions_ws_(std::move(sum_dual_solutions_ws)),
-      last_restart_duality_gap_primal_solution_ws_(
-        std::move(last_restart_duality_gap_primal_solution_ws)),
-      last_restart_duality_gap_dual_solution_ws_(
-        std::move(last_restart_duality_gap_dual_solution_ws)),
-      initial_primal_weight_(initial_primal_weight),
-      initial_step_size_(initial_step_size),
-      total_pdlp_iterations_(total_pdlp_iterations),
-      total_pdhg_iterations_(total_pdhg_iterations),
-      last_candidate_kkt_score_(last_candidate_kkt_score),
-      last_restart_kkt_score_(last_restart_kkt_score),
-      sum_solution_weight_(sum_solution_weight),
-      iterations_since_last_restart_(iterations_since_last_restart)
+      pdlp_warm_start_data_(std::move(warmstart_data))
   {
   }
 
@@ -207,47 +249,85 @@ class cpu_lp_solution_t : public lp_solution_interface_t<i_t, f_t> {
       cuopt::error_type_t::RuntimeError);
   }
 
-  bool has_warm_start_data() const override { return !current_primal_solution_ws_.empty(); }
+  bool has_warm_start_data() const override { return pdlp_warm_start_data_.is_populated(); }
+
+  // Warmstart data accessor - returns the CPU warmstart struct
+  const cpu_pdlp_warm_start_data_t<i_t, f_t>& get_cpu_pdlp_warm_start_data() const
+  {
+    return pdlp_warm_start_data_;
+  }
+
+  cpu_pdlp_warm_start_data_t<i_t, f_t>& get_cpu_pdlp_warm_start_data()
+  {
+    return pdlp_warm_start_data_;
+  }
 
   // Individual warm start data accessors (return stored host vectors)
   std::vector<f_t> get_current_primal_solution_host() const override
   {
-    return current_primal_solution_ws_;
+    return pdlp_warm_start_data_.current_primal_solution_;
   }
   std::vector<f_t> get_current_dual_solution_host() const override
   {
-    return current_dual_solution_ws_;
+    return pdlp_warm_start_data_.current_dual_solution_;
   }
   std::vector<f_t> get_initial_primal_average_host() const override
   {
-    return initial_primal_average_ws_;
+    return pdlp_warm_start_data_.initial_primal_average_;
   }
   std::vector<f_t> get_initial_dual_average_host() const override
   {
-    return initial_dual_average_ws_;
+    return pdlp_warm_start_data_.initial_dual_average_;
   }
-  std::vector<f_t> get_current_ATY_host() const override { return current_ATY_ws_; }
+  std::vector<f_t> get_current_ATY_host() const override
+  {
+    return pdlp_warm_start_data_.current_ATY_;
+  }
   std::vector<f_t> get_sum_primal_solutions_host() const override
   {
-    return sum_primal_solutions_ws_;
+    return pdlp_warm_start_data_.sum_primal_solutions_;
   }
-  std::vector<f_t> get_sum_dual_solutions_host() const override { return sum_dual_solutions_ws_; }
+  std::vector<f_t> get_sum_dual_solutions_host() const override
+  {
+    return pdlp_warm_start_data_.sum_dual_solutions_;
+  }
   std::vector<f_t> get_last_restart_duality_gap_primal_solution_host() const override
   {
-    return last_restart_duality_gap_primal_solution_ws_;
+    return pdlp_warm_start_data_.last_restart_duality_gap_primal_solution_;
   }
   std::vector<f_t> get_last_restart_duality_gap_dual_solution_host() const override
   {
-    return last_restart_duality_gap_dual_solution_ws_;
+    return pdlp_warm_start_data_.last_restart_duality_gap_dual_solution_;
   }
-  f_t get_initial_primal_weight() const override { return initial_primal_weight_; }
-  f_t get_initial_step_size() const override { return initial_step_size_; }
-  i_t get_total_pdlp_iterations() const override { return total_pdlp_iterations_; }
-  i_t get_total_pdhg_iterations() const override { return total_pdhg_iterations_; }
-  f_t get_last_candidate_kkt_score() const override { return last_candidate_kkt_score_; }
-  f_t get_last_restart_kkt_score() const override { return last_restart_kkt_score_; }
-  f_t get_sum_solution_weight() const override { return sum_solution_weight_; }
-  i_t get_iterations_since_last_restart() const override { return iterations_since_last_restart_; }
+  f_t get_initial_primal_weight() const override
+  {
+    return pdlp_warm_start_data_.initial_primal_weight_;
+  }
+  f_t get_initial_step_size() const override { return pdlp_warm_start_data_.initial_step_size_; }
+  i_t get_total_pdlp_iterations() const override
+  {
+    return pdlp_warm_start_data_.total_pdlp_iterations_;
+  }
+  i_t get_total_pdhg_iterations() const override
+  {
+    return pdlp_warm_start_data_.total_pdhg_iterations_;
+  }
+  f_t get_last_candidate_kkt_score() const override
+  {
+    return pdlp_warm_start_data_.last_candidate_kkt_score_;
+  }
+  f_t get_last_restart_kkt_score() const override
+  {
+    return pdlp_warm_start_data_.last_restart_kkt_score_;
+  }
+  f_t get_sum_solution_weight() const override
+  {
+    return pdlp_warm_start_data_.sum_solution_weight_;
+  }
+  i_t get_iterations_since_last_restart() const override
+  {
+    return pdlp_warm_start_data_.iterations_since_last_restart_;
+  }
 
   /**
    * @brief Convert CPU solution to GPU solution
@@ -294,6 +374,12 @@ class cpu_lp_solution_t : public lp_solution_interface_t<i_t, f_t> {
                                                      std::move(termination_status_vec));
   }
 
+  /**
+   * @brief Convert to CPU-backed cpu_linear_programming_ret_t struct for Python/Cython
+   * Moves std::vector data with zero-copy.
+   */
+  cuopt::cython::cpu_linear_programming_ret_t to_cpu_linear_programming_ret_t() &&;
+
  private:
   std::vector<f_t> primal_solution_;
   std::vector<f_t> dual_solution_;
@@ -309,24 +395,8 @@ class cpu_lp_solution_t : public lp_solution_interface_t<i_t, f_t> {
   i_t num_iterations_;
   bool solved_by_pdlp_;
 
-  // PDLP warm start data (CPU-backed using std::vector)
-  std::vector<f_t> current_primal_solution_ws_;
-  std::vector<f_t> current_dual_solution_ws_;
-  std::vector<f_t> initial_primal_average_ws_;
-  std::vector<f_t> initial_dual_average_ws_;
-  std::vector<f_t> current_ATY_ws_;
-  std::vector<f_t> sum_primal_solutions_ws_;
-  std::vector<f_t> sum_dual_solutions_ws_;
-  std::vector<f_t> last_restart_duality_gap_primal_solution_ws_;
-  std::vector<f_t> last_restart_duality_gap_dual_solution_ws_;
-  f_t initial_primal_weight_{-1.0};
-  f_t initial_step_size_{-1.0};
-  i_t total_pdlp_iterations_{-1};
-  i_t total_pdhg_iterations_{-1};
-  f_t last_candidate_kkt_score_{-1.0};
-  f_t last_restart_kkt_score_{-1.0};
-  f_t sum_solution_weight_{-1.0};
-  i_t iterations_since_last_restart_{-1};
+  // PDLP warm start data (embedded struct, CPU-backed using std::vector)
+  cpu_pdlp_warm_start_data_t<i_t, f_t> pdlp_warm_start_data_;
 };
 
 /**
@@ -450,6 +520,12 @@ class cpu_mip_solution_t : public mip_solution_interface_t<i_t, f_t> {
                                     max_variable_bound_violation_,
                                     stats);
   }
+
+  /**
+   * @brief Convert to CPU-backed cpu_mip_ret_t struct for Python/Cython
+   * Moves std::vector data with zero-copy.
+   */
+  cuopt::cython::cpu_mip_ret_t to_cpu_mip_ret_t() &&;
 
  private:
   std::vector<f_t> solution_;

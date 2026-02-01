@@ -6,6 +6,7 @@
 /* clang-format on */
 
 #include <cuopt/linear_programming/cpu_optimization_problem_solution.hpp>
+#include <cuopt/linear_programming/cpu_pdlp_warm_start_data.hpp>
 #include <cuopt/linear_programming/gpu_optimization_problem_solution.hpp>
 #include <cuopt/linear_programming/optimization_problem_interface.hpp>
 #include <cuopt/linear_programming/solve.hpp>
@@ -34,16 +35,25 @@ std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp_remote(
   std::vector<f_t> dual_solution(n_constraints, 0.0);
   std::vector<f_t> reduced_cost(n_vars, 0.0);
 
-  // Create fake warm start data with recognizable non-zero values for testing
-  std::vector<f_t> current_primal_ws(n_vars, 1.1);       // Fill with 1.1
-  std::vector<f_t> current_dual_ws(n_constraints, 2.2);  // Fill with 2.2
-  std::vector<f_t> initial_primal_avg_ws(n_vars, 3.3);
-  std::vector<f_t> initial_dual_avg_ws(n_constraints, 4.4);
-  std::vector<f_t> current_ATY_ws(n_vars, 5.5);
-  std::vector<f_t> sum_primal_ws(n_vars, 6.6);
-  std::vector<f_t> sum_dual_ws(n_constraints, 7.7);
-  std::vector<f_t> last_restart_primal_ws(n_vars, 8.8);
-  std::vector<f_t> last_restart_dual_ws(n_constraints, 9.9);
+  // Create fake warm start data struct with recognizable non-zero values for testing
+  cpu_pdlp_warm_start_data_t<i_t, f_t> warmstart;
+  warmstart.current_primal_solution_                  = std::vector<f_t>(n_vars, 1.1);
+  warmstart.current_dual_solution_                    = std::vector<f_t>(n_constraints, 2.2);
+  warmstart.initial_primal_average_                   = std::vector<f_t>(n_vars, 3.3);
+  warmstart.initial_dual_average_                     = std::vector<f_t>(n_constraints, 4.4);
+  warmstart.current_ATY_                              = std::vector<f_t>(n_vars, 5.5);
+  warmstart.sum_primal_solutions_                     = std::vector<f_t>(n_vars, 6.6);
+  warmstart.sum_dual_solutions_                       = std::vector<f_t>(n_constraints, 7.7);
+  warmstart.last_restart_duality_gap_primal_solution_ = std::vector<f_t>(n_vars, 8.8);
+  warmstart.last_restart_duality_gap_dual_solution_   = std::vector<f_t>(n_constraints, 9.9);
+  warmstart.initial_primal_weight_                    = 99.1;
+  warmstart.initial_step_size_                        = 99.2;
+  warmstart.total_pdlp_iterations_                    = 100;
+  warmstart.total_pdhg_iterations_                    = 200;
+  warmstart.last_candidate_kkt_score_                 = 99.3;
+  warmstart.last_restart_kkt_score_                   = 99.4;
+  warmstart.sum_solution_weight_                      = 99.5;
+  warmstart.iterations_since_last_restart_            = 10;
 
   auto solution = std::make_unique<cpu_lp_solution_t<i_t, f_t>>(
     std::move(primal_solution),
@@ -58,23 +68,7 @@ std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp_remote(
     0.003,                               // gap
     42,                                  // num_iterations
     true,                                // solved_by_pdlp
-    std::move(current_primal_ws),
-    std::move(current_dual_ws),
-    std::move(initial_primal_avg_ws),
-    std::move(initial_dual_avg_ws),
-    std::move(current_ATY_ws),
-    std::move(sum_primal_ws),
-    std::move(sum_dual_ws),
-    std::move(last_restart_primal_ws),
-    std::move(last_restart_dual_ws),
-    99.1,  // initial_primal_weight
-    99.2,  // initial_step_size
-    100,   // total_pdlp_iterations
-    200,   // total_pdhg_iterations
-    99.3,  // last_candidate_kkt_score
-    99.4,  // last_restart_kkt_score
-    99.5,  // sum_solution_weight
-    10     // iterations_since_last_restart
+    std::move(warmstart)                 // warmstart data
   );
 
   return solution;

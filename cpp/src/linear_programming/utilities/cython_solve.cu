@@ -200,74 +200,72 @@ std::unique_ptr<solver_ret_t> call_solve(
     const raft::handle_t handle_{stream};
 
     auto gpu_problem = cuopt::linear_programming::gpu_optimization_problem_t<int, double>(&handle_);
-    cuopt::linear_programming::populate_from_data_model_view(&gpu_problem, data_model);
+    cuopt::linear_programming::populate_from_data_model_view(
+      &gpu_problem, data_model, solver_settings, &handle_);
 
-    // Handle warmstart data
-    if (solver_settings->get_pdlp_warm_start_data_view()
-          .last_restart_duality_gap_dual_solution_.data() != nullptr) {
-      cuopt::linear_programming::pdlp_warm_start_data_t<int, double> pdlp_warm_start_data(
-        solver_settings->get_pdlp_warm_start_data_view(), handle_.get_stream());
-      solver_settings->get_pdlp_settings().set_pdlp_warm_start_data(pdlp_warm_start_data);
-    }
-
-    // Call appropriate solve function
+    // Call appropriate solve function and convert to ret struct
     if (gpu_problem.get_problem_category() == linear_programming::problem_category_t::LP) {
-      response.lp_solution =
-        call_solve_lp(&gpu_problem, solver_settings->get_pdlp_settings(), is_batch_mode);
-      response.mip_solution = nullptr;
+      // Solve and get solution interface pointer
+      auto lp_solution_ptr =
+        std::unique_ptr<linear_programming::lp_solution_interface_t<int, double>>(
+          call_solve_lp(&gpu_problem, solver_settings->get_pdlp_settings(), is_batch_mode));
+
+      // Dynamic cast to GPU concrete type
+      auto* gpu_lp_sol =
+        dynamic_cast<linear_programming::gpu_lp_solution_t<int, double>*>(lp_solution_ptr.get());
+
+      if (!gpu_lp_sol) {
+        throw cuopt::logic_error("Expected GPU LP solution but got different type",
+                                 cuopt::error_type_t::RuntimeError);
+      }
+
+      // Release ownership and convert (move-based, zero-copy)
+      lp_solution_ptr.release();  // Transfer ownership to conversion method
+      response.lp_ret       = std::move(*gpu_lp_sol).to_linear_programming_ret_t();
       response.problem_type = linear_programming::problem_category_t::LP;
+
+      // Reset stream to per-thread default as non-blocking stream is out of scope after the
+      // function returns.
+      auto& lp = std::get<linear_programming_ret_t>(response.lp_ret);
+      lp.primal_solution_->set_stream(rmm::cuda_stream_per_thread);
+      lp.dual_solution_->set_stream(rmm::cuda_stream_per_thread);
+      lp.reduced_cost_->set_stream(rmm::cuda_stream_per_thread);
+      lp.current_primal_solution_->set_stream(rmm::cuda_stream_per_thread);
+      lp.current_dual_solution_->set_stream(rmm::cuda_stream_per_thread);
+      lp.initial_primal_average_->set_stream(rmm::cuda_stream_per_thread);
+      lp.initial_dual_average_->set_stream(rmm::cuda_stream_per_thread);
+      lp.current_ATY_->set_stream(rmm::cuda_stream_per_thread);
+      lp.sum_primal_solutions_->set_stream(rmm::cuda_stream_per_thread);
+      lp.sum_dual_solutions_->set_stream(rmm::cuda_stream_per_thread);
+      lp.last_restart_duality_gap_primal_solution_->set_stream(rmm::cuda_stream_per_thread);
+      lp.last_restart_duality_gap_dual_solution_->set_stream(rmm::cuda_stream_per_thread);
+
     } else {
-      response.mip_solution = call_solve_mip(&gpu_problem, solver_settings->get_mip_settings());
-      response.lp_solution  = nullptr;
+      // MIP solve
+      auto mip_solution_ptr =
+        std::unique_ptr<linear_programming::mip_solution_interface_t<int, double>>(
+          call_solve_mip(&gpu_problem, solver_settings->get_mip_settings()));
+
+      auto* gpu_mip_sol =
+        dynamic_cast<linear_programming::gpu_mip_solution_t<int, double>*>(mip_solution_ptr.get());
+
+      if (!gpu_mip_sol) {
+        throw cuopt::logic_error("Expected GPU MIP solution but got different type",
+                                 cuopt::error_type_t::RuntimeError);
+      }
+
+      // Release ownership and convert (move-based, zero-copy)
+      mip_solution_ptr.release();
+      response.mip_ret      = std::move(*gpu_mip_sol).to_mip_ret_t();
       response.problem_type = linear_programming::problem_category_t::MIP;
+
+      // Reset stream to per-thread default as non-blocking stream is out of scope after the
+      // function returns.
+      auto& mip = std::get<mip_ret_t>(response.mip_ret);
+      mip.solution_->set_stream(rmm::cuda_stream_per_thread);
     }
 
-    // CRITICAL: Transfer solution's device memory to persistent stream before local stream is
-    // destroyed. The solution contains device_uvectors allocated on our local stream. When this
-    // function returns, the local stream will be destroyed, but the solution object persists in
-    // Python. We must transfer ownership to a persistent stream to avoid segfaults during cleanup.
-    stream.synchronize();  // Ensure all operations on local stream are complete
-
-    // Transfer solution device memory to per-thread default stream
-    if (response.lp_solution) {
-      auto* gpu_lp_sol = dynamic_cast<cuopt::linear_programming::gpu_lp_solution_t<int, double>*>(
-        response.lp_solution);
-      if (gpu_lp_sol) {
-        // Access the underlying optimization_problem_solution_t and transfer its streams
-        auto& sol = gpu_lp_sol->get_solution();
-        sol.get_primal_solution().set_stream(rmm::cuda_stream_per_thread);
-        sol.get_dual_solution().set_stream(rmm::cuda_stream_per_thread);
-        sol.get_reduced_cost().set_stream(rmm::cuda_stream_per_thread);
-
-        // Transfer warmstart data streams if present
-        auto& ws_data = sol.get_pdlp_warm_start_data();
-        if (ws_data.current_primal_solution_.size() > 0) {
-          ws_data.current_primal_solution_.set_stream(rmm::cuda_stream_per_thread);
-          ws_data.current_dual_solution_.set_stream(rmm::cuda_stream_per_thread);
-          ws_data.initial_primal_average_.set_stream(rmm::cuda_stream_per_thread);
-          ws_data.initial_dual_average_.set_stream(rmm::cuda_stream_per_thread);
-          ws_data.current_ATY_.set_stream(rmm::cuda_stream_per_thread);
-          ws_data.sum_primal_solutions_.set_stream(rmm::cuda_stream_per_thread);
-          ws_data.sum_dual_solutions_.set_stream(rmm::cuda_stream_per_thread);
-          ws_data.last_restart_duality_gap_primal_solution_.set_stream(rmm::cuda_stream_per_thread);
-          ws_data.last_restart_duality_gap_dual_solution_.set_stream(rmm::cuda_stream_per_thread);
-        }
-      }
-    }
-
-    if (response.mip_solution) {
-      auto* gpu_mip_sol = dynamic_cast<cuopt::linear_programming::gpu_mip_solution_t<int, double>*>(
-        response.mip_solution);
-      if (gpu_mip_sol) {
-        // Access the underlying mip_solution_t and transfer its streams
-        auto& sol = gpu_mip_sol->get_solution();
-        sol.get_solution().set_stream(rmm::cuda_stream_per_thread);
-      }
-    }
-
-    // Reset warmstart data streams in solver_settings to per-thread default before destroying our
-    // local stream. The warmstart data was created using our stream and its uvectors are associated
-    // with it.
+    // Reset warmstart data streams in solver_settings
     auto& warmstart_data = solver_settings->get_pdlp_settings().get_pdlp_warm_start_data();
     if (warmstart_data.current_primal_solution_.size() > 0) {
       warmstart_data.current_primal_solution_.set_stream(rmm::cuda_stream_per_thread);
@@ -282,20 +280,48 @@ std::unique_ptr<solver_ret_t> call_solve(
       warmstart_data.last_restart_duality_gap_dual_solution_.set_stream(
         rmm::cuda_stream_per_thread);
     }
+
   } else {
     // CPU backend: No CUDA resources, create CPU problem for remote execution
     auto cpu_problem = cuopt::linear_programming::cpu_optimization_problem_t<int, double>(nullptr);
-    cuopt::linear_programming::populate_from_data_model_view(&cpu_problem, data_model);
+    cuopt::linear_programming::populate_from_data_model_view(
+      &cpu_problem, data_model, solver_settings, nullptr);
 
-    // Call appropriate solve function
+    // Call appropriate solve function and convert to CPU ret struct
     if (cpu_problem.get_problem_category() == linear_programming::problem_category_t::LP) {
-      response.lp_solution =
-        call_solve_lp(&cpu_problem, solver_settings->get_pdlp_settings(), is_batch_mode);
-      response.mip_solution = nullptr;
+      auto lp_solution_ptr =
+        std::unique_ptr<linear_programming::lp_solution_interface_t<int, double>>(
+          call_solve_lp(&cpu_problem, solver_settings->get_pdlp_settings(), is_batch_mode));
+
+      auto* cpu_lp_sol =
+        dynamic_cast<linear_programming::cpu_lp_solution_t<int, double>*>(lp_solution_ptr.get());
+
+      if (!cpu_lp_sol) {
+        throw cuopt::logic_error("Expected CPU LP solution but got different type",
+                                 cuopt::error_type_t::RuntimeError);
+      }
+
+      // Release ownership and convert (move-based, zero-copy for std::vector)
+      lp_solution_ptr.release();
+      response.lp_ret       = std::move(*cpu_lp_sol).to_cpu_linear_programming_ret_t();
       response.problem_type = linear_programming::problem_category_t::LP;
+
     } else {
-      response.mip_solution = call_solve_mip(&cpu_problem, solver_settings->get_mip_settings());
-      response.lp_solution  = nullptr;
+      auto mip_solution_ptr =
+        std::unique_ptr<linear_programming::mip_solution_interface_t<int, double>>(
+          call_solve_mip(&cpu_problem, solver_settings->get_mip_settings()));
+
+      auto* cpu_mip_sol =
+        dynamic_cast<linear_programming::cpu_mip_solution_t<int, double>*>(mip_solution_ptr.get());
+
+      if (!cpu_mip_sol) {
+        throw cuopt::logic_error("Expected CPU MIP solution but got different type",
+                                 cuopt::error_type_t::RuntimeError);
+      }
+
+      // Release ownership and convert (move-based, zero-copy for std::vector)
+      mip_solution_ptr.release();
+      response.mip_ret      = std::move(*cpu_mip_sol).to_cpu_mip_ret_t();
       response.problem_type = linear_programming::problem_category_t::MIP;
     }
   }
