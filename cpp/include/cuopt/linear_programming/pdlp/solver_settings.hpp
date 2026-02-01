@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cuopt/linear_programming/constants.h>
+#include <cuopt/linear_programming/cpu_pdlp_warm_start_data.hpp>
 #include <cuopt/linear_programming/pdlp/pdlp_hyper_params.cuh>
 #include <cuopt/linear_programming/pdlp/pdlp_warm_start_data.hpp>
 #include <optional>
@@ -178,6 +179,10 @@ class pdlp_solver_settings_t {
   const pdlp_warm_start_data_t<i_t, f_t>& get_pdlp_warm_start_data() const noexcept;
   pdlp_warm_start_data_t<i_t, f_t>& get_pdlp_warm_start_data();
   const pdlp_warm_start_data_view_t<i_t, f_t>& get_pdlp_warm_start_data_view() const noexcept;
+
+  // CPU warmstart data accessors (for remote execution)
+  const cpu_pdlp_warm_start_data_t<i_t, f_t>& get_cpu_pdlp_warm_start_data() const noexcept;
+  cpu_pdlp_warm_start_data_t<i_t, f_t>& get_cpu_pdlp_warm_start_data() noexcept;
   // TODO batch mode: tmp
   std::optional<f_t> get_initial_step_size() const;
   // TODO batch mode: tmp
@@ -252,10 +257,12 @@ class pdlp_solver_settings_t {
   /** Initial primal weight */
   // TODO batch mode: tmp
   std::optional<f_t> initial_primal_weight_;
-  // For the C++ interface
+  // For the C++ interface - GPU warmstart
   pdlp_warm_start_data_t<i_t, f_t> pdlp_warm_start_data_;
   // For the Cython interface
   pdlp_warm_start_data_view_t<i_t, f_t> pdlp_warm_start_data_view_;
+  // For remote execution - CPU warmstart
+  cpu_pdlp_warm_start_data_t<i_t, f_t> cpu_pdlp_warm_start_data_;
 
   friend class solver_settings_t<i_t, f_t>;
 };

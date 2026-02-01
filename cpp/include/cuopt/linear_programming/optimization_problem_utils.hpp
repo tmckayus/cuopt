@@ -7,7 +7,9 @@
 
 #pragma once
 
+#include <cuopt/linear_programming/cpu_pdlp_warm_start_data.hpp>
 #include <cuopt/linear_programming/optimization_problem_interface.hpp>
+#include <cuopt/linear_programming/solver_settings.hpp>
 #include <mps_parser/data_model_view.hpp>
 #include <mps_parser/mps_data_model.hpp>
 
@@ -130,10 +132,14 @@ void populate_from_mps_data_model(optimization_problem_interface_t<i_t, f_t>* pr
  * @tparam f_t Floating point type for values
  * @param[out] problem The optimization problem interface to populate
  * @param[in] data_model The data model view containing the problem data
+ * @param[in] solver_settings Optional solver settings (for warmstart data, GPU only)
+ * @param[in] handle Optional RAFT handle (for warmstart data, GPU only)
  */
 template <typename i_t, typename f_t>
 void populate_from_data_model_view(optimization_problem_interface_t<i_t, f_t>* problem,
-                                   cuopt::mps_parser::data_model_view_t<i_t, f_t>* data_model)
+                                   cuopt::mps_parser::data_model_view_t<i_t, f_t>* data_model,
+                                   solver_settings_t<i_t, f_t>* solver_settings = nullptr,
+                                   const raft::handle_t* handle                 = nullptr)
 {
   problem->set_maximize(data_model->get_sense());
 
@@ -160,6 +166,49 @@ void populate_from_data_model_view(optimization_problem_interface_t<i_t, f_t>* p
 
   problem->set_objective_scaling_factor(data_model->get_objective_scaling_factor());
   problem->set_objective_offset(data_model->get_objective_offset());
+
+  // Handle warmstart data with GPU↔CPU conversion if needed
+  if (solver_settings != nullptr) {
+    bool target_is_gpu = (handle != nullptr);
+
+    // Check which warmstart type is populated (using consistent is_populated() API)
+    bool has_gpu_warmstart =
+      solver_settings->get_pdlp_settings().get_pdlp_warm_start_data().is_populated();
+    bool has_cpu_warmstart =
+      solver_settings->get_pdlp_settings().get_cpu_pdlp_warm_start_data().is_populated();
+
+    if (has_gpu_warmstart || has_cpu_warmstart) {
+      if (target_is_gpu) {
+        // Target is GPU backend
+        if (has_gpu_warmstart) {
+          // GPU warmstart → GPU backend: direct copy
+          pdlp_warm_start_data_t<i_t, f_t> pdlp_warm_start_data(
+            solver_settings->get_pdlp_warm_start_data_view(), handle->get_stream());
+          solver_settings->get_pdlp_settings().set_pdlp_warm_start_data(pdlp_warm_start_data);
+        } else {
+          // CPU warmstart → GPU backend: convert H2D
+          pdlp_warm_start_data_t<i_t, f_t> gpu_warmstart = convert_to_gpu_warmstart(
+            solver_settings->get_pdlp_settings().get_cpu_pdlp_warm_start_data(),
+            handle->get_stream());
+          solver_settings->get_pdlp_settings().set_pdlp_warm_start_data(gpu_warmstart);
+        }
+      } else {
+        // Target is CPU backend (remote execution)
+        if (has_cpu_warmstart) {
+          // CPU warmstart → CPU backend: already in correct form, nothing to do
+        } else {
+          // GPU warmstart → CPU backend: convert D2H
+          // Note: This requires a valid CUDA stream even though target is CPU
+          // Use rmm::cuda_stream_per_thread for the conversion
+          cpu_pdlp_warm_start_data_t<i_t, f_t> cpu_warmstart = convert_to_cpu_warmstart(
+            solver_settings->get_pdlp_settings().get_pdlp_warm_start_data(),
+            rmm::cuda_stream_per_thread);
+          solver_settings->get_pdlp_settings().get_cpu_pdlp_warm_start_data() =
+            std::move(cpu_warmstart);
+        }
+      }
+    }
+  }
 
   if (data_model->get_quadratic_objective_values().size() != 0 &&
       data_model->get_quadratic_objective_indices().size() != 0 &&
