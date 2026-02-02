@@ -155,20 +155,30 @@ void populate_from_data_model_view(optimization_problem_interface_t<i_t, f_t>* p
   if (solver_settings != nullptr) {
     bool target_is_gpu = (handle != nullptr);
 
-    // Check which warmstart type is populated (using consistent is_populated() API)
-    bool has_gpu_warmstart =
+    // Check which warmstart type is populated
+    // Note: Python sets the VIEW (spans), so check both view and data for GPU warmstart
+    // CPU warmstart is set directly in the data structure
+    bool has_gpu_warmstart_view = (solver_settings->get_pdlp_warm_start_data_view()
+                                     .last_restart_duality_gap_dual_solution_.size() > 0);
+    bool has_gpu_warmstart_data =
       solver_settings->get_pdlp_settings().get_pdlp_warm_start_data().is_populated();
     bool has_cpu_warmstart =
       solver_settings->get_pdlp_settings().get_cpu_pdlp_warm_start_data().is_populated();
 
+    bool has_gpu_warmstart = has_gpu_warmstart_view || has_gpu_warmstart_data;
+
     if (has_gpu_warmstart || has_cpu_warmstart) {
       if (target_is_gpu) {
         // Target is GPU backend
-        if (has_gpu_warmstart) {
-          // GPU warmstart → GPU backend: direct copy
+        if (has_gpu_warmstart_view) {
+          // GPU warmstart from Python → GPU backend: copy view (spans) to data (device_uvectors)
+          // Python sets the view (spans over cuDF), but solver needs device_uvectors
           pdlp_warm_start_data_t<i_t, f_t> pdlp_warm_start_data(
             solver_settings->get_pdlp_warm_start_data_view(), handle->get_stream());
           solver_settings->get_pdlp_settings().set_pdlp_warm_start_data(pdlp_warm_start_data);
+        } else if (has_gpu_warmstart_data) {
+          // GPU warmstart from C++ API → GPU backend: data already set, nothing to do
+          // The device_uvectors are already populated in the settings
         } else {
           // CPU warmstart → GPU backend: convert H2D
           pdlp_warm_start_data_t<i_t, f_t> gpu_warmstart = convert_to_gpu_warmstart(
@@ -179,7 +189,7 @@ void populate_from_data_model_view(optimization_problem_interface_t<i_t, f_t>* p
       } else {
         // Target is CPU backend (remote execution)
         if (has_cpu_warmstart) {
-          // CPU warmstart → CPU backend: already in correct form, nothing to do
+          // CPU warmstart → CPU backend: data already in correct form, nothing to do
         } else {
           // GPU warmstart → CPU backend: convert D2H
           // Note: This requires a valid CUDA stream even though target is CPU

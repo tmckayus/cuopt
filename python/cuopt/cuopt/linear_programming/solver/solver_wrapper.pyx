@@ -295,6 +295,7 @@ cdef set_solver_setting(
                 settings.get_pdlp_warm_start_data().last_restart_duality_gap_dual_solution # noqa
             )
         )
+        ws_data = settings.get_pdlp_warm_start_data()
         c_solver_settings.set_pdlp_warm_start_data(
             <const double *> c_current_primal_solution,
             <const double *> c_current_dual_solution,
@@ -305,16 +306,16 @@ cdef set_solver_setting(
             <const double *> c_sum_dual_solutions,
             <const double *> c_last_restart_duality_gap_primal_solution,
             <const double *> c_last_restart_duality_gap_dual_solution,
-            settings.get_pdlp_warm_start_data().last_restart_duality_gap_primal_solution.shape[0], # Primal size # noqa
-            settings.get_pdlp_warm_start_data().last_restart_duality_gap_dual_solution.shape[0], # Dual size # noqa
-            settings.get_pdlp_warm_start_data().initial_primal_weight,
-            settings.get_pdlp_warm_start_data().initial_step_size,
-            settings.get_pdlp_warm_start_data().total_pdlp_iterations,
-            settings.get_pdlp_warm_start_data().total_pdhg_iterations,
-            settings.get_pdlp_warm_start_data().last_candidate_kkt_score,
-            settings.get_pdlp_warm_start_data().last_restart_kkt_score,
-            settings.get_pdlp_warm_start_data().sum_solution_weight,
-            settings.get_pdlp_warm_start_data().iterations_since_last_restart # noqa
+            ws_data.last_restart_duality_gap_primal_solution.shape[0], # Primal size # noqa
+            ws_data.last_restart_duality_gap_dual_solution.shape[0], # Dual size # noqa
+            ws_data.initial_primal_weight,
+            ws_data.initial_step_size,
+            ws_data.total_pdlp_iterations,
+            ws_data.total_pdhg_iterations,
+            ws_data.last_candidate_kkt_score,
+            ws_data.last_restart_kkt_score,
+            ws_data.sum_solution_weight,
+            ws_data.iterations_since_last_restart # noqa
         )
 
 cdef create_solution(unique_ptr[solver_ret_t] sol_ret_ptr,

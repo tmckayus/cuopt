@@ -271,7 +271,7 @@ class gpu_lp_solution_t : public lp_solution_interface_t<i_t, f_t> {
   {
     auto& ws =
       const_cast<optimization_problem_solution_t<i_t, f_t>&>(solution_).get_pdlp_warm_start_data();
-    if (ws.last_restart_duality_gap_dual_solution_.size() == 0) return {};
+    if (!ws.is_populated()) return {};
     std::vector<f_t> result(ws.last_restart_duality_gap_dual_solution_.size());
     raft::copy(result.data(),
                ws.last_restart_duality_gap_dual_solution_.data(),
