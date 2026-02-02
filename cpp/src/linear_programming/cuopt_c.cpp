@@ -47,7 +47,8 @@ cuopt_int_t cuOptGetVersion(cuopt_int_t* version_major,
 
 cuopt_int_t cuOptReadProblem(const char* filename, cuOptOptimizationProblem* problem_ptr)
 {
-  problem_and_stream_view_t* problem_and_stream = new problem_and_stream_view_t(get_backend_type());
+  problem_and_stream_view_t* problem_and_stream =
+    new problem_and_stream_view_t(get_memory_backend_type());
   std::string filename_str(filename);
   bool input_mps_strict = false;
   std::unique_ptr<mps_data_model_t<cuopt_int_t, cuopt_float_t>> mps_data_model_ptr;
@@ -118,7 +119,8 @@ cuopt_int_t cuOptCreateProblem(cuopt_int_t num_constraints,
     return CUOPT_INVALID_ARGUMENT;
   }
 
-  problem_and_stream_view_t* problem_and_stream = new problem_and_stream_view_t(get_backend_type());
+  problem_and_stream_view_t* problem_and_stream =
+    new problem_and_stream_view_t(get_memory_backend_type());
   try {
     auto* problem = problem_and_stream->get_problem();
     problem->set_maximize(objective_sense == CUOPT_MAXIMIZE);
@@ -177,7 +179,8 @@ cuopt_int_t cuOptCreateRangedProblem(cuopt_int_t num_constraints,
     return CUOPT_INVALID_ARGUMENT;
   }
 
-  problem_and_stream_view_t* problem_and_stream = new problem_and_stream_view_t(get_backend_type());
+  problem_and_stream_view_t* problem_and_stream =
+    new problem_and_stream_view_t(get_memory_backend_type());
   try {
     auto* problem = problem_and_stream->get_problem();
     problem->set_maximize(objective_sense == CUOPT_MAXIMIZE);
@@ -249,7 +252,8 @@ cuopt_int_t cuOptCreateQuadraticProblem(
     return CUOPT_INVALID_ARGUMENT;
   }
 
-  problem_and_stream_view_t* problem_and_stream = new problem_and_stream_view_t(get_backend_type());
+  problem_and_stream_view_t* problem_and_stream =
+    new problem_and_stream_view_t(get_memory_backend_type());
   try {
     auto* problem = problem_and_stream->get_problem();
     problem->set_maximize(objective_sense == CUOPT_MAXIMIZE);
@@ -315,7 +319,8 @@ cuopt_int_t cuOptCreateQuadraticRangedProblem(
     return CUOPT_INVALID_ARGUMENT;
   }
 
-  problem_and_stream_view_t* problem_and_stream = new problem_and_stream_view_t(get_backend_type());
+  problem_and_stream_view_t* problem_and_stream =
+    new problem_and_stream_view_t(get_memory_backend_type());
   try {
     auto* problem = problem_and_stream->get_problem();
     problem->set_maximize(objective_sense == CUOPT_MAXIMIZE);
@@ -410,7 +415,6 @@ cuopt_int_t cuOptGetObjectiveCoefficients(cuOptOptimizationProblem problem,
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
 
-  // Use polymorphic method - no backend branching needed!
   cuopt_int_t size = problem_and_stream_view->get_problem()->get_n_variables();
   problem_and_stream_view->get_problem()->copy_objective_coefficients_to_host(
     objective_coefficients_ptr, size);
@@ -441,7 +445,6 @@ cuopt_int_t cuOptGetConstraintMatrix(cuOptOptimizationProblem problem,
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
 
-  // Use polymorphic method - no backend branching needed!
   auto* prob           = problem_and_stream_view->get_problem();
   cuopt_int_t num_nnz  = prob->get_nnz();
   cuopt_int_t num_rows = prob->get_n_constraints();
@@ -463,7 +466,6 @@ cuopt_int_t cuOptGetConstraintSense(cuOptOptimizationProblem problem, char* cons
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
 
-  // Use polymorphic method - no backend branching needed!
   cuopt_int_t size = problem_and_stream_view->get_problem()->get_n_constraints();
   problem_and_stream_view->get_problem()->copy_row_types_to_host(constraint_sense_ptr, size);
 
@@ -478,7 +480,6 @@ cuopt_int_t cuOptGetConstraintRightHandSide(cuOptOptimizationProblem problem,
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
 
-  // Use polymorphic method - no backend branching needed!
   cuopt_int_t size = problem_and_stream_view->get_problem()->get_n_constraints();
   problem_and_stream_view->get_problem()->copy_constraint_bounds_to_host(rhs_ptr, size);
 
@@ -493,7 +494,6 @@ cuopt_int_t cuOptGetConstraintLowerBounds(cuOptOptimizationProblem problem,
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
 
-  // Use polymorphic method - no backend branching needed!
   cuopt_int_t size = problem_and_stream_view->get_problem()->get_n_constraints();
   problem_and_stream_view->get_problem()->copy_constraint_lower_bounds_to_host(lower_bounds_ptr,
                                                                                size);
@@ -509,7 +509,6 @@ cuopt_int_t cuOptGetConstraintUpperBounds(cuOptOptimizationProblem problem,
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
 
-  // Use polymorphic method - no backend branching needed!
   cuopt_int_t size = problem_and_stream_view->get_problem()->get_n_constraints();
   problem_and_stream_view->get_problem()->copy_constraint_upper_bounds_to_host(upper_bounds_ptr,
                                                                                size);
@@ -525,7 +524,6 @@ cuopt_int_t cuOptGetVariableLowerBounds(cuOptOptimizationProblem problem,
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
 
-  // Use polymorphic method - no backend branching needed!
   cuopt_int_t size = problem_and_stream_view->get_problem()->get_n_variables();
   problem_and_stream_view->get_problem()->copy_variable_lower_bounds_to_host(lower_bounds_ptr,
                                                                              size);
@@ -541,7 +539,6 @@ cuopt_int_t cuOptGetVariableUpperBounds(cuOptOptimizationProblem problem,
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
 
-  // Use polymorphic method - no backend branching needed!
   cuopt_int_t size = problem_and_stream_view->get_problem()->get_n_variables();
   problem_and_stream_view->get_problem()->copy_variable_upper_bounds_to_host(upper_bounds_ptr,
                                                                              size);
@@ -556,7 +553,6 @@ cuopt_int_t cuOptGetVariableTypes(cuOptOptimizationProblem problem, char* variab
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
 
-  // Use polymorphic method - no backend branching needed!
   cuopt_int_t size = problem_and_stream_view->get_problem()->get_n_variables();
   std::vector<cuopt::linear_programming::var_t> variable_types_host(size);
   problem_and_stream_view->get_problem()->copy_variable_types_to_host(variable_types_host.data(),
@@ -802,7 +798,7 @@ cuopt_int_t cuOptSolve(cuOptOptimizationProblem problem,
 
       // Store interface pointer directly (works on both GPU and CPU-only hosts)
       solution_and_stream_view_t* solution_and_stream_view =
-        new solution_and_stream_view_t(true, problem_and_stream_view->backend_type);
+        new solution_and_stream_view_t(true, problem_and_stream_view->memory_backend);
       solution_and_stream_view->mip_solution_interface_ptr = solution_interface.release();
       *solution_ptr = static_cast<cuOptSolution>(solution_and_stream_view);
 
@@ -822,7 +818,7 @@ cuopt_int_t cuOptSolve(cuOptOptimizationProblem problem,
 
       // Store interface pointer directly (works on both GPU and CPU-only hosts)
       solution_and_stream_view_t* solution_and_stream_view =
-        new solution_and_stream_view_t(false, problem_and_stream_view->backend_type);
+        new solution_and_stream_view_t(false, problem_and_stream_view->memory_backend);
       solution_and_stream_view->lp_solution_interface_ptr = solution_interface.release();
       *solution_ptr = static_cast<cuOptSolution>(solution_and_stream_view);
 
@@ -858,7 +854,6 @@ cuopt_int_t cuOptGetTerminationStatus(cuOptSolution solution, cuopt_int_t* termi
   if (termination_status_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
-  // Use polymorphic get_termination_status_int() - works for both LP and MIP
   *termination_status_ptr = static_cast<cuopt_int_t>(
     solution_and_stream_view->get_solution()->get_termination_status_int());
   return CUOPT_SUCCESS;
@@ -870,7 +865,6 @@ cuopt_int_t cuOptGetErrorStatus(cuOptSolution solution, cuopt_int_t* error_statu
   if (error_status_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
-  // Use polymorphic get_error_status() - works for both LP and MIP
   *error_status_ptr = static_cast<cuopt_int_t>(
     solution_and_stream_view->get_solution()->get_error_status().get_error_type());
   return CUOPT_SUCCESS;
@@ -884,7 +878,6 @@ cuopt_int_t cuOptGetErrorString(cuOptSolution solution,
   if (error_string_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
-  // Use polymorphic get_error_status() - works for both LP and MIP
   std::string error_string = solution_and_stream_view->get_solution()->get_error_status().what();
   std::snprintf(error_string_ptr, error_string_size, "%s", error_string.c_str());
   return CUOPT_SUCCESS;
@@ -897,9 +890,6 @@ cuopt_int_t cuOptGetPrimalSolution(cuOptSolution solution, cuopt_float_t* soluti
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
 
-  // Use polymorphic get_solution_host() - works for both LP and MIP
-  // LP: returns primal solution (variable values)
-  // MIP: returns integer solution (variable values)
   const auto& solution_host = solution_and_stream_view->get_solution()->get_solution_host();
   std::memcpy(
     solution_values_ptr, solution_host.data(), solution_host.size() * sizeof(cuopt_float_t));
@@ -912,7 +902,6 @@ cuopt_int_t cuOptGetObjectiveValue(cuOptSolution solution, cuopt_float_t* object
   if (objective_value_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
-  // Use polymorphic get_objective_value() - works for both LP and MIP
   *objective_value_ptr = solution_and_stream_view->get_solution()->get_objective_value();
   return CUOPT_SUCCESS;
 }
@@ -923,7 +912,6 @@ cuopt_int_t cuOptGetSolveTime(cuOptSolution solution, cuopt_float_t* solve_time_
   if (solve_time_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
-  // Use polymorphic get_solve_time() - works for both LP and MIP
   *solve_time_ptr = solution_and_stream_view->get_solution()->get_solve_time();
   return CUOPT_SUCCESS;
 }
@@ -935,7 +923,6 @@ cuopt_int_t cuOptGetMIPGap(cuOptSolution solution, cuopt_float_t* mip_gap_ptr)
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
   try {
-    // Polymorphic call - throws std::logic_error if called on LP solution
     *mip_gap_ptr = solution_and_stream_view->get_solution()->get_mip_gap();
     return CUOPT_SUCCESS;
   } catch (const std::logic_error&) {
@@ -950,7 +937,6 @@ cuopt_int_t cuOptGetSolutionBound(cuOptSolution solution, cuopt_float_t* solutio
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
   try {
-    // Polymorphic call - throws std::logic_error if called on LP solution
     *solution_bound_ptr = solution_and_stream_view->get_solution()->get_solution_bound();
     return CUOPT_SUCCESS;
   } catch (const std::logic_error&) {
@@ -965,7 +951,6 @@ cuopt_int_t cuOptGetDualSolution(cuOptSolution solution, cuopt_float_t* dual_sol
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
   try {
-    // Polymorphic call - throws std::logic_error if called on MIP solution
     const auto& dual_host = solution_and_stream_view->get_solution()->get_dual_solution();
     std::memcpy(dual_solution_ptr, dual_host.data(), dual_host.size() * sizeof(cuopt_float_t));
     return CUOPT_SUCCESS;
@@ -982,7 +967,6 @@ cuopt_int_t cuOptGetDualObjectiveValue(cuOptSolution solution,
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
   try {
-    // Polymorphic call - throws std::logic_error if called on MIP solution
     *dual_objective_value_ptr =
       solution_and_stream_view->get_solution()->get_dual_objective_value();
     return CUOPT_SUCCESS;
@@ -998,7 +982,6 @@ cuopt_int_t cuOptGetReducedCosts(cuOptSolution solution, cuopt_float_t* reduced_
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
   try {
-    // Polymorphic call - throws std::logic_error if called on MIP solution
     const auto& reduced_cost_host = solution_and_stream_view->get_solution()->get_reduced_costs();
     std::memcpy(
       reduced_cost_ptr, reduced_cost_host.data(), reduced_cost_host.size() * sizeof(cuopt_float_t));

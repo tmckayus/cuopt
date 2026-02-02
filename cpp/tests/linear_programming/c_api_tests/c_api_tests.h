@@ -35,6 +35,15 @@ cuopt_int_t test_quadratic_problem(cuopt_int_t* termination_status_ptr,
 cuopt_int_t test_quadratic_ranged_problem(cuopt_int_t* termination_status_ptr,
                                           cuopt_float_t* objective_ptr);
 cuopt_int_t test_write_problem(const char* input_filename, const char* output_filename);
+
+/* Tests for solution interface polymorphism */
+cuopt_int_t test_lp_solution_mip_methods(const char* lp_filename);
+cuopt_int_t test_mip_solution_lp_methods(const char* mip_filename);
+
+/* CPU-only execution tests (require env vars CUDA_VISIBLE_DEVICES="" and CUOPT_REMOTE_HOST) */
+cuopt_int_t test_cpu_only_execution(const char* filename);
+cuopt_int_t test_cpu_only_mip_execution(const char* filename);
+
 #ifdef __cplusplus
 }
 #endif

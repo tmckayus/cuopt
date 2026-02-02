@@ -123,14 +123,14 @@ int run_single_file(const std::string& file_path,
     return -1;
   }
 
-  // Determine backend and create problem using interface
-  // Create handle only for GPU backend (avoid CUDA init on CPU-only hosts)
-  auto backend = cuopt::linear_programming::get_backend_type();
+  // Determine memory backend and create problem using interface
+  // Create handle only for GPU memory backend (avoid CUDA init on CPU-only hosts)
+  auto memory_backend = cuopt::linear_programming::get_memory_backend_type();
   std::unique_ptr<raft::handle_t> handle_ptr;
   std::unique_ptr<cuopt::linear_programming::optimization_problem_interface_t<int, double>>
     problem_interface;
 
-  if (backend == cuopt::linear_programming::problem_backend_t::GPU) {
+  if (memory_backend == cuopt::linear_programming::memory_backend_t::GPU) {
     handle_ptr = std::make_unique<raft::handle_t>();
     problem_interface =
       std::make_unique<cuopt::linear_programming::gpu_optimization_problem_t<int, double>>(
@@ -353,11 +353,11 @@ int main(int argc, char* argv[])
   const auto initial_solution_file = program.get<std::string>("--initial-solution");
   const auto solve_relaxation      = program.get<bool>("--relaxation");
 
-  // Only initialize CUDA resources if using GPU backend (not remote execution)
-  auto backend = cuopt::linear_programming::get_backend_type();
+  // Only initialize CUDA resources if using GPU memory backend (not remote execution)
+  auto memory_backend = cuopt::linear_programming::get_memory_backend_type();
   std::vector<std::shared_ptr<rmm::mr::device_memory_resource>> memory_resources;
 
-  if (backend == cuopt::linear_programming::problem_backend_t::GPU) {
+  if (memory_backend == cuopt::linear_programming::memory_backend_t::GPU) {
     // All arguments are parsed as string, default values are parsed as int if unused.
     const auto num_gpus = program.is_used("--num-gpus")
                             ? std::stoi(program.get<std::string>("--num-gpus"))
