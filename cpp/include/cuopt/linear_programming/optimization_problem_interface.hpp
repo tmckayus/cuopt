@@ -19,6 +19,16 @@
 
 namespace cuopt::linear_programming {
 
+// Forward declarations
+template <typename i_t, typename f_t>
+class pdlp_solver_settings_t;
+template <typename i_t, typename f_t>
+class mip_solver_settings_t;
+template <typename i_t, typename f_t>
+class lp_solution_interface_t;
+template <typename i_t, typename f_t>
+class mip_solution_interface_t;
+
 /**
  * @brief Interface for optimization problem implementations that can store data
  *        in either CPU or GPU memory.
@@ -326,6 +336,108 @@ class optimization_problem_interface_t {
    * @return true if the problems are equivalent (up to permutation of variables/constraints)
    */
   virtual bool is_equivalent(const optimization_problem_interface_t<i_t, f_t>& other) const = 0;
+
+  // ============================================================================
+  // Remote Execution (Polymorphic Dispatch)
+  // ============================================================================
+
+  /**
+   * @brief Solve LP problem using remote execution (polymorphic)
+   * This method dispatches to the appropriate solve_lp_remote overload based on
+   * the concrete type (GPU or CPU).
+   * @param[in] settings PDLP solver settings
+   * @return Pointer to solution interface
+   */
+  virtual std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp_remote(
+    pdlp_solver_settings_t<i_t, f_t> const& settings) const = 0;
+
+  /**
+   * @brief Solve MIP problem using remote execution (polymorphic)
+   * This method dispatches to the appropriate solve_mip_remote overload based on
+   * the concrete type (GPU or CPU).
+   * @param[in] settings MIP solver settings
+   * @return Pointer to solution interface
+   */
+  virtual std::unique_ptr<mip_solution_interface_t<i_t, f_t>> solve_mip_remote(
+    mip_solver_settings_t<i_t, f_t> const& settings) const = 0;
+
+  // ============================================================================
+  // C API Support: Copy to Host (Polymorphic)
+  // ============================================================================
+
+  /**
+   * @brief Copy objective coefficients to host memory (polymorphic)
+   * GPU implementation: cudaMemcpy from device to host
+   * CPU implementation: std::copy from host vector
+   * @param[out] output Pointer to host memory buffer
+   * @param[in] size Number of elements to copy
+   */
+  virtual void copy_objective_coefficients_to_host(f_t* output, i_t size) const = 0;
+
+  /**
+   * @brief Copy constraint matrix to host memory (polymorphic)
+   * @param[out] values Output buffer for matrix values
+   * @param[out] indices Output buffer for column indices
+   * @param[out] offsets Output buffer for row offsets
+   * @param[in] num_values Number of non-zero values
+   * @param[in] num_indices Number of indices (should equal num_values)
+   * @param[in] num_offsets Number of row offsets (num_constraints + 1)
+   */
+  virtual void copy_constraint_matrix_to_host(f_t* values,
+                                              i_t* indices,
+                                              i_t* offsets,
+                                              i_t num_values,
+                                              i_t num_indices,
+                                              i_t num_offsets) const = 0;
+
+  /**
+   * @brief Copy constraint sense/row types to host memory (polymorphic)
+   * @param[out] output Pointer to host memory buffer
+   * @param[in] size Number of constraints
+   */
+  virtual void copy_row_types_to_host(char* output, i_t size) const = 0;
+
+  /**
+   * @brief Copy constraint bounds (RHS) to host memory (polymorphic)
+   * @param[out] output Pointer to host memory buffer
+   * @param[in] size Number of constraints
+   */
+  virtual void copy_constraint_bounds_to_host(f_t* output, i_t size) const = 0;
+
+  /**
+   * @brief Copy constraint lower bounds to host memory (polymorphic)
+   * @param[out] output Pointer to host memory buffer
+   * @param[in] size Number of constraints
+   */
+  virtual void copy_constraint_lower_bounds_to_host(f_t* output, i_t size) const = 0;
+
+  /**
+   * @brief Copy constraint upper bounds to host memory (polymorphic)
+   * @param[out] output Pointer to host memory buffer
+   * @param[in] size Number of constraints
+   */
+  virtual void copy_constraint_upper_bounds_to_host(f_t* output, i_t size) const = 0;
+
+  /**
+   * @brief Copy variable lower bounds to host memory (polymorphic)
+   * @param[out] output Pointer to host memory buffer
+   * @param[in] size Number of variables
+   */
+  virtual void copy_variable_lower_bounds_to_host(f_t* output, i_t size) const = 0;
+
+  /**
+   * @brief Copy variable upper bounds to host memory (polymorphic)
+   * @param[out] output Pointer to host memory buffer
+   * @param[in] size Number of variables
+   */
+  virtual void copy_variable_upper_bounds_to_host(f_t* output, i_t size) const = 0;
+
+  /**
+   * @brief Copy variable types to host memory (polymorphic)
+   * @param[out] output Pointer to host memory buffer
+   * @param[in] size Number of variables
+   */
+  virtual void copy_variable_types_to_host(var_t* output, i_t size) const = 0;
 };
 
 // ==============================================================================
@@ -446,6 +558,29 @@ class gpu_optimization_problem_t : public optimization_problem_interface_t<i_t, 
    * @return true if the problems are equivalent (up to permutation of variables/constraints)
    */
   bool is_equivalent(const optimization_problem_interface_t<i_t, f_t>& other) const override;
+
+  // Remote execution (polymorphic dispatch)
+  std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp_remote(
+    pdlp_solver_settings_t<i_t, f_t> const& settings) const override;
+
+  std::unique_ptr<mip_solution_interface_t<i_t, f_t>> solve_mip_remote(
+    mip_solver_settings_t<i_t, f_t> const& settings) const override;
+
+  // C API support: Copy to host (polymorphic)
+  void copy_objective_coefficients_to_host(f_t* output, i_t size) const override;
+  void copy_constraint_matrix_to_host(f_t* values,
+                                      i_t* indices,
+                                      i_t* offsets,
+                                      i_t num_values,
+                                      i_t num_indices,
+                                      i_t num_offsets) const override;
+  void copy_row_types_to_host(char* output, i_t size) const override;
+  void copy_constraint_bounds_to_host(f_t* output, i_t size) const override;
+  void copy_constraint_lower_bounds_to_host(f_t* output, i_t size) const override;
+  void copy_constraint_upper_bounds_to_host(f_t* output, i_t size) const override;
+  void copy_variable_lower_bounds_to_host(f_t* output, i_t size) const override;
+  void copy_variable_upper_bounds_to_host(f_t* output, i_t size) const override;
+  void copy_variable_types_to_host(var_t* output, i_t size) const override;
 
   raft::handle_t const* get_handle_ptr() const noexcept;
 
@@ -602,6 +737,29 @@ class cpu_optimization_problem_t : public optimization_problem_interface_t<i_t, 
    * @return true if the problems are equivalent (up to permutation of variables/constraints)
    */
   bool is_equivalent(const optimization_problem_interface_t<i_t, f_t>& other) const override;
+
+  // Remote execution (polymorphic dispatch)
+  std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp_remote(
+    pdlp_solver_settings_t<i_t, f_t> const& settings) const override;
+
+  std::unique_ptr<mip_solution_interface_t<i_t, f_t>> solve_mip_remote(
+    mip_solver_settings_t<i_t, f_t> const& settings) const override;
+
+  // C API support: Copy to host (polymorphic)
+  void copy_objective_coefficients_to_host(f_t* output, i_t size) const override;
+  void copy_constraint_matrix_to_host(f_t* values,
+                                      i_t* indices,
+                                      i_t* offsets,
+                                      i_t num_values,
+                                      i_t num_indices,
+                                      i_t num_offsets) const override;
+  void copy_row_types_to_host(char* output, i_t size) const override;
+  void copy_constraint_bounds_to_host(f_t* output, i_t size) const override;
+  void copy_constraint_lower_bounds_to_host(f_t* output, i_t size) const override;
+  void copy_constraint_upper_bounds_to_host(f_t* output, i_t size) const override;
+  void copy_variable_lower_bounds_to_host(f_t* output, i_t size) const override;
+  void copy_variable_upper_bounds_to_host(f_t* output, i_t size) const override;
+  void copy_variable_types_to_host(var_t* output, i_t size) const override;
 
  private:
   raft::handle_t const* handle_ptr_{nullptr};

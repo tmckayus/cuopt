@@ -181,19 +181,11 @@ std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp_remote(
                                                quad_offsets.size());
   }
 
-  // Call CPU remote solver (returns unique_ptr<cpu_lp_solution_t>)
+  // Call CPU remote solver (returns unique_ptr<lp_solution_interface_t>)
   auto cpu_solution_interface = solve_lp_remote(cpu_problem, settings);
 
   // Convert CPU solution back to GPU solution (since we started with a GPU problem)
-  auto* cpu_solution_ptr = dynamic_cast<cpu_lp_solution_t<i_t, f_t>*>(cpu_solution_interface.get());
-  if (!cpu_solution_ptr) {
-    throw cuopt::logic_error("Failed to cast CPU solution interface to cpu_lp_solution_t",
-                             cuopt::error_type_t::RuntimeError);
-  }
-
-  // Convert to GPU solution and wrap in interface
-  // Use the per-thread default stream for the conversion
-  auto gpu_solution = cpu_solution_ptr->to_gpu_solution(rmm::cuda_stream_per_thread);
+  auto gpu_solution = cpu_solution_interface->to_gpu_solution(rmm::cuda_stream_per_thread);
   return std::make_unique<gpu_lp_solution_t<i_t, f_t>>(std::move(gpu_solution));
 }
 
@@ -270,20 +262,11 @@ std::unique_ptr<mip_solution_interface_t<i_t, f_t>> solve_mip_remote(
                                                quad_offsets.size());
   }
 
-  // Call CPU remote solver (returns unique_ptr<cpu_mip_solution_t>)
+  // Call CPU remote solver (returns unique_ptr<mip_solution_interface_t>)
   auto cpu_solution_interface = solve_mip_remote(cpu_problem, settings);
 
   // Convert CPU solution back to GPU solution (since we started with a GPU problem)
-  auto* cpu_solution_ptr =
-    dynamic_cast<cpu_mip_solution_t<i_t, f_t>*>(cpu_solution_interface.get());
-  if (!cpu_solution_ptr) {
-    throw cuopt::logic_error("Failed to cast CPU solution interface to cpu_mip_solution_t",
-                             cuopt::error_type_t::RuntimeError);
-  }
-
-  // Convert to GPU solution and wrap in interface
-  // Use the per-thread default stream for the conversion
-  auto gpu_solution = cpu_solution_ptr->to_gpu_solution(rmm::cuda_stream_per_thread);
+  auto gpu_solution = cpu_solution_interface->to_gpu_solution(rmm::cuda_stream_per_thread);
   return std::make_unique<gpu_mip_solution_t<i_t, f_t>>(std::move(gpu_solution));
 }
 

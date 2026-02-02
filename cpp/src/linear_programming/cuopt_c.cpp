@@ -464,21 +464,11 @@ cuopt_int_t cuOptGetObjectiveCoefficients(cuOptOptimizationProblem problem,
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
 
-  if (problem_and_stream_view->backend_type == problem_backend_t::CPU) {
-    // CPU backend - use host getters
-    std::vector<cuopt_float_t> host_data =
-      problem_and_stream_view->get_problem()->get_objective_coefficients_host();
-    std::copy(host_data.begin(), host_data.end(), objective_coefficients_ptr);
-  } else {
-    // GPU backend - copy from device
-    const rmm::device_uvector<cuopt_float_t>& objective_coefficients =
-      problem_and_stream_view->get_problem()->get_objective_coefficients();
-    raft::copy(objective_coefficients_ptr,
-               objective_coefficients.data(),
-               objective_coefficients.size(),
-               *problem_and_stream_view->stream_view_ptr);
-    problem_and_stream_view->stream_view_ptr->synchronize();
-  }
+  // Use polymorphic method - no backend branching needed!
+  cuopt_int_t size = problem_and_stream_view->get_problem()->get_n_variables();
+  problem_and_stream_view->get_problem()->copy_objective_coefficients_to_host(
+    objective_coefficients_ptr, size);
+
   return CUOPT_SUCCESS;
 }
 
@@ -505,39 +495,18 @@ cuopt_int_t cuOptGetConstraintMatrix(cuOptOptimizationProblem problem,
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
 
-  if (problem_and_stream_view->backend_type == problem_backend_t::CPU) {
-    // CPU backend - use host getters
-    std::vector<cuopt_float_t> values_host =
-      problem_and_stream_view->get_problem()->get_constraint_matrix_values_host();
-    std::vector<cuopt_int_t> indices_host =
-      problem_and_stream_view->get_problem()->get_constraint_matrix_indices_host();
-    std::vector<cuopt_int_t> offsets_host =
-      problem_and_stream_view->get_problem()->get_constraint_matrix_offsets_host();
-    std::copy(values_host.begin(), values_host.end(), constraint_matrix_coefficients_ptr);
-    std::copy(indices_host.begin(), indices_host.end(), constraint_matrix_column_indices_ptr);
-    std::copy(offsets_host.begin(), offsets_host.end(), constraint_matrix_row_offsets_ptr);
-  } else {
-    // GPU backend - copy from device
-    const rmm::device_uvector<cuopt_float_t>& constraint_matrix_coefficients =
-      problem_and_stream_view->get_problem()->get_constraint_matrix_values();
-    const rmm::device_uvector<cuopt_int_t>& constraint_matrix_column_indices =
-      problem_and_stream_view->get_problem()->get_constraint_matrix_indices();
-    const rmm::device_uvector<cuopt_int_t>& constraint_matrix_row_offsets =
-      problem_and_stream_view->get_problem()->get_constraint_matrix_offsets();
-    raft::copy(constraint_matrix_coefficients_ptr,
-               constraint_matrix_coefficients.data(),
-               constraint_matrix_coefficients.size(),
-               *problem_and_stream_view->stream_view_ptr);
-    raft::copy(constraint_matrix_column_indices_ptr,
-               constraint_matrix_column_indices.data(),
-               constraint_matrix_column_indices.size(),
-               *problem_and_stream_view->stream_view_ptr);
-    raft::copy(constraint_matrix_row_offsets_ptr,
-               constraint_matrix_row_offsets.data(),
-               constraint_matrix_row_offsets.size(),
-               *problem_and_stream_view->stream_view_ptr);
-    problem_and_stream_view->stream_view_ptr->synchronize();
-  }
+  // Use polymorphic method - no backend branching needed!
+  auto* prob           = problem_and_stream_view->get_problem();
+  cuopt_int_t num_nnz  = prob->get_nnz();
+  cuopt_int_t num_rows = prob->get_n_constraints();
+
+  prob->copy_constraint_matrix_to_host(constraint_matrix_coefficients_ptr,
+                                       constraint_matrix_column_indices_ptr,
+                                       constraint_matrix_row_offsets_ptr,
+                                       num_nnz,
+                                       num_nnz,
+                                       num_rows + 1);
+
   return CUOPT_SUCCESS;
 }
 
@@ -548,18 +517,10 @@ cuopt_int_t cuOptGetConstraintSense(cuOptOptimizationProblem problem, char* cons
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
 
-  if (problem_and_stream_view->backend_type == problem_backend_t::CPU) {
-    std::vector<char> host_data = problem_and_stream_view->get_problem()->get_row_types_host();
-    std::copy(host_data.begin(), host_data.end(), constraint_sense_ptr);
-  } else {
-    const rmm::device_uvector<char>& constraint_sense =
-      problem_and_stream_view->get_problem()->get_row_types();
-    raft::copy(constraint_sense_ptr,
-               constraint_sense.data(),
-               constraint_sense.size(),
-               *problem_and_stream_view->stream_view_ptr);
-    problem_and_stream_view->stream_view_ptr->synchronize();
-  }
+  // Use polymorphic method - no backend branching needed!
+  cuopt_int_t size = problem_and_stream_view->get_problem()->get_n_constraints();
+  problem_and_stream_view->get_problem()->copy_row_types_to_host(constraint_sense_ptr, size);
+
   return CUOPT_SUCCESS;
 }
 
@@ -571,16 +532,10 @@ cuopt_int_t cuOptGetConstraintRightHandSide(cuOptOptimizationProblem problem,
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
 
-  if (problem_and_stream_view->backend_type == problem_backend_t::CPU) {
-    std::vector<cuopt_float_t> host_data =
-      problem_and_stream_view->get_problem()->get_constraint_bounds_host();
-    std::copy(host_data.begin(), host_data.end(), rhs_ptr);
-  } else {
-    const rmm::device_uvector<cuopt_float_t>& rhs =
-      problem_and_stream_view->get_problem()->get_constraint_bounds();
-    raft::copy(rhs_ptr, rhs.data(), rhs.size(), *problem_and_stream_view->stream_view_ptr);
-    problem_and_stream_view->stream_view_ptr->synchronize();
-  }
+  // Use polymorphic method - no backend branching needed!
+  cuopt_int_t size = problem_and_stream_view->get_problem()->get_n_constraints();
+  problem_and_stream_view->get_problem()->copy_constraint_bounds_to_host(rhs_ptr, size);
+
   return CUOPT_SUCCESS;
 }
 
@@ -592,19 +547,11 @@ cuopt_int_t cuOptGetConstraintLowerBounds(cuOptOptimizationProblem problem,
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
 
-  if (problem_and_stream_view->backend_type == problem_backend_t::CPU) {
-    std::vector<cuopt_float_t> host_data =
-      problem_and_stream_view->get_problem()->get_constraint_lower_bounds_host();
-    std::copy(host_data.begin(), host_data.end(), lower_bounds_ptr);
-  } else {
-    const rmm::device_uvector<cuopt_float_t>& lower_bounds =
-      problem_and_stream_view->get_problem()->get_constraint_lower_bounds();
-    raft::copy(lower_bounds_ptr,
-               lower_bounds.data(),
-               lower_bounds.size(),
-               *problem_and_stream_view->stream_view_ptr);
-    problem_and_stream_view->stream_view_ptr->synchronize();
-  }
+  // Use polymorphic method - no backend branching needed!
+  cuopt_int_t size = problem_and_stream_view->get_problem()->get_n_constraints();
+  problem_and_stream_view->get_problem()->copy_constraint_lower_bounds_to_host(lower_bounds_ptr,
+                                                                               size);
+
   return CUOPT_SUCCESS;
 }
 
@@ -616,19 +563,11 @@ cuopt_int_t cuOptGetConstraintUpperBounds(cuOptOptimizationProblem problem,
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
 
-  if (problem_and_stream_view->backend_type == problem_backend_t::CPU) {
-    std::vector<cuopt_float_t> host_data =
-      problem_and_stream_view->get_problem()->get_constraint_upper_bounds_host();
-    std::copy(host_data.begin(), host_data.end(), upper_bounds_ptr);
-  } else {
-    const rmm::device_uvector<cuopt_float_t>& upper_bounds =
-      problem_and_stream_view->get_problem()->get_constraint_upper_bounds();
-    raft::copy(upper_bounds_ptr,
-               upper_bounds.data(),
-               upper_bounds.size(),
-               *problem_and_stream_view->stream_view_ptr);
-    problem_and_stream_view->stream_view_ptr->synchronize();
-  }
+  // Use polymorphic method - no backend branching needed!
+  cuopt_int_t size = problem_and_stream_view->get_problem()->get_n_constraints();
+  problem_and_stream_view->get_problem()->copy_constraint_upper_bounds_to_host(upper_bounds_ptr,
+                                                                               size);
+
   return CUOPT_SUCCESS;
 }
 
@@ -640,19 +579,11 @@ cuopt_int_t cuOptGetVariableLowerBounds(cuOptOptimizationProblem problem,
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
 
-  if (problem_and_stream_view->backend_type == problem_backend_t::CPU) {
-    std::vector<cuopt_float_t> host_data =
-      problem_and_stream_view->get_problem()->get_variable_lower_bounds_host();
-    std::copy(host_data.begin(), host_data.end(), lower_bounds_ptr);
-  } else {
-    const rmm::device_uvector<cuopt_float_t>& lower_bounds =
-      problem_and_stream_view->get_problem()->get_variable_lower_bounds();
-    raft::copy(lower_bounds_ptr,
-               lower_bounds.data(),
-               lower_bounds.size(),
-               *problem_and_stream_view->stream_view_ptr);
-    problem_and_stream_view->stream_view_ptr->synchronize();
-  }
+  // Use polymorphic method - no backend branching needed!
+  cuopt_int_t size = problem_and_stream_view->get_problem()->get_n_variables();
+  problem_and_stream_view->get_problem()->copy_variable_lower_bounds_to_host(lower_bounds_ptr,
+                                                                             size);
+
   return CUOPT_SUCCESS;
 }
 
@@ -664,19 +595,11 @@ cuopt_int_t cuOptGetVariableUpperBounds(cuOptOptimizationProblem problem,
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
 
-  if (problem_and_stream_view->backend_type == problem_backend_t::CPU) {
-    std::vector<cuopt_float_t> host_data =
-      problem_and_stream_view->get_problem()->get_variable_upper_bounds_host();
-    std::copy(host_data.begin(), host_data.end(), upper_bounds_ptr);
-  } else {
-    const rmm::device_uvector<cuopt_float_t>& upper_bounds =
-      problem_and_stream_view->get_problem()->get_variable_upper_bounds();
-    raft::copy(upper_bounds_ptr,
-               upper_bounds.data(),
-               upper_bounds.size(),
-               *problem_and_stream_view->stream_view_ptr);
-    problem_and_stream_view->stream_view_ptr->synchronize();
-  }
+  // Use polymorphic method - no backend branching needed!
+  cuopt_int_t size = problem_and_stream_view->get_problem()->get_n_variables();
+  problem_and_stream_view->get_problem()->copy_variable_upper_bounds_to_host(upper_bounds_ptr,
+                                                                             size);
+
   return CUOPT_SUCCESS;
 }
 
@@ -687,19 +610,13 @@ cuopt_int_t cuOptGetVariableTypes(cuOptOptimizationProblem problem, char* variab
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
 
-  std::vector<cuopt::linear_programming::var_t> variable_types_host;
-  if (problem_and_stream_view->backend_type == problem_backend_t::CPU) {
-    variable_types_host = problem_and_stream_view->get_problem()->get_variable_types_host();
-  } else {
-    const rmm::device_uvector<var_t>& variable_types =
-      problem_and_stream_view->get_problem()->get_variable_types();
-    variable_types_host.resize(variable_types.size());
-    raft::copy(variable_types_host.data(),
-               variable_types.data(),
-               variable_types.size(),
-               *problem_and_stream_view->stream_view_ptr);
-    problem_and_stream_view->stream_view_ptr->synchronize();
-  }
+  // Use polymorphic method - no backend branching needed!
+  cuopt_int_t size = problem_and_stream_view->get_problem()->get_n_variables();
+  std::vector<cuopt::linear_programming::var_t> variable_types_host(size);
+  problem_and_stream_view->get_problem()->copy_variable_types_to_host(variable_types_host.data(),
+                                                                      size);
+
+  // Convert var_t enum to C API char values
   for (size_t j = 0; j < variable_types_host.size(); j++) {
     variable_types_ptr[j] =
       variable_types_host[j] == var_t::INTEGER ? CUOPT_INTEGER : CUOPT_CONTINUOUS;

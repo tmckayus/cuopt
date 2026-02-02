@@ -10,17 +10,12 @@
 #include <cuopt/linear_programming/mip/solver_solution.hpp>
 #include <cuopt/linear_programming/optimization_problem_solution_interface.hpp>
 #include <cuopt/linear_programming/pdlp/solver_solution.hpp>
+#include <cuopt/linear_programming/utilities/cython_types.hpp>
 
 #include <raft/core/copy.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
 #include <optional>
-
-// Forward declarations for Cython structs
-namespace cuopt::cython {
-struct linear_programming_ret_t;
-struct mip_ret_t;
-}  // namespace cuopt::cython
 
 namespace cuopt::linear_programming {
 
@@ -342,6 +337,16 @@ class gpu_lp_solution_t : public lp_solution_interface_t<i_t, f_t> {
    */
   cuopt::cython::linear_programming_ret_t to_linear_programming_ret_t() &&;
 
+  /**
+   * @brief Polymorphic conversion to Python return type (interface override)
+   * Returns GPU variant (linear_programming_ret_t with device_buffer)
+   */
+  std::variant<cuopt::cython::linear_programming_ret_t, cuopt::cython::cpu_linear_programming_ret_t>
+    to_python_lp_ret() && override
+  {
+    return std::move(*this).to_linear_programming_ret_t();
+  }
+
  private:
   optimization_problem_solution_t<i_t, f_t> solution_;
   // Cached host data (lazy initialization)
@@ -434,6 +439,16 @@ class gpu_mip_solution_t : public mip_solution_interface_t<i_t, f_t> {
    * Moves device_uvector data into device_buffer wrappers with zero-copy.
    */
   cuopt::cython::mip_ret_t to_mip_ret_t() &&;
+
+  /**
+   * @brief Polymorphic conversion to Python return type (interface override)
+   * Returns GPU variant (mip_ret_t with device_buffer)
+   */
+  std::variant<cuopt::cython::mip_ret_t, cuopt::cython::cpu_mip_ret_t> to_python_mip_ret() &&
+    override
+  {
+    return std::move(*this).to_mip_ret_t();
+  }
 
  private:
   mip_solution_t<i_t, f_t> solution_;

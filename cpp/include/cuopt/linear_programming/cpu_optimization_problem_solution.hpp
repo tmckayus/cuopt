@@ -12,16 +12,11 @@
 #include <cuopt/linear_programming/mip/solver_stats.hpp>
 #include <cuopt/linear_programming/optimization_problem_solution_interface.hpp>
 #include <cuopt/linear_programming/pdlp/solver_solution.hpp>
+#include <cuopt/linear_programming/utilities/cython_types.hpp>
 
 #include <raft/core/copy.hpp>
 
 #include <vector>
-
-// Forward declarations for Cython structs
-namespace cuopt::cython {
-struct cpu_linear_programming_ret_t;
-struct cpu_mip_ret_t;
-}  // namespace cuopt::cython
 
 namespace cuopt::linear_programming {
 
@@ -380,6 +375,16 @@ class cpu_lp_solution_t : public lp_solution_interface_t<i_t, f_t> {
    */
   cuopt::cython::cpu_linear_programming_ret_t to_cpu_linear_programming_ret_t() &&;
 
+  /**
+   * @brief Polymorphic conversion to Python return type (interface override)
+   * Returns CPU variant (cpu_linear_programming_ret_t with std::vector)
+   */
+  std::variant<cuopt::cython::linear_programming_ret_t, cuopt::cython::cpu_linear_programming_ret_t>
+    to_python_lp_ret() && override
+  {
+    return std::move(*this).to_cpu_linear_programming_ret_t();
+  }
+
  private:
   std::vector<f_t> primal_solution_;
   std::vector<f_t> dual_solution_;
@@ -526,6 +531,16 @@ class cpu_mip_solution_t : public mip_solution_interface_t<i_t, f_t> {
    * Moves std::vector data with zero-copy.
    */
   cuopt::cython::cpu_mip_ret_t to_cpu_mip_ret_t() &&;
+
+  /**
+   * @brief Polymorphic conversion to Python return type (interface override)
+   * Returns CPU variant (cpu_mip_ret_t with std::vector)
+   */
+  std::variant<cuopt::cython::mip_ret_t, cuopt::cython::cpu_mip_ret_t> to_python_mip_ret() &&
+    override
+  {
+    return std::move(*this).to_cpu_mip_ret_t();
+  }
 
  private:
   std::vector<f_t> solution_;

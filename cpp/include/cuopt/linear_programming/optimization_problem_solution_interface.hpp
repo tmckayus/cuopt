@@ -16,7 +16,10 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_uvector.hpp>
 
+#include <cuopt/linear_programming/utilities/cython_types.hpp>
+
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace cuopt::linear_programming {
@@ -200,6 +203,17 @@ class lp_solution_interface_t : public optimization_problem_solution_interface_t
    */
   virtual optimization_problem_solution_t<i_t, f_t> to_gpu_solution(
     rmm::cuda_stream_view stream_view) = 0;
+
+  /**
+   * @brief Convert to Python/Cython return type (polymorphic version)
+   * This method allows backend-agnostic conversion to Python return structs.
+   * GPU solutions return linear_programming_ret_t (device_buffer-backed).
+   * CPU solutions return cpu_linear_programming_ret_t (std::vector-backed).
+   * @return Variant containing either GPU or CPU return struct
+   */
+  virtual std::variant<cuopt::cython::linear_programming_ret_t,
+                       cuopt::cython::cpu_linear_programming_ret_t>
+  to_python_lp_ret() && = 0;
 };
 
 /**
@@ -295,6 +309,16 @@ class mip_solution_interface_t : public optimization_problem_solution_interface_
    * @return GPU-backed solution
    */
   virtual mip_solution_t<i_t, f_t> to_gpu_solution(rmm::cuda_stream_view stream_view) = 0;
+
+  /**
+   * @brief Convert to Python/Cython return type (polymorphic version)
+   * This method allows backend-agnostic conversion to Python return structs.
+   * GPU solutions return mip_ret_t (device_buffer-backed).
+   * CPU solutions return cpu_mip_ret_t (std::vector-backed).
+   * @return Variant containing either GPU or CPU return struct
+   */
+  virtual std::variant<cuopt::cython::mip_ret_t, cuopt::cython::cpu_mip_ret_t>
+  to_python_mip_ret() && = 0;
 };
 
 // Forward declarations of concrete implementations
