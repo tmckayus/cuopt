@@ -33,98 +33,6 @@
 namespace cuopt {
 namespace cython {
 
-using cuopt::linear_programming::var_t;
-
-static cuopt::linear_programming::optimization_problem_t<int, double>
-data_model_to_optimization_problem(
-  cuopt::mps_parser::data_model_view_t<int, double>* data_model,
-  cuopt::linear_programming::solver_settings_t<int, double>* solver_settings,
-  raft::handle_t const* handle_ptr)
-{
-  cuopt::linear_programming::optimization_problem_t<int, double> op_problem(handle_ptr);
-  op_problem.set_maximize(data_model->get_sense());
-  if (data_model->get_constraint_matrix_values().size() != 0 &&
-      data_model->get_constraint_matrix_indices().size() != 0 &&
-      data_model->get_constraint_matrix_offsets().size() != 0) {
-    op_problem.set_csr_constraint_matrix(data_model->get_constraint_matrix_values().data(),
-                                         data_model->get_constraint_matrix_values().size(),
-                                         data_model->get_constraint_matrix_indices().data(),
-                                         data_model->get_constraint_matrix_indices().size(),
-                                         data_model->get_constraint_matrix_offsets().data(),
-                                         data_model->get_constraint_matrix_offsets().size());
-  }
-  if (data_model->get_constraint_bounds().size() != 0) {
-    op_problem.set_constraint_bounds(data_model->get_constraint_bounds().data(),
-                                     data_model->get_constraint_bounds().size());
-  }
-  if (data_model->get_objective_coefficients().size() != 0) {
-    op_problem.set_objective_coefficients(data_model->get_objective_coefficients().data(),
-                                          data_model->get_objective_coefficients().size());
-  }
-  op_problem.set_objective_scaling_factor(data_model->get_objective_scaling_factor());
-  op_problem.set_objective_offset(data_model->get_objective_offset());
-
-  if (data_model->get_quadratic_objective_values().size() != 0 &&
-      data_model->get_quadratic_objective_indices().size() != 0 &&
-      data_model->get_quadratic_objective_offsets().size() != 0) {
-    op_problem.set_quadratic_objective_matrix(data_model->get_quadratic_objective_values().data(),
-                                              data_model->get_quadratic_objective_values().size(),
-                                              data_model->get_quadratic_objective_indices().data(),
-                                              data_model->get_quadratic_objective_indices().size(),
-                                              data_model->get_quadratic_objective_offsets().data(),
-                                              data_model->get_quadratic_objective_offsets().size());
-  }
-  if (data_model->get_variable_lower_bounds().size() != 0) {
-    op_problem.set_variable_lower_bounds(data_model->get_variable_lower_bounds().data(),
-                                         data_model->get_variable_lower_bounds().size());
-  }
-  if (data_model->get_variable_upper_bounds().size() != 0) {
-    op_problem.set_variable_upper_bounds(data_model->get_variable_upper_bounds().data(),
-                                         data_model->get_variable_upper_bounds().size());
-  }
-
-  if (data_model->get_row_types().size() != 0) {
-    op_problem.set_row_types(data_model->get_row_types().data(),
-                             data_model->get_row_types().size());
-  }
-  if (data_model->get_constraint_lower_bounds().size() != 0) {
-    op_problem.set_constraint_lower_bounds(data_model->get_constraint_lower_bounds().data(),
-                                           data_model->get_constraint_lower_bounds().size());
-  }
-  if (data_model->get_constraint_upper_bounds().size() != 0) {
-    op_problem.set_constraint_upper_bounds(data_model->get_constraint_upper_bounds().data(),
-                                           data_model->get_constraint_upper_bounds().size());
-  }
-
-  if (solver_settings->get_pdlp_warm_start_data_view()
-        .last_restart_duality_gap_dual_solution_.data() != nullptr) {
-    // Moved inside
-    cuopt::linear_programming::pdlp_warm_start_data_t<int, double> pdlp_warm_start_data(
-      solver_settings->get_pdlp_warm_start_data_view(), handle_ptr->get_stream());
-    solver_settings->get_pdlp_settings().set_pdlp_warm_start_data(pdlp_warm_start_data);
-  }
-
-  if (data_model->get_variable_types().size() != 0) {
-    std::vector<var_t> enum_variable_types(data_model->get_variable_types().size());
-    std::transform(
-      data_model->get_variable_types().data(),
-      data_model->get_variable_types().data() + data_model->get_variable_types().size(),
-      enum_variable_types.begin(),
-      [](const auto val) -> var_t { return val == 'I' ? var_t::INTEGER : var_t::CONTINUOUS; });
-    op_problem.set_variable_types(enum_variable_types.data(), enum_variable_types.size());
-  }
-
-  if (data_model->get_variable_names().size() != 0) {
-    op_problem.set_variable_names(data_model->get_variable_names());
-  }
-
-  if (data_model->get_row_names().size() != 0) {
-    op_problem.set_row_names(data_model->get_row_names());
-  }
-
-  return op_problem;
-}
-
 /**
  * @brief Wrapper for linear_programming to expose the API to cython
  *
@@ -188,14 +96,14 @@ std::unique_ptr<solver_ret_t> call_solve(
 {
   raft::common::nvtx::range fun_scope("Call Solve");
 
-  // Determine backend type based on environment variables
-  auto backend_type = cuopt::linear_programming::get_backend_type();
+  // Determine memory backend based on execution mode
+  auto memory_backend = cuopt::linear_programming::get_memory_backend_type();
 
   solver_ret_t response;
 
-  // Create problem instance and CUDA resources based on backend type
-  if (backend_type == cuopt::linear_programming::problem_backend_t::GPU) {
-    // GPU backend: Create CUDA resources and GPU problem
+  // Create problem instance and CUDA resources based on memory backend
+  if (memory_backend == cuopt::linear_programming::memory_backend_t::GPU) {
+    // GPU memory backend: Create CUDA resources and GPU problem
     rmm::cuda_stream stream(static_cast<rmm::cuda_stream::flags>(flags));
     const raft::handle_t handle_{stream};
 
@@ -263,7 +171,7 @@ std::unique_ptr<solver_ret_t> call_solve(
     }
 
   } else {
-    // CPU backend: No CUDA resources, create CPU problem for remote execution
+    // CPU memory backend: No CUDA resources, create CPU problem for remote execution
     auto cpu_problem = cuopt::linear_programming::cpu_optimization_problem_t<int, double>(nullptr);
     cuopt::linear_programming::populate_from_data_model_view(
       &cpu_problem, data_model, solver_settings, nullptr);

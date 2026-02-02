@@ -29,6 +29,10 @@ namespace cuopt::linear_programming {
 template <typename i_t, typename f_t>
 class cpu_lp_solution_t : public lp_solution_interface_t<i_t, f_t> {
  public:
+  // Bring base class overloads into scope to avoid hiding warnings
+  using lp_solution_interface_t<i_t, f_t>::get_objective_value;
+  using lp_solution_interface_t<i_t, f_t>::get_dual_objective_value;
+
   /**
    * @brief Construct an empty CPU LP solution (for errors)
    */

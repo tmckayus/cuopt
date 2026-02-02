@@ -719,6 +719,16 @@ class cpu_optimization_problem_t : public optimization_problem_interface_t<i_t, 
   std::vector<var_t> get_variable_types_host() const override;
 
   /**
+   * @brief Set the CUDA handle for GPU operations
+   *
+   * This is used in test mode when a CPU problem needs to be converted to GPU
+   * for local solving. The handle must be set before calling to_optimization_problem().
+   *
+   * @param handle_ptr Pointer to the RAFT handle with CUDA resources
+   */
+  void set_handle(raft::handle_t const* handle_ptr) { handle_ptr_ = handle_ptr; }
+
+  /**
    * @brief Convert this CPU optimization problem to an optimization_problem_t
    *        by copying CPU data to GPU (requires GPU memory transfer).
    * @return optimization_problem_t with all data copied to GPU
@@ -800,11 +810,19 @@ class cpu_optimization_problem_t : public optimization_problem_interface_t<i_t, 
 // ============================================================================
 
 /**
- * @brief Enum for selecting CPU or GPU backend for optimization problems
+ * @brief Enum for execution mode (local vs remote solve)
  */
-enum class problem_backend_t {
-  CPU,  ///< Use CPU memory and remote execution
-  GPU   ///< Use GPU memory and local execution
+enum class execution_mode_t {
+  LOCAL,  ///< Solve locally on this machine
+  REMOTE  ///< Solve remotely via gRPC
+};
+
+/**
+ * @brief Enum for memory backend type (GPU vs CPU memory)
+ */
+enum class memory_backend_t {
+  GPU,  ///< Use GPU memory (device memory via RMM)
+  CPU   ///< Use CPU memory (host memory)
 };
 
 /**
@@ -814,21 +832,38 @@ enum class problem_backend_t {
 bool is_remote_execution_enabled();
 
 /**
- * @brief Check if GPU memory should be forced via environment variable
- * @return true if CUOPT_USE_GPU_MEM is set to "true" or "1" (case-insensitive)
+ * @brief Determine execution mode based on environment variables
+ *
+ * @return execution_mode_t::REMOTE if CUOPT_REMOTE_HOST and CUOPT_REMOTE_PORT are set,
+ *         execution_mode_t::LOCAL otherwise
  */
-bool force_gpu_memory();
+execution_mode_t get_execution_mode();
 
 /**
- * @brief Determine which backend to use based on environment variables
- *
- * Priority:
- *   1. CUOPT_USE_GPU_MEM=true -> GPU backend (overrides remote execution)
- *   2. CUOPT_REMOTE_HOST + CUOPT_REMOTE_PORT set -> CPU backend (remote execution)
- *   3. Default -> GPU backend
- *
- * @return problem_backend_t::GPU or problem_backend_t::CPU
+ * @brief Check if GPU memory should be used for remote execution
+ * @return true if CUOPT_USE_GPU_MEM_FOR_REMOTE is set to "true" or "1" (case-insensitive)
  */
-problem_backend_t get_backend_type();
+bool use_gpu_memory_for_remote();
+
+/**
+ * @brief Check if CPU memory should be used for local execution (test mode)
+ *
+ * This is intended for testing CPU problem/solution structures without remote execution.
+ * When enabled, local solve will convert CPU problems to GPU, solve, and convert back.
+ *
+ * @return true if CUOPT_USE_CPU_MEM_FOR_LOCAL is set to "true" or "1" (case-insensitive)
+ */
+bool use_cpu_memory_for_local();
+
+/**
+ * @brief Determine which memory backend to use based on execution mode
+ *
+ * Logic:
+ *   - LOCAL execution -> GPU memory by default, CPU if CUOPT_USE_CPU_MEM_FOR_LOCAL=true (test mode)
+ *   - REMOTE execution -> CPU memory by default, GPU if CUOPT_USE_GPU_MEM_FOR_REMOTE=true
+ *
+ * @return memory_backend_t::GPU or memory_backend_t::CPU
+ */
+memory_backend_t get_memory_backend_type();
 
 }  // namespace cuopt::linear_programming

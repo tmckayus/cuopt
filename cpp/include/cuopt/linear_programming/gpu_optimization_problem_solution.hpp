@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <cuopt/linear_programming/cpu_optimization_problem_solution.hpp>
 #include <cuopt/linear_programming/mip/solver_solution.hpp>
 #include <cuopt/linear_programming/optimization_problem_solution_interface.hpp>
 #include <cuopt/linear_programming/pdlp/solver_solution.hpp>
@@ -28,6 +29,10 @@ namespace cuopt::linear_programming {
 template <typename i_t, typename f_t>
 class gpu_lp_solution_t : public lp_solution_interface_t<i_t, f_t> {
  public:
+  // Bring base class overloads into scope to avoid hiding warnings
+  using lp_solution_interface_t<i_t, f_t>::get_objective_value;
+  using lp_solution_interface_t<i_t, f_t>::get_dual_objective_value;
+
   /**
    * @brief Construct from existing optimization_problem_solution_t (move)
    */
@@ -332,6 +337,34 @@ class gpu_lp_solution_t : public lp_solution_interface_t<i_t, f_t> {
   }
 
   /**
+   * @brief Convert GPU solution to CPU solution
+   * Copies data from device to host for test mode or CPU-only environments.
+   * @return A new cpu_lp_solution_t with all data copied to host vectors
+   */
+  std::unique_ptr<cpu_lp_solution_t<i_t, f_t>> to_cpu_solution() const
+  {
+    // Copy solution data from device to host
+    auto primal_host  = get_primal_solution_host();
+    auto dual_host    = get_dual_solution_host();
+    auto reduced_host = get_reduced_cost_host();
+
+    // Create CPU solution with full termination info
+    return std::make_unique<cpu_lp_solution_t<i_t, f_t>>(
+      std::vector<f_t>(primal_host.begin(), primal_host.end()),
+      std::vector<f_t>(dual_host.begin(), dual_host.end()),
+      std::vector<f_t>(reduced_host.begin(), reduced_host.end()),
+      get_termination_status(),
+      get_objective_value(),
+      get_dual_objective_value(),
+      get_solve_time(),
+      get_l2_primal_residual(),
+      get_l2_dual_residual(),
+      get_gap(),
+      get_num_iterations(),
+      is_solved_by_pdlp());
+  }
+
+  /**
    * @brief Convert to GPU-backed linear_programming_ret_t struct for Python/Cython
    * Moves device_uvector data into device_buffer wrappers with zero-copy.
    */
@@ -432,6 +465,32 @@ class gpu_mip_solution_t : public mip_solution_interface_t<i_t, f_t> {
   {
     // Already GPU, just move
     return std::move(solution_);
+  }
+
+  /**
+   * @brief Convert GPU MIP solution to CPU MIP solution
+   * Copies data from device to host for test mode or CPU-only environments.
+   * @return A new cpu_mip_solution_t with all data copied to host vectors
+   */
+  std::unique_ptr<cpu_mip_solution_t<i_t, f_t>> to_cpu_solution() const
+  {
+    // Copy solution data from device to host
+    auto solution_host = get_solution_host();
+
+    // Create CPU MIP solution with all stats
+    return std::make_unique<cpu_mip_solution_t<i_t, f_t>>(
+      std::vector<f_t>(solution_host.begin(), solution_host.end()),
+      get_termination_status(),
+      get_objective_value(),
+      get_mip_gap(),
+      get_solution_bound(),
+      get_solve_time(),
+      get_presolve_time(),
+      get_max_constraint_violation(),
+      get_max_int_violation(),
+      get_max_variable_bound_violation(),
+      get_num_nodes(),
+      get_num_simplex_iterations());
   }
 
   /**

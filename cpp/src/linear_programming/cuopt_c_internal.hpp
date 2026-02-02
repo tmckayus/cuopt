@@ -21,17 +21,17 @@
 namespace cuopt::linear_programming {
 
 struct problem_and_stream_view_t {
-  problem_and_stream_view_t(problem_backend_t backend)
-    : backend_type(backend), stream_view_ptr(nullptr), handle_ptr(nullptr)
+  problem_and_stream_view_t(memory_backend_t mem_backend)
+    : memory_backend(mem_backend), stream_view_ptr(nullptr), handle_ptr(nullptr)
   {
-    if (backend == problem_backend_t::GPU) {
-      // GPU backend: Allocate CUDA resources
+    if (mem_backend == memory_backend_t::GPU) {
+      // GPU memory backend: Allocate CUDA resources
       stream_view_ptr = new rmm::cuda_stream_view(rmm::cuda_stream_per_thread);
       handle_ptr      = new raft::handle_t(*stream_view_ptr);
       gpu_problem     = new gpu_optimization_problem_t<cuopt_int_t, cuopt_float_t>(handle_ptr);
       cpu_problem     = nullptr;
     } else {
-      // CPU backend: No CUDA resources allocated (for remote execution on CPU-only hosts)
+      // CPU memory backend: No CUDA resources allocated (for remote execution on CPU-only hosts)
       cpu_problem = new cpu_optimization_problem_t<cuopt_int_t, cuopt_float_t>(nullptr);
       gpu_problem = nullptr;
     }
@@ -49,7 +49,7 @@ struct problem_and_stream_view_t {
 
   optimization_problem_interface_t<cuopt_int_t, cuopt_float_t>* get_problem()
   {
-    return backend_type == problem_backend_t::GPU
+    return memory_backend == memory_backend_t::GPU
              ? static_cast<optimization_problem_interface_t<cuopt_int_t, cuopt_float_t>*>(
                  gpu_problem)
              : static_cast<optimization_problem_interface_t<cuopt_int_t, cuopt_float_t>*>(
@@ -58,26 +58,27 @@ struct problem_and_stream_view_t {
 
   optimization_problem_t<cuopt_int_t, cuopt_float_t> to_optimization_problem()
   {
-    if (backend_type == problem_backend_t::GPU) {
+    if (memory_backend == memory_backend_t::GPU) {
       return gpu_problem->to_optimization_problem();
     } else {
       return cpu_problem->to_optimization_problem();
     }
   }
 
-  problem_backend_t backend_type;
+  memory_backend_t memory_backend;
   gpu_optimization_problem_t<cuopt_int_t, cuopt_float_t>* gpu_problem;
   cpu_optimization_problem_t<cuopt_int_t, cuopt_float_t>* cpu_problem;
-  rmm::cuda_stream_view* stream_view_ptr;  // nullptr for CPU backend to avoid CUDA initialization
-  raft::handle_t* handle_ptr;              // nullptr for CPU backend to avoid CUDA initialization
+  rmm::cuda_stream_view*
+    stream_view_ptr;           // nullptr for CPU memory backend to avoid CUDA initialization
+  raft::handle_t* handle_ptr;  // nullptr for CPU memory backend to avoid CUDA initialization
 };
 
 struct solution_and_stream_view_t {
-  solution_and_stream_view_t(bool solution_for_mip, problem_backend_t backend)
+  solution_and_stream_view_t(bool solution_for_mip, memory_backend_t mem_backend)
     : is_mip(solution_for_mip),
       mip_solution_interface_ptr(nullptr),
       lp_solution_interface_ptr(nullptr),
-      backend_type(backend)
+      memory_backend(mem_backend)
   {
   }
 
@@ -104,7 +105,7 @@ struct solution_and_stream_view_t {
   bool is_mip;
   mip_solution_interface_t<cuopt_int_t, cuopt_float_t>* mip_solution_interface_ptr;
   lp_solution_interface_t<cuopt_int_t, cuopt_float_t>* lp_solution_interface_ptr;
-  problem_backend_t backend_type;  // Track if GPU or CPU backend for data access
+  memory_backend_t memory_backend;  // Track if GPU or CPU memory for data access
 };
 
 }  // namespace cuopt::linear_programming

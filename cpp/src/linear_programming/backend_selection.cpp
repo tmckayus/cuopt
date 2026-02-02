@@ -23,9 +23,14 @@ bool is_remote_execution_enabled()
   return (remote_host != nullptr && remote_port != nullptr);
 }
 
-bool force_gpu_memory()
+execution_mode_t get_execution_mode()
 {
-  const char* use_gpu_mem = std::getenv("CUOPT_USE_GPU_MEM");
+  return is_remote_execution_enabled() ? execution_mode_t::REMOTE : execution_mode_t::LOCAL;
+}
+
+bool use_gpu_memory_for_remote()
+{
+  const char* use_gpu_mem = std::getenv("CUOPT_USE_GPU_MEM_FOR_REMOTE");
   if (use_gpu_mem != nullptr) {
     std::string value(use_gpu_mem);
     // Convert to lowercase for case-insensitive comparison
@@ -35,11 +40,26 @@ bool force_gpu_memory()
   return false;
 }
 
-problem_backend_t get_backend_type()
+bool use_cpu_memory_for_local()
 {
-  if (force_gpu_memory()) { return problem_backend_t::GPU; }
-  if (is_remote_execution_enabled()) { return problem_backend_t::CPU; }
-  return problem_backend_t::GPU;
+  const char* use_cpu_mem = std::getenv("CUOPT_USE_CPU_MEM_FOR_LOCAL");
+  if (use_cpu_mem != nullptr) {
+    std::string value(use_cpu_mem);
+    // Convert to lowercase for case-insensitive comparison
+    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+    return (value == "true" || value == "1");
+  }
+  return false;
+}
+
+memory_backend_t get_memory_backend_type()
+{
+  if (get_execution_mode() == execution_mode_t::LOCAL) {
+    // Local execution: GPU memory by default, CPU if test mode enabled
+    return use_cpu_memory_for_local() ? memory_backend_t::CPU : memory_backend_t::GPU;
+  }
+  // Remote execution: CPU memory by default, GPU if explicitly requested
+  return use_gpu_memory_for_remote() ? memory_backend_t::GPU : memory_backend_t::CPU;
 }
 
 }  // namespace cuopt::linear_programming
