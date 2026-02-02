@@ -6,6 +6,7 @@
 /* clang-format on */
 
 #include <cuopt/linear_programming/optimization_problem_interface.hpp>
+#include <cuopt/linear_programming/solve_remote.hpp>
 
 #include <mip/mip_constants.hpp>
 #include <mps_parser/writer.hpp>
@@ -765,6 +766,101 @@ bool cpu_optimization_problem_t<i_t, f_t>::is_equivalent(
   if (A_.size() != other_A_values.size()) return false;
 
   return true;
+}
+
+// ==============================================================================
+// Remote Execution (Polymorphic Dispatch)
+// ==============================================================================
+
+template <typename i_t, typename f_t>
+std::unique_ptr<lp_solution_interface_t<i_t, f_t>>
+cpu_optimization_problem_t<i_t, f_t>::solve_lp_remote(
+  pdlp_solver_settings_t<i_t, f_t> const& settings) const
+{
+  // Forward to the cpu_optimization_problem_t overload
+  // Need to cast away const since solve functions take non-const reference
+  auto& non_const_this = const_cast<cpu_optimization_problem_t<i_t, f_t>&>(*this);
+  return ::cuopt::linear_programming::solve_lp_remote(non_const_this, settings);
+}
+
+template <typename i_t, typename f_t>
+std::unique_ptr<mip_solution_interface_t<i_t, f_t>>
+cpu_optimization_problem_t<i_t, f_t>::solve_mip_remote(
+  mip_solver_settings_t<i_t, f_t> const& settings) const
+{
+  // Forward to the cpu_optimization_problem_t overload
+  auto& non_const_this = const_cast<cpu_optimization_problem_t<i_t, f_t>&>(*this);
+  return ::cuopt::linear_programming::solve_mip_remote(non_const_this, settings);
+}
+
+// ==============================================================================
+// C API Support: Copy to Host (CPU Implementation)
+// ==============================================================================
+
+template <typename i_t, typename f_t>
+void cpu_optimization_problem_t<i_t, f_t>::copy_objective_coefficients_to_host(f_t* output,
+                                                                               i_t size) const
+{
+  // Already in host memory - just copy
+  std::copy(c_.begin(), c_.begin() + size, output);
+}
+
+template <typename i_t, typename f_t>
+void cpu_optimization_problem_t<i_t, f_t>::copy_constraint_matrix_to_host(
+  f_t* values, i_t* indices, i_t* offsets, i_t num_values, i_t num_indices, i_t num_offsets) const
+{
+  // Already in host memory - just copy
+  std::copy(A_.begin(), A_.begin() + num_values, values);
+  std::copy(A_indices_.begin(), A_indices_.begin() + num_indices, indices);
+  std::copy(A_offsets_.begin(), A_offsets_.begin() + num_offsets, offsets);
+}
+
+template <typename i_t, typename f_t>
+void cpu_optimization_problem_t<i_t, f_t>::copy_row_types_to_host(char* output, i_t size) const
+{
+  std::copy(row_types_.begin(), row_types_.begin() + size, output);
+}
+
+template <typename i_t, typename f_t>
+void cpu_optimization_problem_t<i_t, f_t>::copy_constraint_bounds_to_host(f_t* output,
+                                                                          i_t size) const
+{
+  std::copy(b_.begin(), b_.begin() + size, output);
+}
+
+template <typename i_t, typename f_t>
+void cpu_optimization_problem_t<i_t, f_t>::copy_constraint_lower_bounds_to_host(f_t* output,
+                                                                                i_t size) const
+{
+  std::copy(constraint_lower_bounds_.begin(), constraint_lower_bounds_.begin() + size, output);
+}
+
+template <typename i_t, typename f_t>
+void cpu_optimization_problem_t<i_t, f_t>::copy_constraint_upper_bounds_to_host(f_t* output,
+                                                                                i_t size) const
+{
+  std::copy(constraint_upper_bounds_.begin(), constraint_upper_bounds_.begin() + size, output);
+}
+
+template <typename i_t, typename f_t>
+void cpu_optimization_problem_t<i_t, f_t>::copy_variable_lower_bounds_to_host(f_t* output,
+                                                                              i_t size) const
+{
+  std::copy(variable_lower_bounds_.begin(), variable_lower_bounds_.begin() + size, output);
+}
+
+template <typename i_t, typename f_t>
+void cpu_optimization_problem_t<i_t, f_t>::copy_variable_upper_bounds_to_host(f_t* output,
+                                                                              i_t size) const
+{
+  std::copy(variable_upper_bounds_.begin(), variable_upper_bounds_.begin() + size, output);
+}
+
+template <typename i_t, typename f_t>
+void cpu_optimization_problem_t<i_t, f_t>::copy_variable_types_to_host(var_t* output,
+                                                                       i_t size) const
+{
+  std::copy(variable_types_.begin(), variable_types_.begin() + size, output);
 }
 
 // ==============================================================================

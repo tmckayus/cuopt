@@ -6,6 +6,7 @@
 /* clang-format on */
 
 #include <cuopt/linear_programming/optimization_problem_interface.hpp>
+#include <cuopt/linear_programming/solve_remote.hpp>
 
 #include <mip/mip_constants.hpp>
 #include <mps_parser/writer.hpp>
@@ -845,6 +846,106 @@ bool gpu_optimization_problem_t<i_t, f_t>::is_equivalent(
   if (this_A_values.size() != other_A_values.size()) return false;
 
   return true;
+}
+
+// ==============================================================================
+// Remote Execution (Polymorphic Dispatch)
+// ==============================================================================
+
+template <typename i_t, typename f_t>
+std::unique_ptr<lp_solution_interface_t<i_t, f_t>>
+gpu_optimization_problem_t<i_t, f_t>::solve_lp_remote(
+  pdlp_solver_settings_t<i_t, f_t> const& settings) const
+{
+  // Forward to the gpu_optimization_problem_t overload
+  // Need to cast away const since solve functions take non-const reference
+  auto& non_const_this = const_cast<gpu_optimization_problem_t<i_t, f_t>&>(*this);
+  return ::cuopt::linear_programming::solve_lp_remote(non_const_this, settings);
+}
+
+template <typename i_t, typename f_t>
+std::unique_ptr<mip_solution_interface_t<i_t, f_t>>
+gpu_optimization_problem_t<i_t, f_t>::solve_mip_remote(
+  mip_solver_settings_t<i_t, f_t> const& settings) const
+{
+  // Forward to the gpu_optimization_problem_t overload
+  auto& non_const_this = const_cast<gpu_optimization_problem_t<i_t, f_t>&>(*this);
+  return ::cuopt::linear_programming::solve_mip_remote(non_const_this, settings);
+}
+
+// ==============================================================================
+// C API Support: Copy to Host (GPU Implementation)
+// ==============================================================================
+
+template <typename i_t, typename f_t>
+void gpu_optimization_problem_t<i_t, f_t>::copy_objective_coefficients_to_host(f_t* output,
+                                                                               i_t size) const
+{
+  RAFT_CUDA_TRY(cudaMemcpy(output, c_.data(), size * sizeof(f_t), cudaMemcpyDeviceToHost));
+}
+
+template <typename i_t, typename f_t>
+void gpu_optimization_problem_t<i_t, f_t>::copy_constraint_matrix_to_host(
+  f_t* values, i_t* indices, i_t* offsets, i_t num_values, i_t num_indices, i_t num_offsets) const
+{
+  RAFT_CUDA_TRY(cudaMemcpy(values, A_.data(), num_values * sizeof(f_t), cudaMemcpyDeviceToHost));
+  RAFT_CUDA_TRY(
+    cudaMemcpy(indices, A_indices_.data(), num_indices * sizeof(i_t), cudaMemcpyDeviceToHost));
+  RAFT_CUDA_TRY(
+    cudaMemcpy(offsets, A_offsets_.data(), num_offsets * sizeof(i_t), cudaMemcpyDeviceToHost));
+}
+
+template <typename i_t, typename f_t>
+void gpu_optimization_problem_t<i_t, f_t>::copy_row_types_to_host(char* output, i_t size) const
+{
+  RAFT_CUDA_TRY(cudaMemcpy(output, row_types_.data(), size * sizeof(char), cudaMemcpyDeviceToHost));
+}
+
+template <typename i_t, typename f_t>
+void gpu_optimization_problem_t<i_t, f_t>::copy_constraint_bounds_to_host(f_t* output,
+                                                                          i_t size) const
+{
+  RAFT_CUDA_TRY(cudaMemcpy(output, b_.data(), size * sizeof(f_t), cudaMemcpyDeviceToHost));
+}
+
+template <typename i_t, typename f_t>
+void gpu_optimization_problem_t<i_t, f_t>::copy_constraint_lower_bounds_to_host(f_t* output,
+                                                                                i_t size) const
+{
+  RAFT_CUDA_TRY(cudaMemcpy(
+    output, constraint_lower_bounds_.data(), size * sizeof(f_t), cudaMemcpyDeviceToHost));
+}
+
+template <typename i_t, typename f_t>
+void gpu_optimization_problem_t<i_t, f_t>::copy_constraint_upper_bounds_to_host(f_t* output,
+                                                                                i_t size) const
+{
+  RAFT_CUDA_TRY(cudaMemcpy(
+    output, constraint_upper_bounds_.data(), size * sizeof(f_t), cudaMemcpyDeviceToHost));
+}
+
+template <typename i_t, typename f_t>
+void gpu_optimization_problem_t<i_t, f_t>::copy_variable_lower_bounds_to_host(f_t* output,
+                                                                              i_t size) const
+{
+  RAFT_CUDA_TRY(
+    cudaMemcpy(output, variable_lower_bounds_.data(), size * sizeof(f_t), cudaMemcpyDeviceToHost));
+}
+
+template <typename i_t, typename f_t>
+void gpu_optimization_problem_t<i_t, f_t>::copy_variable_upper_bounds_to_host(f_t* output,
+                                                                              i_t size) const
+{
+  RAFT_CUDA_TRY(
+    cudaMemcpy(output, variable_upper_bounds_.data(), size * sizeof(f_t), cudaMemcpyDeviceToHost));
+}
+
+template <typename i_t, typename f_t>
+void gpu_optimization_problem_t<i_t, f_t>::copy_variable_types_to_host(var_t* output,
+                                                                       i_t size) const
+{
+  RAFT_CUDA_TRY(
+    cudaMemcpy(output, variable_types_.data(), size * sizeof(var_t), cudaMemcpyDeviceToHost));
 }
 
 // ==============================================================================

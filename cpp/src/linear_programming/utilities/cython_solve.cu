@@ -210,22 +210,12 @@ std::unique_ptr<solver_ret_t> call_solve(
         std::unique_ptr<linear_programming::lp_solution_interface_t<int, double>>(
           call_solve_lp(&gpu_problem, solver_settings->get_pdlp_settings(), is_batch_mode));
 
-      // Dynamic cast to GPU concrete type
-      auto* gpu_lp_sol =
-        dynamic_cast<linear_programming::gpu_lp_solution_t<int, double>*>(lp_solution_ptr.get());
-
-      if (!gpu_lp_sol) {
-        throw cuopt::logic_error("Expected GPU LP solution but got different type",
-                                 cuopt::error_type_t::RuntimeError);
-      }
-
-      // Release ownership and convert (move-based, zero-copy)
-      lp_solution_ptr.release();  // Transfer ownership to conversion method
-      response.lp_ret       = std::move(*gpu_lp_sol).to_linear_programming_ret_t();
+      response.lp_ret       = std::move(*lp_solution_ptr).to_python_lp_ret();
       response.problem_type = linear_programming::problem_category_t::LP;
 
       // Reset stream to per-thread default as non-blocking stream is out of scope after the
       // function returns.
+      // Note: GPU backend returns linear_programming_ret_t variant
       auto& lp = std::get<linear_programming_ret_t>(response.lp_ret);
       lp.primal_solution_->set_stream(rmm::cuda_stream_per_thread);
       lp.dual_solution_->set_stream(rmm::cuda_stream_per_thread);
@@ -246,21 +236,12 @@ std::unique_ptr<solver_ret_t> call_solve(
         std::unique_ptr<linear_programming::mip_solution_interface_t<int, double>>(
           call_solve_mip(&gpu_problem, solver_settings->get_mip_settings()));
 
-      auto* gpu_mip_sol =
-        dynamic_cast<linear_programming::gpu_mip_solution_t<int, double>*>(mip_solution_ptr.get());
-
-      if (!gpu_mip_sol) {
-        throw cuopt::logic_error("Expected GPU MIP solution but got different type",
-                                 cuopt::error_type_t::RuntimeError);
-      }
-
-      // Release ownership and convert (move-based, zero-copy)
-      mip_solution_ptr.release();
-      response.mip_ret      = std::move(*gpu_mip_sol).to_mip_ret_t();
+      response.mip_ret      = std::move(*mip_solution_ptr).to_python_mip_ret();
       response.problem_type = linear_programming::problem_category_t::MIP;
 
       // Reset stream to per-thread default as non-blocking stream is out of scope after the
       // function returns.
+      // Note: GPU backend returns mip_ret_t variant
       auto& mip = std::get<mip_ret_t>(response.mip_ret);
       mip.solution_->set_stream(rmm::cuda_stream_per_thread);
     }
@@ -293,17 +274,7 @@ std::unique_ptr<solver_ret_t> call_solve(
         std::unique_ptr<linear_programming::lp_solution_interface_t<int, double>>(
           call_solve_lp(&cpu_problem, solver_settings->get_pdlp_settings(), is_batch_mode));
 
-      auto* cpu_lp_sol =
-        dynamic_cast<linear_programming::cpu_lp_solution_t<int, double>*>(lp_solution_ptr.get());
-
-      if (!cpu_lp_sol) {
-        throw cuopt::logic_error("Expected CPU LP solution but got different type",
-                                 cuopt::error_type_t::RuntimeError);
-      }
-
-      // Release ownership and convert (move-based, zero-copy for std::vector)
-      lp_solution_ptr.release();
-      response.lp_ret       = std::move(*cpu_lp_sol).to_cpu_linear_programming_ret_t();
+      response.lp_ret       = std::move(*lp_solution_ptr).to_python_lp_ret();
       response.problem_type = linear_programming::problem_category_t::LP;
 
     } else {
@@ -311,17 +282,7 @@ std::unique_ptr<solver_ret_t> call_solve(
         std::unique_ptr<linear_programming::mip_solution_interface_t<int, double>>(
           call_solve_mip(&cpu_problem, solver_settings->get_mip_settings()));
 
-      auto* cpu_mip_sol =
-        dynamic_cast<linear_programming::cpu_mip_solution_t<int, double>*>(mip_solution_ptr.get());
-
-      if (!cpu_mip_sol) {
-        throw cuopt::logic_error("Expected CPU MIP solution but got different type",
-                                 cuopt::error_type_t::RuntimeError);
-      }
-
-      // Release ownership and convert (move-based, zero-copy for std::vector)
-      mip_solution_ptr.release();
-      response.mip_ret      = std::move(*cpu_mip_sol).to_cpu_mip_ret_t();
+      response.mip_ret      = std::move(*mip_solution_ptr).to_python_mip_ret();
       response.problem_type = linear_programming::problem_category_t::MIP;
     }
   }

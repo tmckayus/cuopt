@@ -37,15 +37,8 @@ bool force_gpu_memory()
 
 problem_backend_t get_backend_type()
 {
-  if (force_gpu_memory()) {
-    fprintf(stderr, "[cuOpt] CUOPT_USE_GPU_MEM=true - forcing GPU backend\n");
-    return problem_backend_t::GPU;
-  }
-  if (is_remote_execution_enabled()) {
-    fprintf(stderr, "[cuOpt] Remote execution enabled - using CPU backend\n");
-    return problem_backend_t::CPU;
-  }
-  fprintf(stderr, "[cuOpt] Using GPU backend\n");
+  if (force_gpu_memory()) { return problem_backend_t::GPU; }
+  if (is_remote_execution_enabled()) { return problem_backend_t::CPU; }
   return problem_backend_t::GPU;
 }
 

@@ -1338,17 +1338,7 @@ std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp(
   // Check if remote execution is enabled
   if (is_remote_execution_enabled()) {
     CUOPT_LOG_INFO("Remote LP solve requested");
-
-    // Try CPU problem first
-    auto* cpu_problem = dynamic_cast<cpu_optimization_problem_t<i_t, f_t>*>(problem_interface);
-    if (cpu_problem) { return solve_lp_remote(*cpu_problem, settings); }
-
-    // Try GPU problem
-    auto* gpu_problem = dynamic_cast<gpu_optimization_problem_t<i_t, f_t>*>(problem_interface);
-    if (gpu_problem) { return solve_lp_remote(*gpu_problem, settings); }
-
-    throw cuopt::logic_error("Unknown problem type for remote solving",
-                             cuopt::error_type_t::ValidationError);
+    return problem_interface->solve_lp_remote(settings);
   } else {
     // Local execution - convert to optimization_problem_t and call original solve_lp
     CUOPT_LOG_INFO("Local LP solve");
@@ -1384,17 +1374,7 @@ std::unique_ptr<mip_solution_interface_t<i_t, f_t>> solve_mip(
   // Check if remote execution is enabled
   if (is_remote_execution_enabled()) {
     CUOPT_LOG_INFO("Remote MIP solve requested");
-
-    // Try CPU problem first
-    auto* cpu_problem = dynamic_cast<cpu_optimization_problem_t<i_t, f_t>*>(problem_interface);
-    if (cpu_problem) { return solve_mip_remote(*cpu_problem, settings); }
-
-    // Try GPU problem
-    auto* gpu_problem = dynamic_cast<gpu_optimization_problem_t<i_t, f_t>*>(problem_interface);
-    if (gpu_problem) { return solve_mip_remote(*gpu_problem, settings); }
-
-    throw cuopt::logic_error("Unknown problem type for remote solving",
-                             cuopt::error_type_t::ValidationError);
+    return problem_interface->solve_mip_remote(settings);
   } else {
     // Local execution - convert to optimization_problem_t and call original solve_mip
     CUOPT_LOG_INFO("Local MIP solve");
