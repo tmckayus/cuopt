@@ -937,13 +937,9 @@ cuopt_int_t cuOptGetTerminationStatus(cuOptSolution solution, cuopt_int_t* termi
   if (termination_status_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
-  if (solution_and_stream_view->is_mip) {
-    *termination_status_ptr = static_cast<cuopt_int_t>(
-      solution_and_stream_view->mip_solution_interface_ptr->get_termination_status());
-  } else {
-    *termination_status_ptr = static_cast<cuopt_int_t>(
-      solution_and_stream_view->lp_solution_interface_ptr->get_termination_status());
-  }
+  // Use polymorphic get_termination_status_int() - works for both LP and MIP
+  *termination_status_ptr = static_cast<cuopt_int_t>(
+    solution_and_stream_view->get_solution()->get_termination_status_int());
   return CUOPT_SUCCESS;
 }
 
@@ -953,13 +949,9 @@ cuopt_int_t cuOptGetErrorStatus(cuOptSolution solution, cuopt_int_t* error_statu
   if (error_status_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
-  if (solution_and_stream_view->is_mip) {
-    *error_status_ptr = static_cast<cuopt_int_t>(
-      solution_and_stream_view->mip_solution_interface_ptr->get_error_status().get_error_type());
-  } else {
-    *error_status_ptr = static_cast<cuopt_int_t>(
-      solution_and_stream_view->lp_solution_interface_ptr->get_error_status().get_error_type());
-  }
+  // Use polymorphic get_error_status() - works for both LP and MIP
+  *error_status_ptr = static_cast<cuopt_int_t>(
+    solution_and_stream_view->get_solution()->get_error_status().get_error_type());
   return CUOPT_SUCCESS;
 }
 
@@ -971,15 +963,9 @@ cuopt_int_t cuOptGetErrorString(cuOptSolution solution,
   if (error_string_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
-  if (solution_and_stream_view->is_mip) {
-    std::string error_string =
-      solution_and_stream_view->mip_solution_interface_ptr->get_error_status().what();
-    std::snprintf(error_string_ptr, error_string_size, "%s", error_string.c_str());
-  } else {
-    std::string error_string =
-      solution_and_stream_view->lp_solution_interface_ptr->get_error_status().what();
-    std::snprintf(error_string_ptr, error_string_size, "%s", error_string.c_str());
-  }
+  // Use polymorphic get_error_status() - works for both LP and MIP
+  std::string error_string = solution_and_stream_view->get_solution()->get_error_status().what();
+  std::snprintf(error_string_ptr, error_string_size, "%s", error_string.c_str());
   return CUOPT_SUCCESS;
 }
 
@@ -990,20 +976,12 @@ cuopt_int_t cuOptGetPrimalSolution(cuOptSolution solution, cuopt_float_t* soluti
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
 
-  // Use interface methods to get solution data
-  // For GPU backend: access device memory directly
-  // For CPU backend: copy from host memory
-  if (solution_and_stream_view->is_mip) {
-    auto* mip_interface       = solution_and_stream_view->mip_solution_interface_ptr;
-    const auto& solution_host = mip_interface->get_solution_host();
-    std::memcpy(
-      solution_values_ptr, solution_host.data(), solution_host.size() * sizeof(cuopt_float_t));
-  } else {
-    auto* lp_interface        = solution_and_stream_view->lp_solution_interface_ptr;
-    const auto& solution_host = lp_interface->get_primal_solution_host();
-    std::memcpy(
-      solution_values_ptr, solution_host.data(), solution_host.size() * sizeof(cuopt_float_t));
-  }
+  // Use polymorphic get_solution_host() - works for both LP and MIP
+  // LP: returns primal solution (variable values)
+  // MIP: returns integer solution (variable values)
+  const auto& solution_host = solution_and_stream_view->get_solution()->get_solution_host();
+  std::memcpy(
+    solution_values_ptr, solution_host.data(), solution_host.size() * sizeof(cuopt_float_t));
   return CUOPT_SUCCESS;
 }
 
@@ -1013,13 +991,8 @@ cuopt_int_t cuOptGetObjectiveValue(cuOptSolution solution, cuopt_float_t* object
   if (objective_value_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
-  if (solution_and_stream_view->is_mip) {
-    *objective_value_ptr =
-      solution_and_stream_view->mip_solution_interface_ptr->get_objective_value();
-  } else {
-    *objective_value_ptr =
-      solution_and_stream_view->lp_solution_interface_ptr->get_objective_value();
-  }
+  // Use polymorphic get_objective_value() - works for both LP and MIP
+  *objective_value_ptr = solution_and_stream_view->get_solution()->get_objective_value();
   return CUOPT_SUCCESS;
 }
 
@@ -1029,11 +1002,8 @@ cuopt_int_t cuOptGetSolveTime(cuOptSolution solution, cuopt_float_t* solve_time_
   if (solve_time_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
-  if (solution_and_stream_view->is_mip) {
-    *solve_time_ptr = solution_and_stream_view->mip_solution_interface_ptr->get_solve_time();
-  } else {
-    *solve_time_ptr = solution_and_stream_view->lp_solution_interface_ptr->get_solve_time();
-  }
+  // Use polymorphic get_solve_time() - works for both LP and MIP
+  *solve_time_ptr = solution_and_stream_view->get_solution()->get_solve_time();
   return CUOPT_SUCCESS;
 }
 
@@ -1043,12 +1013,13 @@ cuopt_int_t cuOptGetMIPGap(cuOptSolution solution, cuopt_float_t* mip_gap_ptr)
   if (mip_gap_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
-  if (solution_and_stream_view->is_mip) {
-    *mip_gap_ptr = solution_and_stream_view->mip_solution_interface_ptr->get_mip_gap();
-  } else {
+  try {
+    // Polymorphic call - throws std::logic_error if called on LP solution
+    *mip_gap_ptr = solution_and_stream_view->get_solution()->get_mip_gap();
+    return CUOPT_SUCCESS;
+  } catch (const std::logic_error&) {
     return CUOPT_INVALID_ARGUMENT;
   }
-  return CUOPT_SUCCESS;
 }
 
 cuopt_int_t cuOptGetSolutionBound(cuOptSolution solution, cuopt_float_t* solution_bound_ptr)
@@ -1057,13 +1028,13 @@ cuopt_int_t cuOptGetSolutionBound(cuOptSolution solution, cuopt_float_t* solutio
   if (solution_bound_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
-  if (solution_and_stream_view->is_mip) {
-    *solution_bound_ptr =
-      solution_and_stream_view->mip_solution_interface_ptr->get_solution_bound();
-  } else {
+  try {
+    // Polymorphic call - throws std::logic_error if called on LP solution
+    *solution_bound_ptr = solution_and_stream_view->get_solution()->get_solution_bound();
+    return CUOPT_SUCCESS;
+  } catch (const std::logic_error&) {
     return CUOPT_INVALID_ARGUMENT;
   }
-  return CUOPT_SUCCESS;
 }
 
 cuopt_int_t cuOptGetDualSolution(cuOptSolution solution, cuopt_float_t* dual_solution_ptr)
@@ -1072,14 +1043,13 @@ cuopt_int_t cuOptGetDualSolution(cuOptSolution solution, cuopt_float_t* dual_sol
   if (dual_solution_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
-  if (solution_and_stream_view->is_mip) {
-    return CUOPT_INVALID_ARGUMENT;
-  } else {
-    // Use interface to get dual solution (works for both GPU and CPU)
-    auto* lp_interface    = solution_and_stream_view->lp_solution_interface_ptr;
-    const auto& dual_host = lp_interface->get_dual_solution_host();
+  try {
+    // Polymorphic call - throws std::logic_error if called on MIP solution
+    const auto& dual_host = solution_and_stream_view->get_solution()->get_dual_solution();
     std::memcpy(dual_solution_ptr, dual_host.data(), dual_host.size() * sizeof(cuopt_float_t));
     return CUOPT_SUCCESS;
+  } catch (const std::logic_error&) {
+    return CUOPT_INVALID_ARGUMENT;
   }
 }
 
@@ -1090,12 +1060,13 @@ cuopt_int_t cuOptGetDualObjectiveValue(cuOptSolution solution,
   if (dual_objective_value_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
-  if (solution_and_stream_view->is_mip) {
-    return CUOPT_INVALID_ARGUMENT;
-  } else {
+  try {
+    // Polymorphic call - throws std::logic_error if called on MIP solution
     *dual_objective_value_ptr =
-      solution_and_stream_view->lp_solution_interface_ptr->get_dual_objective_value();
+      solution_and_stream_view->get_solution()->get_dual_objective_value();
     return CUOPT_SUCCESS;
+  } catch (const std::logic_error&) {
+    return CUOPT_INVALID_ARGUMENT;
   }
 }
 
@@ -1105,14 +1076,13 @@ cuopt_int_t cuOptGetReducedCosts(cuOptSolution solution, cuopt_float_t* reduced_
   if (reduced_cost_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
-  if (solution_and_stream_view->is_mip) {
-    return CUOPT_INVALID_ARGUMENT;
-  } else {
-    // Use interface to get reduced costs (works for both GPU and CPU)
-    auto* lp_interface            = solution_and_stream_view->lp_solution_interface_ptr;
-    const auto& reduced_cost_host = lp_interface->get_reduced_cost_host();
+  try {
+    // Polymorphic call - throws std::logic_error if called on MIP solution
+    const auto& reduced_cost_host = solution_and_stream_view->get_solution()->get_reduced_costs();
     std::memcpy(
       reduced_cost_ptr, reduced_cost_host.data(), reduced_cost_host.size() * sizeof(cuopt_float_t));
     return CUOPT_SUCCESS;
+  } catch (const std::logic_error&) {
+    return CUOPT_INVALID_ARGUMENT;
   }
 }

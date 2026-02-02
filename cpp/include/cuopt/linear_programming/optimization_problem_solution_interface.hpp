@@ -18,6 +18,7 @@
 
 #include <cuopt/linear_programming/utilities/cython_types.hpp>
 
+#include <stdexcept>
 #include <string>
 #include <variant>
 #include <vector>
@@ -62,6 +63,73 @@ class optimization_problem_solution_interface_t {
    * @return Time in seconds
    */
   virtual double get_solve_time() const = 0;
+
+  /**
+   * @brief Get solution (variable values) as host vector
+   * @return Host vector of variable values
+   * @note For LP solutions, this returns the primal solution.
+   *       For MIP solutions, this returns the integer solution.
+   *       Provides uniform access to variable values regardless of problem type.
+   */
+  virtual const std::vector<f_t>& get_solution_host() const = 0;
+
+  /**
+   * @brief Get termination status as integer
+   * @return Termination status cast to int
+   * @note Provides uniform access to termination status regardless of problem type.
+   *       LP returns pdlp_termination_status_t cast to int.
+   *       MIP returns mip_termination_status_t cast to int.
+   *       Both use the same CUOPT_TERMINATION_STATUS_* integer constants.
+   */
+  virtual int get_termination_status_int() const = 0;
+
+  // ============================================================================
+  // Cross-type methods: These allow polymorphic access from C API.
+  // Each method throws std::logic_error if called on the wrong solution type.
+  // ============================================================================
+
+  /**
+   * @brief Get objective value (unified interface)
+   * @return Objective value
+   * @note LP: Returns primal objective (id=0). MIP: Returns best objective.
+   * @throws std::logic_error Never (implemented by both types)
+   */
+  virtual f_t get_objective_value() const = 0;
+
+  /**
+   * @brief Get MIP gap (MIP-only)
+   * @return MIP gap
+   * @throws std::logic_error if called on LP solution
+   */
+  virtual f_t get_mip_gap() const = 0;
+
+  /**
+   * @brief Get solution bound (MIP-only)
+   * @return Solution bound
+   * @throws std::logic_error if called on LP solution
+   */
+  virtual f_t get_solution_bound() const = 0;
+
+  /**
+   * @brief Get dual solution as host vector (LP-only)
+   * @return Host vector of dual solution
+   * @throws std::logic_error if called on MIP solution
+   */
+  virtual const std::vector<f_t>& get_dual_solution() const = 0;
+
+  /**
+   * @brief Get dual objective value (LP-only)
+   * @return Dual objective value
+   * @throws std::logic_error if called on MIP solution
+   */
+  virtual f_t get_dual_objective_value() const = 0;
+
+  /**
+   * @brief Get reduced costs as host vector (LP-only)
+   * @return Host vector of reduced costs
+   * @throws std::logic_error if called on MIP solution
+   */
+  virtual const std::vector<f_t>& get_reduced_costs() const = 0;
 };
 
 /**
@@ -95,6 +163,64 @@ class lp_solution_interface_t : public optimization_problem_solution_interface_t
    * @return Host vector of primal solution
    */
   virtual const std::vector<f_t>& get_primal_solution_host() const = 0;
+
+  /**
+   * @brief Get solution as host vector (wraps get_primal_solution_host)
+   * @return Host vector of variable values
+   * @note For LP, this returns the primal solution (variable values).
+   *       Provides interface parallelism with mip_solution_interface_t.
+   */
+  const std::vector<f_t>& get_solution_host() const override { return get_primal_solution_host(); }
+
+  // ============================================================================
+  // Base interface implementations for cross-type polymorphic access
+  // ============================================================================
+
+  /**
+   * @brief Get objective value (base interface implementation)
+   * Delegates to get_objective_value(0) for LP
+   */
+  f_t get_objective_value() const override { return get_objective_value(0); }
+
+  /**
+   * @brief MIP gap - not available for LP solutions
+   * @throws std::logic_error always
+   */
+  f_t get_mip_gap() const override
+  {
+    throw std::logic_error("get_mip_gap() is not available for LP solutions");
+  }
+
+  /**
+   * @brief Solution bound - not available for LP solutions
+   * @throws std::logic_error always
+   */
+  f_t get_solution_bound() const override
+  {
+    throw std::logic_error("get_solution_bound() is not available for LP solutions");
+  }
+
+  /**
+   * @brief Get dual solution (base interface implementation)
+   * Delegates to get_dual_solution_host()
+   */
+  const std::vector<f_t>& get_dual_solution() const override { return get_dual_solution_host(); }
+
+  /**
+   * @brief Get dual objective value (base interface implementation)
+   * Delegates to get_dual_objective_value(0)
+   */
+  f_t get_dual_objective_value() const override { return get_dual_objective_value(0); }
+
+  /**
+   * @brief Get reduced costs (base interface implementation)
+   * Delegates to get_reduced_cost_host()
+   */
+  const std::vector<f_t>& get_reduced_costs() const override { return get_reduced_cost_host(); }
+
+  // ============================================================================
+  // LP-specific methods
+  // ============================================================================
 
   /**
    * @brief Get dual solution as host vector
@@ -131,6 +257,15 @@ class lp_solution_interface_t : public optimization_problem_solution_interface_t
    * @return Termination status
    */
   virtual pdlp_termination_status_t get_termination_status(i_t id = 0) const = 0;
+
+  /**
+   * @brief Get termination status as integer (implements base interface)
+   * @return pdlp_termination_status_t cast to int
+   */
+  int get_termination_status_int() const override
+  {
+    return static_cast<int>(get_termination_status());
+  }
 
   /**
    * @brief Get L2 primal residual
@@ -224,6 +359,42 @@ class mip_solution_interface_t : public optimization_problem_solution_interface_
  public:
   bool is_mip() const override { return true; }
 
+  // ============================================================================
+  // Base interface implementations for cross-type polymorphic access
+  // LP-only methods throw exceptions when called on MIP solutions
+  // ============================================================================
+
+  /**
+   * @brief Dual solution - not available for MIP solutions
+   * @throws std::logic_error always
+   */
+  const std::vector<f_t>& get_dual_solution() const override
+  {
+    throw std::logic_error("get_dual_solution() is not available for MIP solutions");
+  }
+
+  /**
+   * @brief Dual objective value - not available for MIP solutions
+   * @throws std::logic_error always
+   */
+  f_t get_dual_objective_value() const override
+  {
+    throw std::logic_error("get_dual_objective_value() is not available for MIP solutions");
+  }
+
+  /**
+   * @brief Reduced costs - not available for MIP solutions
+   * @throws std::logic_error always
+   */
+  const std::vector<f_t>& get_reduced_costs() const override
+  {
+    throw std::logic_error("get_reduced_costs() is not available for MIP solutions");
+  }
+
+  // ============================================================================
+  // MIP-specific methods
+  // ============================================================================
+
   /**
    * @brief Get the solution size
    * @return Number of variables
@@ -265,6 +436,15 @@ class mip_solution_interface_t : public optimization_problem_solution_interface_
    * @return Termination status
    */
   virtual mip_termination_status_t get_termination_status() const = 0;
+
+  /**
+   * @brief Get termination status as integer (implements base interface)
+   * @return mip_termination_status_t cast to int
+   */
+  int get_termination_status_int() const override
+  {
+    return static_cast<int>(get_termination_status());
+  }
 
   /**
    * @brief Get presolve time

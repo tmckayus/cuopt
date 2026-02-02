@@ -87,6 +87,20 @@ struct solution_and_stream_view_t {
     if (lp_solution_interface_ptr) delete lp_solution_interface_ptr;
   }
 
+  /**
+   * @brief Get the solution as base interface pointer
+   * @return Base interface pointer for polymorphic access to common methods
+   * @note Allows uniform access to get_solution_host(), get_error_status(), get_solve_time()
+   */
+  optimization_problem_solution_interface_t<cuopt_int_t, cuopt_float_t>* get_solution()
+  {
+    return is_mip
+             ? static_cast<optimization_problem_solution_interface_t<cuopt_int_t, cuopt_float_t>*>(
+                 mip_solution_interface_ptr)
+             : static_cast<optimization_problem_solution_interface_t<cuopt_int_t, cuopt_float_t>*>(
+                 lp_solution_interface_ptr);
+  }
+
   bool is_mip;
   mip_solution_interface_t<cuopt_int_t, cuopt_float_t>* mip_solution_interface_ptr;
   lp_solution_interface_t<cuopt_int_t, cuopt_float_t>* lp_solution_interface_ptr;
