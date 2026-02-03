@@ -1,0 +1,252 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package cuopt.remote;
+
+// Import the existing message definitions
+import "cuopt_remote.proto";
+
+// =============================================================================
+// gRPC Service Definition
+// =============================================================================
+
+service CuOptRemoteService {
+  // -------------------------
+  // Async Job Management
+  // -------------------------
+
+  // Submit a new LP or MIP solve job (returns immediately with job_id)
+  rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
+
+  // Upload a serialized SolveLPRequest / SolveMIPRequest payload in chunks (streaming),
+  // then submit it as a job.
+  //
+  // This avoids gRPC unary message size limits and allows resumable uploads via
+  // explicit offsets/acks (client can reconnect and continue from committed_size).
+  rpc UploadAndSubmit(stream UploadJobRequest) returns (stream UploadJobResponse);
+
+  // Check the status of a submitted job
+  rpc CheckStatus(StatusRequest) returns (StatusResponse);
+
+  // Get the result of a completed job
+  rpc GetResult(GetResultRequest) returns (ResultResponse);
+
+  // Stream the result of a completed job in chunks (effectively unlimited total size).
+  // Each chunk message must still fit within gRPC per-message limits.
+  rpc StreamResult(GetResultRequest) returns (stream ResultChunk);
+
+  // Delete a result from server memory
+  rpc DeleteResult(DeleteRequest) returns (DeleteResponse);
+
+  // Cancel a queued or running job
+  rpc CancelJob(CancelRequest) returns (CancelResponse);
+
+  // Wait for a job to complete (blocking, returns status only - use GetResult for solution)
+  rpc WaitForCompletion(WaitRequest) returns (WaitResponse);
+
+  // -------------------------
+  // Log Streaming
+  // -------------------------
+
+  // Stream log messages as they are produced (server-side streaming)
+  // Client receives log lines in real-time until job completes or stream is cancelled
+  rpc StreamLogs(StreamLogsRequest) returns (stream LogMessage);
+
+  // -------------------------
+  // Incumbent Solutions
+  // -------------------------
+
+  // Get any available incumbent solutions since a given index.
+  rpc GetIncumbents(IncumbentRequest) returns (IncumbentResponse);
+
+  // -------------------------
+  // Synchronous Operations
+  // -------------------------
+
+  // (SolveSync removed - use SubmitJob + WaitForResult (+ StreamLogs/CancelJob) instead)
+}
+
+// =============================================================================
+// Request Messages
+// =============================================================================
+
+// Request to submit a new job
+message SubmitJobRequest {
+  oneof job_data {
+    SolveLPRequest lp_request = 1;
+    SolveMIPRequest mip_request = 2;
+  }
+}
+
+// Response when job is submitted
+message SubmitJobResponse {
+  string job_id = 1;           // Unique job identifier
+  string message = 2;          // Optional message
+}
+
+// =============================================================================
+// Streaming Upload (Chunked)
+// =============================================================================
+
+message UploadStart {
+  // Client-provided ID to support resume. If empty, server will generate one.
+  string upload_id = 1;
+
+  // Payload problem type (LP or MIP).
+  ProblemType problem_type = 2;
+
+  // If true, server will attempt to resume an existing upload_id (append).
+  bool resume = 3;
+
+  // Optional total payload size hint (bytes). Can be 0 if unknown.
+  int64 total_size = 4;
+}
+
+message UploadChunk {
+  // Must match upload_id from UploadStart.
+  string upload_id = 1;
+
+  // Byte offset of this chunk in the overall payload. Server currently requires
+  // strictly sequential appends: offset must equal the server's committed_size.
+  int64 offset = 2;
+
+  // Raw bytes of the serialized SolveLPRequest / SolveMIPRequest.
+  bytes data = 3;
+}
+
+message UploadFinish {
+  // Must match upload_id from UploadStart.
+  string upload_id = 1;
+}
+
+message UploadJobRequest {
+  oneof msg {
+    UploadStart start = 1;
+    UploadChunk chunk = 2;
+    UploadFinish finish = 3;
+  }
+}
+
+message UploadAck {
+  string upload_id = 1;
+  int64 committed_size = 2;
+  int64 max_message_bytes = 3;  // Server gRPC max message size (-1 = unlimited)
+}
+
+message UploadError {
+  string upload_id = 1;
+  string message = 2;
+  int64 committed_size = 3;
+  int64 max_message_bytes = 4;  // Server gRPC max message size (-1 = unlimited)
+}
+
+message UploadJobResponse {
+  oneof msg {
+    UploadAck ack = 1;
+    SubmitJobResponse submit = 2;
+    UploadError error = 3;
+  }
+}
+
+// Request to check job status
+message StatusRequest {
+  string job_id = 1;
+}
+
+// Request to get result
+message GetResultRequest {
+  string job_id = 1;
+}
+
+// Chunked result payload (raw serialized solution bytes).
+// Client reassembles all chunks (by offset) and then parses as:
+// - cuopt.remote.LPSolution (if LP) OR cuopt.remote.MIPSolution (if MIP)
+message ResultChunk {
+  string job_id = 1;
+  int64 offset = 2;
+  bytes data = 3;
+  bool done = 4;
+  string error_message = 5;
+}
+
+// Request to delete result
+message DeleteRequest {
+  string job_id = 1;
+}
+
+// DeleteResponse is defined in cuopt_remote.proto (imported above)
+
+// Request to cancel job
+message CancelRequest {
+  string job_id = 1;
+}
+
+// CancelResponse is defined in cuopt_remote.proto (imported above)
+
+// Request to wait for completion (blocking)
+message WaitRequest {
+  string job_id = 1;
+}
+
+// Response for wait (status only, no solution - use GetResult afterward)
+message WaitResponse {
+  JobStatus job_status = 1;
+  string message = 2;
+  int64 result_size_bytes = 3;  // Size of result payload when COMPLETED
+}
+
+// Request to stream logs
+message StreamLogsRequest {
+  string job_id = 1;
+  int64 from_byte = 2;         // Optional: start from this byte offset
+}
+
+// Individual log message (streamed)
+message LogMessage {
+  string line = 1;             // Single log line
+  int64 byte_offset = 2;       // Byte offset of this line in log file
+  bool job_complete = 3;       // True if this is the last message (job done)
+}
+
+// =============================================================================
+// Incumbent Solutions
+// =============================================================================
+
+message IncumbentRequest {
+  bytes job_id = 1;
+  int64 from_index = 2;        // Return incumbents starting from this index
+  int32 max_count = 3;         // Optional limit (0 or negative => no limit)
+}
+
+message Incumbent {
+  int64 index = 1;
+  double objective = 2;
+  repeated double assignment = 3;
+  bytes job_id = 4;
+}
+
+message IncumbentResponse {
+  repeated Incumbent incumbents = 1;
+  int64 next_index = 2;        // Next index the client should request
+  bool job_complete = 3;       // True if job is complete (no more incumbents)
+}
+
+// =============================================================================
+// Notes on gRPC Status Codes
+// =============================================================================
+//
+// gRPC uses standard status codes instead of custom ResponseStatus enum:
+//   OK (0) - Success
+//   CANCELLED (1) - Operation was cancelled
+//   UNKNOWN (2) - Unknown error
+//   INVALID_ARGUMENT (3) - Invalid request
+//   DEADLINE_EXCEEDED (4) - Timeout
+//   NOT_FOUND (5) - Job ID not found
+//   ALREADY_EXISTS (6) - Job already exists
+//   RESOURCE_EXHAUSTED (8) - Queue full, out of memory, etc.
+//   INTERNAL (13) - Internal server error
+//   UNAVAILABLE (14) - Server unavailable
+//
+// Errors are returned via gRPC Status with a message, not in response message.

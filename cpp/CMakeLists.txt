@@ -255,6 +255,92 @@ create_logger_macros(CUOPT "cuopt::default_logger()" include/cuopt)
 
 find_package(CUDSS REQUIRED)
 
+# ##################################################################################################
+# - gRPC and Protobuf setup (REQUIRED) ------------------------------------------------------------
+
+# gRPC is required for this branch - it provides remote execution features
+# gRPC can come from either:
+# - an installed CMake package (gRPCConfig.cmake), or
+# - an in-tree build (e.g. python/libcuopt uses FetchContent(grpc), which defines gRPC::grpc++).
+if(NOT TARGET gRPC::grpc++)
+  find_package(gRPC CONFIG REQUIRED)
+endif()
+
+# Find Protobuf (should come with gRPC, but verify)
+if(NOT TARGET protobuf::libprotobuf)
+  find_package(protobuf CONFIG REQUIRED)
+endif()
+
+set(CUOPT_ENABLE_GRPC ON)
+add_compile_definitions(CUOPT_ENABLE_GRPC)
+message(STATUS "gRPC enabled (target gRPC::grpc++ is available)")
+
+# Find protoc compiler (provided by config package or target)
+if(TARGET protobuf::protoc)
+  get_target_property(_PROTOBUF_PROTOC protobuf::protoc IMPORTED_LOCATION_RELEASE)
+  if(NOT _PROTOBUF_PROTOC)
+    get_target_property(_PROTOBUF_PROTOC protobuf::protoc IMPORTED_LOCATION)
+  endif()
+else()
+  find_package(protobuf CONFIG REQUIRED)
+  get_target_property(_PROTOBUF_PROTOC protobuf::protoc IMPORTED_LOCATION_RELEASE)
+  if(NOT _PROTOBUF_PROTOC)
+    get_target_property(_PROTOBUF_PROTOC protobuf::protoc IMPORTED_LOCATION)
+  endif()
+endif()
+
+if(NOT _PROTOBUF_PROTOC)
+  message(FATAL_ERROR "protoc not found (Protobuf_PROTOC_EXECUTABLE is empty)")
+endif()
+
+# Find grpc_cpp_plugin
+if(TARGET grpc_cpp_plugin)
+  set(_GRPC_CPP_PLUGIN_EXECUTABLE "$<TARGET_FILE:grpc_cpp_plugin>")
+else()
+  find_program(_GRPC_CPP_PLUGIN_EXECUTABLE grpc_cpp_plugin)
+  if(NOT _GRPC_CPP_PLUGIN_EXECUTABLE)
+    message(FATAL_ERROR "grpc_cpp_plugin not found")
+  endif()
+endif()
+
+# Generate C++ code from cuopt_remote.proto (base message definitions)
+set(PROTO_FILE "${CMAKE_CURRENT_SOURCE_DIR}/src/linear_programming/utilities/cuopt_remote.proto")
+set(PROTO_SRCS "${CMAKE_CURRENT_BINARY_DIR}/cuopt_remote.pb.cc")
+set(PROTO_HDRS "${CMAKE_CURRENT_BINARY_DIR}/cuopt_remote.pb.h")
+
+add_custom_command(
+  OUTPUT "${PROTO_SRCS}" "${PROTO_HDRS}"
+  COMMAND ${_PROTOBUF_PROTOC}
+  ARGS --cpp_out ${CMAKE_CURRENT_BINARY_DIR}
+       --proto_path ${CMAKE_CURRENT_SOURCE_DIR}/src/linear_programming/utilities
+       ${PROTO_FILE}
+  DEPENDS ${PROTO_FILE}
+  COMMENT "Generating C++ code from cuopt_remote.proto"
+  VERBATIM
+)
+
+# Generate gRPC service code from cuopt_remote_service.proto
+set(GRPC_PROTO_FILE "${CMAKE_CURRENT_SOURCE_DIR}/src/linear_programming/utilities/cuopt_remote_service.proto")
+set(GRPC_PROTO_SRCS "${CMAKE_CURRENT_BINARY_DIR}/cuopt_remote_service.pb.cc")
+set(GRPC_PROTO_HDRS "${CMAKE_CURRENT_BINARY_DIR}/cuopt_remote_service.pb.h")
+set(GRPC_SERVICE_SRCS "${CMAKE_CURRENT_BINARY_DIR}/cuopt_remote_service.grpc.pb.cc")
+set(GRPC_SERVICE_HDRS "${CMAKE_CURRENT_BINARY_DIR}/cuopt_remote_service.grpc.pb.h")
+
+add_custom_command(
+  OUTPUT "${GRPC_PROTO_SRCS}" "${GRPC_PROTO_HDRS}" "${GRPC_SERVICE_SRCS}" "${GRPC_SERVICE_HDRS}"
+  COMMAND ${_PROTOBUF_PROTOC}
+  ARGS --cpp_out ${CMAKE_CURRENT_BINARY_DIR}
+       --grpc_out ${CMAKE_CURRENT_BINARY_DIR}
+       --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN_EXECUTABLE}
+       --proto_path ${CMAKE_CURRENT_SOURCE_DIR}/src/linear_programming/utilities
+       ${GRPC_PROTO_FILE}
+  DEPENDS ${GRPC_PROTO_FILE} ${PROTO_FILE}
+  COMMENT "Generating gRPC C++ code from cuopt_remote_service.proto"
+  VERBATIM
+)
+
+message(STATUS "gRPC protobuf code generation configured")
+
 if(BUILD_TESTS)
   include(cmake/thirdparty/get_gtest.cmake)
 endif()
@@ -264,6 +350,19 @@ add_subdirectory(src)
 if (HOST_LINEINFO)
   set_source_files_properties(${CUOPT_SRC_FILES} DIRECTORY ${CMAKE_SOURCE_DIR} PROPERTIES COMPILE_OPTIONS "-g1")
 endif()
+
+# Add gRPC mapper files and generated protobuf sources
+list(APPEND CUOPT_SRC_FILES
+  ${PROTO_SRCS}
+  ${GRPC_PROTO_SRCS}
+  ${GRPC_SERVICE_SRCS}
+  src/linear_programming/utilities/grpc_problem_mapper.cu
+  src/linear_programming/utilities/grpc_solution_mapper.cu
+  src/linear_programming/utilities/grpc_settings_mapper.cu
+  src/linear_programming/utilities/grpc_service_mapper.cu
+  src/linear_programming/utilities/grpc_client.cu
+)
+
 add_library(cuopt SHARED
   ${CUOPT_SRC_FILES}
 )
@@ -315,6 +414,7 @@ target_include_directories(cuopt
   PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty"
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  "${CMAKE_CURRENT_BINARY_DIR}"
   "${CUDSS_INCLUDE}"
   PUBLIC
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
@@ -384,6 +484,8 @@ target_link_libraries(cuopt
   ${CUDSS_LIB_FILE}
   PRIVATE
   ${CUOPT_PRIVATE_CUDA_LIBS}
+  protobuf::libprotobuf
+  gRPC::grpc++
   )
 
 
@@ -589,6 +691,95 @@ if(BUILD_LP_BENCHMARKS)
     target_link_options(solve_LP PRIVATE -Wl,--enable-new-dtags)
   endif()
 endif()
+
+# ##################################################################################################
+# - cuopt_grpc_server - gRPC-based remote server --------------------------------------------------
+
+add_executable(cuopt_grpc_server cuopt_grpc_server.cpp)
+
+set_target_properties(cuopt_grpc_server
+  PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  CXX_SCAN_FOR_MODULES OFF
+)
+
+target_compile_options(cuopt_grpc_server
+  PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>"
+)
+
+target_include_directories(cuopt_grpc_server
+  PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/libmps_parser/include"
+  "${CMAKE_CURRENT_BINARY_DIR}"
+  PUBLIC
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>"
+)
+
+target_link_libraries(cuopt_grpc_server
+  PUBLIC
+  cuopt
+  OpenMP::OpenMP_CXX
+  PRIVATE
+  protobuf::libprotobuf
+  gRPC::grpc++
+)
+
+# Use RUNPATH when building locally
+target_link_options(cuopt_grpc_server PRIVATE -Wl,--enable-new-dtags)
+set_property(TARGET cuopt_grpc_server PROPERTY INSTALL_RPATH "$ORIGIN/../${lib_dir}")
+
+# Install the grpc server executable
+install(TARGETS cuopt_grpc_server
+  COMPONENT runtime
+  RUNTIME DESTINATION ${_BIN_DEST}
+)
+
+message(STATUS "Building cuopt_grpc_server (gRPC-based remote solve server)")
+
+# ##################################################################################################
+# - test_grpc_client - Simple test client for cuopt_grpc_server -----------------------------------
+
+add_executable(test_grpc_client test_grpc_client.cpp)
+
+set_target_properties(test_grpc_client
+  PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  CXX_SCAN_FOR_MODULES OFF
+)
+
+target_compile_options(test_grpc_client
+  PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>"
+)
+
+target_include_directories(test_grpc_client
+  PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/libmps_parser/include"
+  "${CMAKE_CURRENT_BINARY_DIR}"
+  PUBLIC
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>"
+)
+
+target_link_libraries(test_grpc_client
+  PUBLIC
+  cuopt
+  PRIVATE
+  protobuf::libprotobuf
+  gRPC::grpc++
+)
+
+# Use RUNPATH when building locally
+target_link_options(test_grpc_client PRIVATE -Wl,--enable-new-dtags)
+set_property(TARGET test_grpc_client PROPERTY INSTALL_RPATH "$ORIGIN/../${lib_dir}")
+
+message(STATUS "Building test_grpc_client (simple gRPC client for testing)")
 
 
 # ##################################################################################################
