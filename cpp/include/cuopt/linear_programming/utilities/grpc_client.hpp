@@ -50,6 +50,10 @@ struct grpc_client_config_t {
   bool stream_logs           = false;  // Whether to stream logs from server
   std::function<void(const std::string&)> log_callback = nullptr;  // Called for each log line
 
+  // Debug log callback - receives internal client debug messages (for test verification)
+  // This is separate from log_callback which receives solver logs from the server
+  std::function<void(const std::string&)> debug_log_callback = nullptr;
+
   // Incumbent callback for MIP solves (called when new incumbent found)
   // Parameters: index, objective value, solution vector
   // Return false to cancel the solve
@@ -70,8 +74,22 @@ struct grpc_client_config_t {
   int64_t chunk_size_bytes = 1LL * 1024 * 1024;
   // Number of upload retry attempts with reduced chunk size on failure
   int max_upload_retries = 2;
-  // Stream upload timeout in milliseconds (per-upload, not per-chunk)
+  // Stream upload timeout in milliseconds (per-upload, not per-chunk) - DEPRECATED
+  // Use chunk_timeout_seconds instead for per-message timeouts
   int upload_timeout_ms = 300000;  // 5 minutes default
+
+  // Per-chunk/message timeout in seconds for streaming operations
+  // If no chunk, ack, or other message is received within this time, the stream is cancelled.
+  // This prevents hanging when a peer stops responding mid-transfer.
+  // Set to 0 to disable per-chunk timeouts (not recommended).
+  int chunk_timeout_seconds = 60;  // 60 seconds default
+
+  // Enable data integrity hash logging for streaming transfers (for testing/debugging)
+  // When enabled, computes FNV-1a hash of transferred data and logs it.
+  // Compare client upload hash with server received hash (and vice versa for downloads)
+  // to verify data integrity after reassembly from chunks.
+  // Default: false (disabled in production to avoid overhead on large transfers)
+  bool enable_transfer_hash = false;
 };
 
 /**

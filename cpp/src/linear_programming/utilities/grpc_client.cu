@@ -16,10 +16,15 @@
 #include <grpcpp/grpcpp.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <limits>
+#include <mutex>
+#include <sstream>
+#include <thread>
 
 namespace cuopt::linear_programming {
 
@@ -28,6 +33,156 @@ namespace cuopt::linear_programming {
 // =============================================================================
 
 constexpr int64_t kMinChunkSize = 4 * 1024;  // 4 KiB minimum chunk
+
+// =============================================================================
+// Data Integrity - Simple Hash for Transfer Verification
+// =============================================================================
+
+/**
+ * @brief Compute FNV-1a 64-bit hash for data integrity verification.
+ *
+ * This is a fast, non-cryptographic hash suitable for detecting data corruption
+ * during streaming transfers. The hash is logged by both client and server to
+ * allow verification that transferred data matches.
+ *
+ * @param data Pointer to data buffer
+ * @param size Size of data in bytes
+ * @return 64-bit hash value (logged as hex string)
+ */
+inline uint64_t compute_data_hash(const uint8_t* data, size_t size)
+{
+  // FNV-1a 64-bit hash constants
+  constexpr uint64_t FNV_OFFSET_BASIS = 14695981039346656037ULL;
+  constexpr uint64_t FNV_PRIME        = 1099511628211ULL;
+
+  uint64_t hash = FNV_OFFSET_BASIS;
+  for (size_t i = 0; i < size; ++i) {
+    hash ^= static_cast<uint64_t>(data[i]);
+    hash *= FNV_PRIME;
+  }
+  return hash;
+}
+
+/**
+ * @brief Format hash as hex string for logging.
+ */
+inline std::string hash_to_hex(uint64_t hash)
+{
+  std::ostringstream oss;
+  oss << std::hex << std::setfill('0') << std::setw(16) << hash;
+  return oss.str();
+}
+
+// =============================================================================
+// Stream Watchdog - Timeout Detection for Streaming Operations
+// =============================================================================
+
+/**
+ * @brief RAII watchdog that cancels a gRPC context if no activity occurs within timeout.
+ *
+ * Usage:
+ *   grpc::ClientContext context;
+ *   StreamWatchdog watchdog(&context, timeout_seconds);
+ *
+ *   while (stream->Read(&msg)) {
+ *     watchdog.activity();  // Reset timeout on each message
+ *     // ... process message ...
+ *   }
+ *
+ *   if (watchdog.timed_out()) {
+ *     // Handle timeout
+ *   }
+ *   // Watchdog automatically stops on destruction
+ */
+class StreamWatchdog {
+ public:
+  /**
+   * @brief Create a watchdog that monitors for activity timeouts.
+   * @param context gRPC context to cancel on timeout (can be nullptr to disable)
+   * @param timeout_seconds Seconds of inactivity before timeout (0 = disabled)
+   */
+  StreamWatchdog(grpc::ClientContext* context, int timeout_seconds)
+    : context_(context),
+      timeout_seconds_(timeout_seconds),
+      last_activity_(std::chrono::steady_clock::now()),
+      timed_out_(false),
+      stop_(false)
+  {
+    if (context_ && timeout_seconds_ > 0) {
+      watchdog_thread_ = std::thread([this]() { run(); });
+    }
+  }
+
+  ~StreamWatchdog() { stop(); }
+
+  // Non-copyable, non-movable
+  StreamWatchdog(const StreamWatchdog&)            = delete;
+  StreamWatchdog& operator=(const StreamWatchdog&) = delete;
+
+  /// Call this on each message received/sent to reset the timeout
+  void activity()
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    last_activity_ = std::chrono::steady_clock::now();
+  }
+
+  /// Check if timeout occurred
+  bool timed_out() const { return timed_out_.load(); }
+
+  /// Stop the watchdog (called automatically on destruction)
+  void stop()
+  {
+    stop_.store(true);
+    if (watchdog_thread_.joinable()) { watchdog_thread_.join(); }
+  }
+
+ private:
+  void run()
+  {
+    while (!stop_.load()) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+
+      if (stop_.load()) break;
+
+      std::chrono::steady_clock::time_point last;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last = last_activity_;
+      }
+
+      auto now     = std::chrono::steady_clock::now();
+      auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last).count();
+
+      if (elapsed >= timeout_seconds_) {
+        timed_out_.store(true);
+        if (context_) { context_->TryCancel(); }
+        break;
+      }
+    }
+  }
+
+  grpc::ClientContext* context_;
+  int timeout_seconds_;
+  std::chrono::steady_clock::time_point last_activity_;
+  std::atomic<bool> timed_out_;
+  std::atomic<bool> stop_;
+  std::mutex mutex_;
+  std::thread watchdog_thread_;
+};
+
+// =============================================================================
+// Debug Logging Helper
+// =============================================================================
+
+// Helper macro to log to debug callback if configured, otherwise to std::cerr
+#define GRPC_CLIENT_DEBUG_LOG(config, msg)                                      \
+  do {                                                                          \
+    std::ostringstream _oss;                                                    \
+    _oss << msg;                                                                \
+    std::string _msg_str = _oss.str();                                          \
+    if ((config).debug_log_callback) { (config).debug_log_callback(_msg_str); } \
+    std::cerr << _msg_str << "\n";                                              \
+  } while (0)
 
 // Private implementation (PIMPL pattern to hide gRPC types)
 struct grpc_client_t::impl_t {
@@ -89,13 +244,20 @@ bool grpc_client_t::connect()
   impl_->channel = grpc::CreateChannel(config_.server_address, creds);
   impl_->stub    = cuopt::remote::CuOptRemoteService::NewStub(impl_->channel);
 
+  GRPC_CLIENT_DEBUG_LOG(config_,
+                        "[grpc_client] Connecting to " << config_.server_address
+                                                       << (config_.enable_tls ? " (TLS)" : ""));
+
   // Try to check connectivity with a short deadline
   auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(5);
   if (!impl_->channel->WaitForConnected(deadline)) {
     last_error_ = "Failed to connect to server at " + config_.server_address;
+    GRPC_CLIENT_DEBUG_LOG(config_, "[grpc_client] Connection failed: " << last_error_);
     return false;
   }
 
+  GRPC_CLIENT_DEBUG_LOG(config_,
+                        "[grpc_client] Connected successfully to " << config_.server_address);
   return true;
 }
 
@@ -370,8 +532,18 @@ bool grpc_client_t::submit_or_upload(const std::vector<uint8_t>& serialized_data
     effective_max = server_max_message_bytes_;
   }
 
+  GRPC_CLIENT_DEBUG_LOG(config_,
+                        "[grpc_client] submit_or_upload: data_size="
+                          << data_size << " bytes, client_max=" << config_.max_message_bytes
+                          << ", server_max=" << server_max_message_bytes_
+                          << ", effective_max=" << effective_max);
+
   // Try unary first if data fits
   if (effective_max <= 0 || data_size <= effective_max) {
+    GRPC_CLIENT_DEBUG_LOG(config_,
+                          "[grpc_client] Attempting unary submit (data_size="
+                            << data_size << " <= effective_max=" << effective_max << ")");
+
     // Attempt unary submit
     grpc::ClientContext context;
     cuopt::remote::SubmitJobRequest request;
@@ -397,7 +569,11 @@ bool grpc_client_t::submit_or_upload(const std::vector<uint8_t>& serialized_data
 
     if (status.ok()) {
       job_id_out = response.job_id();
-      if (!job_id_out.empty()) { return true; }
+      if (!job_id_out.empty()) {
+        GRPC_CLIENT_DEBUG_LOG(config_,
+                              "[grpc_client] Unary submit succeeded, job_id=" << job_id_out);
+        return true;
+      }
       last_error_ = "SubmitJob succeeded but no job_id returned";
       return false;
     }
@@ -409,13 +585,31 @@ bool grpc_client_t::submit_or_upload(const std::vector<uint8_t>& serialized_data
     }
 
     // Server rejected due to size - fall through to streaming
-    std::cerr << "[grpc_client] Unary submit rejected (RESOURCE_EXHAUSTED), "
-              << "falling back to streaming upload\n";
+    GRPC_CLIENT_DEBUG_LOG(config_,
+                          "[grpc_client] Unary submit rejected (RESOURCE_EXHAUSTED), "
+                          "falling back to streaming upload");
+  } else {
+    // Data exceeds known limits - go directly to streaming
+    GRPC_CLIENT_DEBUG_LOG(config_,
+                          "[grpc_client] Using streaming upload directly (data_size="
+                            << data_size << " > effective_max=" << effective_max << ")");
   }
 
   // Use streaming upload
   int64_t initial_chunk = compute_chunk_size(
     server_max_message_bytes_, config_.max_message_bytes, config_.chunk_size_bytes);
+
+  // Compute hash for data integrity verification (only if enabled)
+  std::string hash_str;
+  if (config_.enable_transfer_hash) {
+    uint64_t upload_hash = compute_data_hash(serialized_data.data(), serialized_data.size());
+    hash_str             = ", data_hash=" + hash_to_hex(upload_hash);
+  }
+
+  GRPC_CLIENT_DEBUG_LOG(config_,
+                        "[grpc_client] Starting streaming upload: size="
+                          << serialized_data.size() << " bytes, chunk_size=" << initial_chunk
+                          << hash_str);
 
   return upload_and_submit(
     serialized_data.data(), serialized_data.size(), problem_type, job_id_out, initial_chunk);
@@ -436,13 +630,16 @@ bool grpc_client_t::upload_and_submit(const uint8_t* data,
   auto do_upload = [&](int64_t chunk_size) -> bool {
     grpc::ClientContext context;
 
-    // Set deadline for entire upload operation
+    // Set deadline for entire upload operation (fallback safety)
     auto deadline =
       std::chrono::system_clock::now() + std::chrono::milliseconds(config_.upload_timeout_ms);
     context.set_deadline(deadline);
 
     // Create bidirectional stream
     auto stream = impl_->stub->UploadAndSubmit(&context);
+
+    // Create watchdog for per-message timeout
+    StreamWatchdog watchdog(&context, config_.chunk_timeout_seconds);
 
     // 1. Send UploadStart message
     cuopt::remote::UploadJobRequest start_req;
@@ -453,19 +650,25 @@ bool grpc_client_t::upload_and_submit(const uint8_t* data,
     start->set_total_size(static_cast<int64_t>(size));
 
     if (!stream->Write(start_req)) {
-      last_error_ = "UploadAndSubmit: failed to write start message";
+      last_error_ = watchdog.timed_out() ? "UploadAndSubmit: timeout waiting for server"
+                                         : "UploadAndSubmit: failed to write start message";
       stream->Finish();
       return false;
     }
+    watchdog.activity();
 
     // 2. Read ack for start
     cuopt::remote::UploadJobResponse start_resp;
     if (!stream->Read(&start_resp)) {
-      last_error_     = "UploadAndSubmit: failed to read response after start";
+      last_error_     = watchdog.timed_out() ? "UploadAndSubmit: timeout waiting for server ack"
+                                             : "UploadAndSubmit: failed to read response after start";
       grpc::Status st = stream->Finish();
-      if (!st.ok()) { last_error_ += " (grpc: " + st.error_message() + ")"; }
+      if (!st.ok() && !watchdog.timed_out()) {
+        last_error_ += " (grpc: " + st.error_message() + ")";
+      }
       return false;
     }
+    watchdog.activity();
 
     if (start_resp.has_error()) {
       last_error_ = "UploadAndSubmit: " + start_resp.error().message();
@@ -485,6 +688,7 @@ bool grpc_client_t::upload_and_submit(const uint8_t* data,
     std::string upload_id  = start_resp.ack().upload_id();
     int64_t committed      = start_resp.ack().committed_size();
     int64_t server_max_msg = start_resp.ack().max_message_bytes();
+    int chunk_count        = 0;
 
     // Update our knowledge of server limits
     if (server_max_msg > 0) {
@@ -496,6 +700,17 @@ bool grpc_client_t::upload_and_submit(const uint8_t* data,
 
     // 3. Send chunks with acknowledgment-based flow control
     while (static_cast<size_t>(committed) < size) {
+      if (watchdog.timed_out()) {
+        GRPC_CLIENT_DEBUG_LOG(config_,
+                              "Streaming upload TIMEOUT after "
+                                << config_.chunk_timeout_seconds
+                                << " seconds of inactivity, committed=" << committed << "/" << size
+                                << " bytes");
+        last_error_ = "UploadAndSubmit: timeout during chunk transfer";
+        stream->Finish();
+        return false;
+      }
+
       size_t offset = static_cast<size_t>(committed);
       size_t n      = std::min(static_cast<size_t>(chunk_size), size - offset);
 
@@ -507,21 +722,31 @@ bool grpc_client_t::upload_and_submit(const uint8_t* data,
       chunk->set_data(reinterpret_cast<const char*>(data + offset), n);
 
       if (!stream->Write(chunk_req)) {
-        last_error_ = "UploadAndSubmit: failed to write chunk at offset " + std::to_string(offset);
+        last_error_     = watchdog.timed_out() ? "UploadAndSubmit: timeout writing chunk"
+                                               : "UploadAndSubmit: failed to write chunk at offset " +
+                                               std::to_string(offset);
         grpc::Status st = stream->Finish();
-        if (!st.ok()) { last_error_ += " (grpc: " + st.error_message() + ")"; }
+        if (!st.ok() && !watchdog.timed_out()) {
+          last_error_ += " (grpc: " + st.error_message() + ")";
+        }
         return false;
       }
+      watchdog.activity();
 
       // Read acknowledgment for this chunk
       cuopt::remote::UploadJobResponse chunk_resp;
       if (!stream->Read(&chunk_resp)) {
         last_error_ =
-          "UploadAndSubmit: failed to read ack for chunk at offset " + std::to_string(offset);
+          watchdog.timed_out()
+            ? "UploadAndSubmit: timeout waiting for chunk ack"
+            : "UploadAndSubmit: failed to read ack for chunk at offset " + std::to_string(offset);
         grpc::Status st = stream->Finish();
-        if (!st.ok()) { last_error_ += " (grpc: " + st.error_message() + ")"; }
+        if (!st.ok() && !watchdog.timed_out()) {
+          last_error_ += " (grpc: " + st.error_message() + ")";
+        }
         return false;
       }
+      watchdog.activity();
 
       if (chunk_resp.has_error()) {
         last_error_ = "UploadAndSubmit: " + chunk_resp.error().message();
@@ -539,6 +764,7 @@ bool grpc_client_t::upload_and_submit(const uint8_t* data,
       }
 
       committed = chunk_resp.ack().committed_size();
+      ++chunk_count;
 
       // Update chunk size if server reports different limits
       if (chunk_resp.ack().max_message_bytes() > 0 &&
@@ -550,25 +776,130 @@ bool grpc_client_t::upload_and_submit(const uint8_t* data,
       }
     }
 
-    // 4. Send finish message
-    cuopt::remote::UploadJobRequest finish_req;
-    finish_req.mutable_finish()->set_upload_id(upload_id);
-    stream->Write(finish_req);
-    stream->WritesDone();
+    // 4. Send finish message and handle potential resend requests
+    const int kMaxResendAttempts = 10;  // Prevent infinite loops
+    int resend_attempts          = 0;
 
-    // 5. Read final response (should contain SubmitJobResponse with job_id)
-    cuopt::remote::UploadJobResponse final_resp;
-    while (stream->Read(&final_resp)) {
-      if (final_resp.has_submit()) {
-        job_id_out = final_resp.submit().job_id();
+    while (resend_attempts < kMaxResendAttempts) {
+      if (watchdog.timed_out()) {
+        last_error_ = "UploadAndSubmit: timeout during finish/resend";
+        return false;
+      }
+
+      cuopt::remote::UploadJobRequest finish_req;
+      finish_req.mutable_finish()->set_upload_id(upload_id);
+      if (!stream->Write(finish_req)) {
+        last_error_ = watchdog.timed_out() ? "UploadAndSubmit: timeout writing finish"
+                                           : "UploadAndSubmit: failed to write finish message";
+        return false;
+      }
+      watchdog.activity();
+
+      // Read response - could be submit (success), error, or resend request
+      cuopt::remote::UploadJobResponse resp;
+      if (!stream->Read(&resp)) {
+        last_error_     = watchdog.timed_out()
+                            ? "UploadAndSubmit: timeout waiting for finish response"
+                            : "UploadAndSubmit: failed to read response after finish";
+        grpc::Status st = stream->Finish();
+        if (!st.ok() && !watchdog.timed_out()) {
+          last_error_ += " (grpc: " + st.error_message() + ")";
+        }
+        return false;
+      }
+      watchdog.activity();
+
+      if (resp.has_submit()) {
+        // Success!
+        job_id_out = resp.submit().job_id();
         break;
       }
-      if (final_resp.has_error()) {
-        last_error_ = "UploadAndSubmit: " + final_resp.error().message();
-        break;
+
+      if (resp.has_error()) {
+        last_error_ = "UploadAndSubmit: " + resp.error().message();
+        return false;
       }
+
+      if (resp.has_resend()) {
+        // Server is requesting we resend missing ranges
+        const auto& resend_req = resp.resend();
+        ++resend_attempts;
+
+        GRPC_CLIENT_DEBUG_LOG(config_,
+                              "[grpc_client] Server requested resend of "
+                                << resend_req.missing_ranges_size() << " ranges (attempt "
+                                << resend_attempts << "/" << kMaxResendAttempts << ")");
+
+        // Resend each missing range
+        for (const auto& range : resend_req.missing_ranges()) {
+          if (watchdog.timed_out()) {
+            last_error_ = "UploadAndSubmit: timeout during resend";
+            return false;
+          }
+
+          int64_t range_offset = range.offset();
+          int64_t range_size   = range.size();
+          int64_t range_end    = range_offset + range_size;
+
+          // Send chunks for this range
+          while (range_offset < range_end) {
+            int64_t n = std::min(chunk_size, range_end - range_offset);
+
+            cuopt::remote::UploadJobRequest chunk_req;
+            auto* chunk = chunk_req.mutable_chunk();
+            chunk->set_upload_id(upload_id);
+            chunk->set_offset(range_offset);
+            chunk->set_data(reinterpret_cast<const char*>(data + range_offset), n);
+
+            if (!stream->Write(chunk_req)) {
+              last_error_ = watchdog.timed_out()
+                              ? "UploadAndSubmit: timeout resending chunk"
+                              : "UploadAndSubmit: failed to resend chunk at offset " +
+                                  std::to_string(range_offset);
+              return false;
+            }
+            watchdog.activity();
+
+            // Read ack
+            cuopt::remote::UploadJobResponse ack_resp;
+            if (!stream->Read(&ack_resp)) {
+              last_error_ = watchdog.timed_out()
+                              ? "UploadAndSubmit: timeout waiting for resend ack"
+                              : "UploadAndSubmit: failed to read ack for resent chunk";
+              return false;
+            }
+            watchdog.activity();
+
+            if (ack_resp.has_error()) {
+              last_error_ = "UploadAndSubmit: " + ack_resp.error().message();
+              return false;
+            }
+
+            range_offset += n;
+            ++chunk_count;
+          }
+
+          GRPC_CLIENT_DEBUG_LOG(
+            config_,
+            "[grpc_client] Resent range offset=" << range.offset() << " size=" << range.size());
+        }
+
+        // Loop back to send finish again
+        continue;
+      }
+
+      // Unexpected response type
+      last_error_ = "UploadAndSubmit: unexpected response type after finish";
+      return false;
     }
 
+    if (resend_attempts >= kMaxResendAttempts) {
+      last_error_ = "UploadAndSubmit: max resend attempts exceeded";
+      return false;
+    }
+
+    // Close the stream
+    stream->WritesDone();
     grpc::Status st = stream->Finish();
     if (!st.ok()) {
       if (last_error_.empty()) {
@@ -582,13 +913,17 @@ bool grpc_client_t::upload_and_submit(const uint8_t* data,
       return false;
     }
 
+    GRPC_CLIENT_DEBUG_LOG(config_,
+                          "[grpc_client] Streaming upload completed: sent "
+                            << chunk_count << " chunks, total_size=" << size
+                            << " bytes, job_id=" << job_id_out);
     return true;
   };
 
   // First attempt
   if (do_upload(initial_chunk_size)) { return true; }
 
-  std::cerr << "[grpc_client] Upload failed: " << last_error_ << "\n";
+  GRPC_CLIENT_DEBUG_LOG(config_, "[grpc_client] Upload failed: " << last_error_);
 
   // Retry with smaller chunks if we have retries left
   for (int retry = 0; retry < config_.max_upload_retries; ++retry) {
@@ -599,7 +934,7 @@ bool grpc_client_t::upload_and_submit(const uint8_t* data,
     }
 
     if (retry_chunk < kMinChunkSize) {
-      std::cerr << "[grpc_client] Cannot retry: chunk size would be too small\n";
+      GRPC_CLIENT_DEBUG_LOG(config_, "[grpc_client] Cannot retry: chunk size would be too small");
       break;
     }
 
@@ -609,13 +944,15 @@ bool grpc_client_t::upload_and_submit(const uint8_t* data,
       if (retry_chunk < kMinChunkSize) { break; }
     }
 
-    std::cerr << "[grpc_client] Retrying upload with chunk_size=" << retry_chunk << " (attempt "
-              << (retry + 2) << "/" << (config_.max_upload_retries + 1) << ")\n";
+    GRPC_CLIENT_DEBUG_LOG(config_,
+                          "[grpc_client] Retrying upload with chunk_size="
+                            << retry_chunk << " (attempt " << (retry + 2) << "/"
+                            << (config_.max_upload_retries + 1) << ")");
 
     initial_chunk_size = retry_chunk;
     if (do_upload(retry_chunk)) { return true; }
 
-    std::cerr << "[grpc_client] Retry failed: " << last_error_ << "\n";
+    GRPC_CLIENT_DEBUG_LOG(config_, "[grpc_client] Retry failed: " << last_error_);
   }
 
   return false;
@@ -648,10 +985,23 @@ bool grpc_client_t::get_result_or_stream(const std::string& job_id,
     effective_max = server_max_message_bytes_;
   }
 
+  GRPC_CLIENT_DEBUG_LOG(config_,
+                        "[grpc_client] get_result_or_stream: result_size_hint="
+                          << result_size_hint << " bytes, client_max=" << config_.max_message_bytes
+                          << ", server_max=" << server_max_message_bytes_
+                          << ", effective_max=" << effective_max);
+
   // If result is known to be large, go directly to streaming
   if (result_size_hint > 0 && effective_max > 0 && result_size_hint > effective_max) {
+    GRPC_CLIENT_DEBUG_LOG(config_,
+                          "[grpc_client] Using streaming download directly (result_size_hint="
+                            << result_size_hint << " > effective_max=" << effective_max << ")");
     return stream_result(job_id, result_data_out);
   }
+
+  GRPC_CLIENT_DEBUG_LOG(config_,
+                        "[grpc_client] Attempting unary GetResult (result_size_hint="
+                          << result_size_hint << " <= effective_max=" << effective_max << ")");
 
   // Try unary GetResult first
   grpc::ClientContext context;
@@ -664,14 +1014,24 @@ bool grpc_client_t::get_result_or_stream(const std::string& job_id,
     if (response.has_lp_solution()) {
       const auto& sol = response.lp_solution();
       result_data_out.resize(sol.ByteSizeLong());
-      if (sol.SerializeToArray(result_data_out.data(), result_data_out.size())) { return true; }
+      if (sol.SerializeToArray(result_data_out.data(), result_data_out.size())) {
+        GRPC_CLIENT_DEBUG_LOG(config_,
+                              "[grpc_client] Unary GetResult succeeded, result_size="
+                                << result_data_out.size() << " bytes");
+        return true;
+      }
       last_error_ = "Failed to serialize LP solution from GetResult";
       return false;
     }
     if (response.has_mip_solution()) {
       const auto& sol = response.mip_solution();
       result_data_out.resize(sol.ByteSizeLong());
-      if (sol.SerializeToArray(result_data_out.data(), result_data_out.size())) { return true; }
+      if (sol.SerializeToArray(result_data_out.data(), result_data_out.size())) {
+        GRPC_CLIENT_DEBUG_LOG(config_,
+                              "[grpc_client] Unary GetResult succeeded, result_size="
+                                << result_data_out.size() << " bytes");
+        return true;
+      }
       last_error_ = "Failed to serialize MIP solution from GetResult";
       return false;
     }
@@ -681,8 +1041,9 @@ bool grpc_client_t::get_result_or_stream(const std::string& job_id,
 
   // If RESOURCE_EXHAUSTED, try streaming
   if (status.error_code() == grpc::StatusCode::RESOURCE_EXHAUSTED) {
-    std::cerr << "[grpc_client] GetResult rejected (RESOURCE_EXHAUSTED), "
-              << "falling back to streaming\n";
+    GRPC_CLIENT_DEBUG_LOG(config_,
+                          "[grpc_client] GetResult rejected (RESOURCE_EXHAUSTED), "
+                          "falling back to streaming");
     return stream_result(job_id, result_data_out);
   }
 
@@ -698,35 +1059,234 @@ bool grpc_client_t::stream_result(const std::string& job_id, std::vector<uint8_t
 {
   result_data_out.clear();
 
+  GRPC_CLIENT_DEBUG_LOG(config_, "[grpc_client] Starting streaming download for job " << job_id);
+
   grpc::ClientContext context;
-  cuopt::remote::GetResultRequest request;
-  request.set_job_id(job_id);
+  auto stream = impl_->stub->StreamResult(&context);
 
-  auto reader = impl_->stub->StreamResult(&context, request);
+  // Create watchdog for per-message timeout
+  StreamWatchdog watchdog(&context, config_.chunk_timeout_seconds);
 
-  cuopt::remote::ResultChunk chunk;
-  while (reader->Read(&chunk)) {
-    // Check for error in chunk
-    if (!chunk.error_message().empty()) {
-      last_error_ = "StreamResult error: " + chunk.error_message();
-      reader->Finish();
+  // Send DownloadStart message
+  cuopt::remote::DownloadRequest start_req;
+  auto* start = start_req.mutable_start();
+  start->set_job_id(job_id);
+  start->set_max_message_bytes(config_.max_message_bytes);
+  if (!stream->Write(start_req)) {
+    last_error_ = watchdog.timed_out() ? "StreamResult: timeout sending DownloadStart"
+                                       : "StreamResult: failed to send DownloadStart";
+    return false;
+  }
+  watchdog.activity();
+
+  // Track received byte ranges (sorted and merged)
+  std::vector<std::pair<int64_t, int64_t>> received_ranges;
+  int64_t expected_total_size = 0;
+  int chunk_count             = 0;
+
+  // Helper to add a received range (merging overlaps)
+  auto add_received_range = [&](int64_t start_off, int64_t end_off) {
+    if (start_off >= end_off) return;
+
+    auto it = std::lower_bound(received_ranges.begin(),
+                               received_ranges.end(),
+                               std::make_pair(start_off, end_off),
+                               [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    if (it != received_ranges.begin()) {
+      auto prev = std::prev(it);
+      if (prev->second >= start_off) {
+        prev->second = std::max(prev->second, end_off);
+        while (it != received_ranges.end() && prev->second >= it->first) {
+          prev->second = std::max(prev->second, it->second);
+          it           = received_ranges.erase(it);
+        }
+        return;
+      }
+    }
+
+    if (it != received_ranges.end() && end_off >= it->first) {
+      it->first  = start_off;
+      it->second = std::max(it->second, end_off);
+      auto next  = std::next(it);
+      while (next != received_ranges.end() && it->second >= next->first) {
+        it->second = std::max(it->second, next->second);
+        next       = received_ranges.erase(next);
+      }
+      return;
+    }
+
+    received_ranges.insert(it, {start_off, end_off});
+  };
+
+  // Helper to compute missing ranges
+  auto compute_missing_ranges =
+    [&](int64_t total_size) -> std::vector<std::pair<int64_t, int64_t>> {
+    std::vector<std::pair<int64_t, int64_t>> missing;
+    int64_t expected_start = 0;
+
+    for (const auto& range : received_ranges) {
+      if (expected_start < range.first) { missing.push_back({expected_start, range.first}); }
+      expected_start = std::max(expected_start, range.second);
+    }
+
+    if (expected_start < total_size) { missing.push_back({expected_start, total_size}); }
+    return missing;
+  };
+
+  // Helper to get total bytes received
+  auto get_total_received = [&]() -> int64_t {
+    int64_t total = 0;
+    for (const auto& range : received_ranges) {
+      total += (range.second - range.first);
+    }
+    return total;
+  };
+
+  // Read chunks until done, then check for gaps and request resends
+  const int kMaxResendAttempts = 10;
+  int resend_attempts          = 0;
+
+  while (resend_attempts < kMaxResendAttempts) {
+    if (watchdog.timed_out()) {
+      GRPC_CLIENT_DEBUG_LOG(config_,
+                            "Streaming download TIMEOUT after "
+                              << config_.chunk_timeout_seconds << " seconds of inactivity for job "
+                              << job_id << ", received " << result_data_out.size() << " bytes");
+      last_error_ = "StreamResult: timeout during download";
+      result_data_out.clear();  // Clean up partial data
       return false;
     }
 
-    // Done flag indicates end of stream
-    if (chunk.done()) { break; }
+    // Read chunks until server sends done
+    cuopt::remote::ResultChunk chunk;
+    while (stream->Read(&chunk)) {
+      watchdog.activity();
 
-    // Append chunk data to result
-    // Note: chunks should arrive in order by offset, but we trust the server
-    const std::string& data = chunk.data();
-    result_data_out.insert(result_data_out.end(), data.begin(), data.end());
+      // Check for error in chunk
+      if (!chunk.error_message().empty()) {
+        last_error_ = "StreamResult error: " + chunk.error_message();
+        result_data_out.clear();  // Clean up partial data
+        stream->WritesDone();
+        stream->Finish();
+        return false;
+      }
+
+      // Done flag indicates server finished sending this batch
+      if (chunk.done()) {
+        expected_total_size = chunk.total_size();
+        break;
+      }
+
+      // Store chunk data at correct offset
+      int64_t offset    = chunk.offset();
+      int64_t data_size = static_cast<int64_t>(chunk.data().size());
+
+      // Ensure result buffer is large enough
+      int64_t required_size = offset + data_size;
+      if (static_cast<int64_t>(result_data_out.size()) < required_size) {
+        result_data_out.resize(static_cast<size_t>(required_size));
+      }
+
+      // Copy data at correct position
+      std::memcpy(result_data_out.data() + offset, chunk.data().data(), chunk.data().size());
+      add_received_range(offset, offset + data_size);
+      ++chunk_count;
+    }
+
+    // Check if read loop exited due to timeout
+    if (watchdog.timed_out()) {
+      GRPC_CLIENT_DEBUG_LOG(config_,
+                            "Streaming download TIMEOUT waiting for chunks after "
+                              << config_.chunk_timeout_seconds << " seconds for job " << job_id
+                              << ", received " << chunk_count << " chunks, "
+                              << result_data_out.size() << "/" << expected_total_size << " bytes");
+      last_error_ = "StreamResult: timeout waiting for chunks";
+      result_data_out.clear();  // Clean up partial data
+      return false;
+    }
+
+    // Check for missing ranges
+    if (expected_total_size > 0) {
+      auto missing = compute_missing_ranges(expected_total_size);
+
+      if (missing.empty()) {
+        // All data received - send finish confirmation
+        cuopt::remote::DownloadRequest finish_req;
+        auto* finish = finish_req.mutable_finish();
+        finish->set_job_id(job_id);
+        finish->set_total_received(get_total_received());
+        stream->Write(finish_req);
+        watchdog.activity();
+        break;
+      }
+
+      // Request resend of missing ranges
+      ++resend_attempts;
+      GRPC_CLIENT_DEBUG_LOG(config_,
+                            "[grpc_client] Requesting resend of "
+                              << missing.size() << " ranges (attempt " << resend_attempts << "/"
+                              << kMaxResendAttempts << ")");
+
+      cuopt::remote::DownloadRequest resend_req;
+      auto* resend = resend_req.mutable_resend();
+      resend->set_transfer_id(job_id);
+      for (const auto& range : missing) {
+        auto* mr = resend->add_missing_ranges();
+        mr->set_offset(range.first);
+        mr->set_size(range.second - range.first);
+      }
+
+      if (!stream->Write(resend_req)) {
+        last_error_ = watchdog.timed_out() ? "StreamResult: timeout sending ResendRequest"
+                                           : "StreamResult: failed to send ResendRequest";
+        result_data_out.clear();  // Clean up partial data
+        return false;
+      }
+      watchdog.activity();
+
+      // Continue reading - server will send the missing chunks
+      continue;
+    }
+
+    // No total_size provided - we're done
+    break;
   }
 
-  grpc::Status st = reader->Finish();
-  if (!st.ok()) {
-    last_error_ = "StreamResult failed: " + st.error_message();
+  if (resend_attempts >= kMaxResendAttempts) {
+    last_error_ = "StreamResult: max resend attempts exceeded";
+    result_data_out.clear();  // Clean up partial data
     return false;
   }
+
+  // Stop watchdog before final operations
+  watchdog.stop();
+
+  stream->WritesDone();
+  grpc::Status st = stream->Finish();
+  if (!st.ok()) {
+    last_error_ = "StreamResult failed: " + st.error_message();
+    result_data_out.clear();  // Clean up partial data
+    return false;
+  }
+
+  // Trim result to expected size if needed
+  if (expected_total_size > 0 &&
+      static_cast<int64_t>(result_data_out.size()) > expected_total_size) {
+    result_data_out.resize(static_cast<size_t>(expected_total_size));
+  }
+
+  // Compute hash for data integrity verification (only if enabled)
+  std::string download_hash_str;
+  if (config_.enable_transfer_hash) {
+    uint64_t download_hash = compute_data_hash(result_data_out.data(), result_data_out.size());
+    download_hash_str      = ", data_hash=" + hash_to_hex(download_hash);
+  }
+
+  GRPC_CLIENT_DEBUG_LOG(config_,
+                        "[grpc_client] Streaming download completed: received "
+                          << chunk_count << " chunks, total_size=" << result_data_out.size()
+                          << " bytes, resend_attempts=" << resend_attempts << download_hash_str);
 
   if (result_data_out.empty()) {
     last_error_ = "StreamResult returned empty result";
@@ -746,8 +1306,11 @@ submit_result_t grpc_client_t::submit_lp(const cpu_optimization_problem_t<i_t, f
 {
   submit_result_t result;
 
+  GRPC_CLIENT_DEBUG_LOG(config_, "[grpc_client] submit_lp: starting submission");
+
   if (!is_connected()) {
     result.error_message = "Not connected to server";
+    GRPC_CLIENT_DEBUG_LOG(config_, "[grpc_client] submit_lp: not connected to server");
     return result;
   }
 
@@ -761,9 +1324,12 @@ submit_result_t grpc_client_t::submit_lp(const cpu_optimization_problem_t<i_t, f
 
   if (!submit_or_upload(serialized_data, streaming_problem_type_t::LP, result.job_id)) {
     result.error_message = last_error_;
+    GRPC_CLIENT_DEBUG_LOG(config_, "[grpc_client] submit_lp: submission failed: " << last_error_);
     return result;
   }
 
+  GRPC_CLIENT_DEBUG_LOG(
+    config_, "[grpc_client] submit_lp: job submitted successfully, job_id=" << result.job_id);
   result.success = true;
   return result;
 }
@@ -775,8 +1341,13 @@ submit_result_t grpc_client_t::submit_mip(const cpu_optimization_problem_t<i_t, 
 {
   submit_result_t result;
 
+  GRPC_CLIENT_DEBUG_LOG(config_,
+                        "[grpc_client] submit_mip: starting submission"
+                          << (enable_incumbents ? " (incumbents enabled)" : ""));
+
   if (!is_connected()) {
     result.error_message = "Not connected to server";
+    GRPC_CLIENT_DEBUG_LOG(config_, "[grpc_client] submit_mip: not connected to server");
     return result;
   }
 
@@ -790,9 +1361,12 @@ submit_result_t grpc_client_t::submit_mip(const cpu_optimization_problem_t<i_t, 
 
   if (!submit_or_upload(serialized_data, streaming_problem_type_t::MIP, result.job_id)) {
     result.error_message = last_error_;
+    GRPC_CLIENT_DEBUG_LOG(config_, "[grpc_client] submit_mip: submission failed: " << last_error_);
     return result;
   }
 
+  GRPC_CLIENT_DEBUG_LOG(
+    config_, "[grpc_client] submit_mip: job submitted successfully, job_id=" << result.job_id);
   result.success = true;
   return result;
 }
