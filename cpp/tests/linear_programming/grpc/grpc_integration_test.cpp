@@ -34,6 +34,15 @@
 #include <cuopt/linear_programming/utilities/grpc_client.hpp>
 #include <mps_parser/parser.hpp>
 
+#include "grpc_test_log_capture.hpp"
+
+// For direct gRPC access in streaming tests
+#include <cuopt_remote_service.grpc.pb.h>
+#include <grpcpp/grpcpp.h>
+
+// For building serialized request messages
+#include <cuopt/linear_programming/utilities/grpc_service_mapper.hpp>
+
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -42,12 +51,14 @@
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <random>
 #include <string>
 #include <thread>
 
 using namespace cuopt::linear_programming;
+using cuopt::linear_programming::testing::GrpcTestLogCapture;
 
 namespace {
 
@@ -171,6 +182,15 @@ class ServerProcess {
   {
     if (pid_ <= 0) return false;
     return kill(pid_, 0) == 0;
+  }
+
+  /**
+   * @brief Get the path to the server log file
+   */
+  std::string log_path() const
+  {
+    if (port_ <= 0) return "";
+    return "/tmp/cuopt_test_server_" + std::to_string(port_) + ".log";
   }
 
  private:
@@ -304,10 +324,14 @@ class GrpcIntegrationTest : public ::testing::Test {
 
   /**
    * @brief Start server with default settings
+   * Always enables transfer hash logging for test verification
    */
   bool start_server(const std::vector<std::string>& extra_args = {})
   {
-    return server_.start(port_, extra_args);
+    // Always enable transfer hash for tests
+    std::vector<std::string> args = {"--enable-transfer-hash"};
+    args.insert(args.end(), extra_args.begin(), extra_args.end());
+    return server_.start(port_, args);
   }
 
   /**
@@ -324,6 +348,9 @@ class GrpcIntegrationTest : public ::testing::Test {
 
     // Set reasonable test timeout if not customized (default is -1 meaning "not set")
     if (config.timeout_seconds == -1) { config.timeout_seconds = 60; }
+
+    // Enable transfer hash for test verification
+    config.enable_transfer_hash = true;
 
     auto client = std::make_unique<grpc_client_t>(config);
     if (!client->connect()) { return nullptr; }
@@ -433,6 +460,224 @@ TEST_F(GrpcIntegrationTest, ConnectToNonexistentServer)
   grpc_client_t client(config);
   EXPECT_FALSE(client.connect());
   EXPECT_FALSE(client.get_last_error().empty());
+}
+
+// =============================================================================
+// Log Capture and Verification Tests
+// =============================================================================
+
+TEST_F(GrpcIntegrationTest, LogCapture_ClientDebugLogs)
+{
+  // Test that client debug logs are captured via the debug_log_callback
+  ASSERT_TRUE(start_server());
+
+  GrpcTestLogCapture log_capture;
+
+  grpc_client_config_t config;
+  config.debug_log_callback = log_capture.client_callback();
+
+  auto client = create_client(config);
+  ASSERT_NE(client, nullptr);
+
+  // Verify connection debug logs were captured
+  EXPECT_TRUE(log_capture.client_log_contains("Connecting to"))
+    << "Expected connection log. Captured logs:\n"
+    << log_capture.get_client_logs();
+  EXPECT_TRUE(log_capture.client_log_contains("Connected successfully"))
+    << "Expected success log. Captured logs:\n"
+    << log_capture.get_client_logs();
+}
+
+TEST_F(GrpcIntegrationTest, LogCapture_ClientConnectionFailure)
+{
+  // Test that connection failure logs are captured
+  GrpcTestLogCapture log_capture;
+
+  grpc_client_config_t config;
+  config.server_address     = "localhost:" + std::to_string(port_);  // Server not started
+  config.debug_log_callback = log_capture.client_callback();
+
+  grpc_client_t client(config);
+  EXPECT_FALSE(client.connect());
+
+  // Verify failure logs were captured
+  EXPECT_TRUE(log_capture.client_log_contains("Connection failed"))
+    << "Expected failure log. Captured logs:\n"
+    << log_capture.get_client_logs();
+}
+
+TEST_F(GrpcIntegrationTest, LogCapture_ServerLogs)
+{
+  // Test that server logs can be read from the log file
+  ASSERT_TRUE(start_server());
+
+  GrpcTestLogCapture log_capture;
+  log_capture.set_server_log_path(server_.log_path());
+  log_capture.mark_test_start();  // Only capture logs from this point forward
+
+  auto client = create_client();
+  ASSERT_NE(client, nullptr);
+
+  // Submit a simple problem to generate server logs
+  auto problem = create_simple_mip();
+  mip_solver_settings_t<int32_t, double> settings;
+  settings.time_limit = 10.0;
+
+  auto result = client->solve_mip(problem, settings, false);
+  EXPECT_TRUE(result.success) << result.error_message;
+
+  // Give server a moment to flush logs
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+  // Verify server logs contain expected entries (only from this test)
+  std::string server_logs = log_capture.get_server_logs();
+  EXPECT_FALSE(server_logs.empty()) << "Server logs should not be empty";
+
+  // Server should log worker processing
+  EXPECT_TRUE(log_capture.server_log_contains("[Worker"))
+    << "Expected worker logs. Server log path: " << server_.log_path();
+}
+
+TEST_F(GrpcIntegrationTest, LogCapture_SubmitJobLogs)
+{
+  // Test that job submission logs are captured
+  ASSERT_TRUE(start_server());
+
+  GrpcTestLogCapture log_capture;
+  log_capture.set_server_log_path(server_.log_path());
+
+  grpc_client_config_t config;
+  config.debug_log_callback = log_capture.client_callback();
+
+  auto client = create_client(config);
+  ASSERT_NE(client, nullptr);
+
+  // Mark test start AFTER connection (so we don't capture connection logs in server)
+  log_capture.mark_test_start();
+
+  std::string mps_path = get_test_lp_path("afiro_original.mps");
+  auto problem         = load_problem_from_mps(mps_path);
+  pdlp_solver_settings_t<int32_t, double> settings;
+  settings.time_limit = 10.0;
+
+  auto result = client->solve_lp(problem, settings);
+  EXPECT_TRUE(result.success) << result.error_message;
+
+  // Verify client captured the job submission logs
+  EXPECT_TRUE(log_capture.client_log_contains("submit_or_upload"))
+    << "Expected submit_or_upload log. Captured client logs:\n"
+    << log_capture.get_client_logs();
+  EXPECT_TRUE(log_capture.client_log_contains("job_id="))
+    << "Expected job_id in logs. Captured client logs:\n"
+    << log_capture.get_client_logs();
+
+  // Verify we can use pattern matching for job_id format
+  EXPECT_TRUE(log_capture.client_log_contains_pattern("job_id=[a-f0-9-]+"))
+    << "Expected job_id pattern. Captured client logs:\n"
+    << log_capture.get_client_logs();
+}
+
+TEST_F(GrpcIntegrationTest, LogCapture_WaitForServerLog)
+{
+  // Test the wait_for_server_log functionality
+  ASSERT_TRUE(start_server());
+
+  GrpcTestLogCapture log_capture;
+  log_capture.set_server_log_path(server_.log_path());
+
+  grpc_client_config_t config;
+  config.debug_log_callback = log_capture.client_callback();
+
+  auto client = create_client(config);
+  ASSERT_NE(client, nullptr);
+
+  // Mark test start - only look for logs from this point forward
+  log_capture.mark_test_start();
+
+  // Submit a problem
+  auto problem = create_simple_mip();
+  mip_solver_settings_t<int32_t, double> settings;
+  settings.time_limit = 10.0;
+
+  auto submit_result = client->submit_mip(problem, settings);
+  ASSERT_TRUE(submit_result.success) << submit_result.error_message;
+
+  // Wait for the server to log that it's processing the job (with timeout)
+  // This will only find logs written after mark_test_start()
+  bool found = log_capture.wait_for_server_log("Processing job", 10000, 100);
+  EXPECT_TRUE(found) << "Server should log 'Processing job' within 10 seconds";
+}
+
+TEST_F(GrpcIntegrationTest, LogCapture_CountOccurrences)
+{
+  // Test log counting functionality
+  GrpcTestLogCapture log_capture;
+
+  // Add some test logs
+  log_capture.add_client_log("Test message 1");
+  log_capture.add_client_log("Test message 2");
+  log_capture.add_client_log("Another test");
+  log_capture.add_client_log("Test message 3");
+
+  // Count occurrences
+  EXPECT_EQ(log_capture.client_log_count("Test message"), 3);
+  EXPECT_EQ(log_capture.client_log_count("Another"), 1);
+  EXPECT_EQ(log_capture.client_log_count("Not found"), 0);
+}
+
+TEST_F(GrpcIntegrationTest, LogCapture_TestIsolation)
+{
+  // Test that mark_test_start() properly isolates logs between test phases
+  ASSERT_TRUE(start_server());
+
+  GrpcTestLogCapture log_capture;
+  log_capture.set_server_log_path(server_.log_path());
+
+  grpc_client_config_t config;
+  config.debug_log_callback = log_capture.client_callback();
+
+  auto client = create_client(config);
+  ASSERT_NE(client, nullptr);
+
+  // Phase 1: Submit a job BEFORE marking test start
+  auto problem = create_simple_mip();
+  mip_solver_settings_t<int32_t, double> settings;
+  settings.time_limit = 10.0;
+
+  auto result1 = client->solve_mip(problem, settings, false);
+  EXPECT_TRUE(result1.success) << result1.error_message;
+
+  // Give server time to log
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  // Now mark test start - should NOT see Phase 1 logs after this
+  log_capture.mark_test_start();
+
+  // Verify Phase 1 logs are NOT visible (because they're before the mark)
+  EXPECT_FALSE(log_capture.server_log_contains("Processing job"))
+    << "Should NOT see logs from before mark_test_start()";
+
+  // Phase 2: Submit another job AFTER marking test start
+  auto result2 = client->solve_mip(problem, settings, false);
+  EXPECT_TRUE(result2.success) << result2.error_message;
+
+  // Give server time to log
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  // Verify Phase 2 logs ARE visible
+  EXPECT_TRUE(log_capture.server_log_contains("Processing job"))
+    << "Should see logs from after mark_test_start()";
+
+  // But we can still access all logs if needed for debugging
+  std::string all_logs = log_capture.get_all_server_logs();
+  // Count "Processing job" occurrences - should be at least 2 (from both phases)
+  int count  = 0;
+  size_t pos = 0;
+  while ((pos = all_logs.find("Processing job", pos)) != std::string::npos) {
+    ++count;
+    pos += 14;  // length of "Processing job"
+  }
+  EXPECT_GE(count, 2) << "Should have at least 2 'Processing job' entries in full log";
 }
 
 // =============================================================================
@@ -735,7 +980,7 @@ TEST_F(GrpcIntegrationTest, MultipleSequentialSolves)
     auto problem         = load_problem_from_mps(mps_path);
 
     pdlp_solver_settings_t<int32_t, double> settings;
-    settings.time_limit = 30.0;
+    settings.time_limit = 10.0;
 
     auto result = client->solve_lp(problem, settings);
     EXPECT_TRUE(result.success) << "Solve #" << i << " failed: " << result.error_message;
@@ -807,7 +1052,7 @@ TEST_F(GrpcIntegrationTest, StreamingUpload_LargeProblem)
   auto problem         = load_problem_from_mps(mps_path);
 
   mip_solver_settings_t<int32_t, double> settings;
-  settings.time_limit = 30.0;  // Limit solve time
+  settings.time_limit = 5.0;  // Short time - we're testing streaming, not solve accuracy
 
   // This should automatically use streaming upload
   auto result = client->solve_mip(problem, settings, false);
@@ -831,7 +1076,7 @@ TEST_F(GrpcIntegrationTest, StreamingUpload_ServerRestart)
   auto problem         = load_problem_from_mps(mps_path);
 
   mip_solver_settings_t<int32_t, double> settings;
-  settings.time_limit = 30.0;
+  settings.time_limit = 10.0;
 
   auto result1 = client->solve_mip(problem, settings, false);
   EXPECT_TRUE(result1.success) << result1.error_message;
@@ -846,6 +1091,140 @@ TEST_F(GrpcIntegrationTest, StreamingUpload_ServerRestart)
 
   auto result2 = client2->solve_mip(problem, settings, false);
   EXPECT_TRUE(result2.success) << result2.error_message;
+}
+
+TEST_F(GrpcIntegrationTest, StreamingUpload_OutOfOrderChunks)
+{
+  // Test that server properly handles chunks sent out of order by solving a real LP problem
+  // We send chunks in non-sequential order and verify the solution is correct
+  ASSERT_TRUE(start_server({"--max-message-mb", "1"}));
+
+  GrpcTestLogCapture log_capture;
+  log_capture.set_server_log_path(server_.log_path());
+  log_capture.mark_test_start();
+
+  // Load and serialize afiro_original.mps problem with settings (as SolveLPRequest)
+  std::string mps_path = get_test_lp_path("afiro_original.mps");
+  auto problem         = load_problem_from_mps(mps_path);
+
+  pdlp_solver_settings_t<int32_t, double> settings;
+  settings.time_limit = 60.0;
+
+  // Build and serialize the full SolveLPRequest (problem + settings)
+  auto submit_request = build_lp_submit_request(problem, settings);
+  const auto& lp_req  = submit_request.lp_request();
+  std::string serialized_problem;
+  ASSERT_TRUE(lp_req.SerializeToString(&serialized_problem));
+
+  // Create a gRPC channel directly
+  auto channel =
+    grpc::CreateChannel("localhost:" + std::to_string(port_), grpc::InsecureChannelCredentials());
+  auto stub = cuopt::remote::CuOptRemoteService::NewStub(channel);
+
+  grpc::ClientContext context;
+  auto stream = stub->UploadAndSubmit(&context);
+
+  // 1. Send start message
+  cuopt::remote::UploadJobRequest start_req;
+  auto* start = start_req.mutable_start();
+  start->set_problem_type(cuopt::remote::LP);
+  start->set_resume(false);
+  start->set_total_size(serialized_problem.size());
+
+  ASSERT_TRUE(stream->Write(start_req));
+
+  // 2. Read start ack
+  cuopt::remote::UploadJobResponse start_resp;
+  ASSERT_TRUE(stream->Read(&start_resp));
+  ASSERT_TRUE(start_resp.has_ack())
+    << "Expected ack, got error: "
+    << (start_resp.has_error() ? start_resp.error().message() : "unknown");
+  std::string upload_id = start_resp.ack().upload_id();
+
+  // 3. Send chunks OUT OF ORDER
+  // Use small chunks to ensure multiple chunks and meaningful reordering
+  const size_t chunk_size = 1024;  // 1KB chunks for afiro (~5KB problem)
+  std::vector<size_t> offsets;
+  for (size_t i = 0; i < serialized_problem.size(); i += chunk_size) {
+    offsets.push_back(i);
+  }
+
+  // Shuffle offsets to create out-of-order sequence
+  // Reverse the order for a clearly non-sequential pattern
+  std::reverse(offsets.begin(), offsets.end());
+
+  std::cout << "[Test] Sending " << offsets.size() << " chunks in reverse order" << std::endl;
+
+  for (size_t offset : offsets) {
+    size_t n = std::min(chunk_size, serialized_problem.size() - offset);
+
+    cuopt::remote::UploadJobRequest chunk_req;
+    auto* chunk = chunk_req.mutable_chunk();
+    chunk->set_upload_id(upload_id);
+    chunk->set_offset(static_cast<int64_t>(offset));
+    chunk->set_data(serialized_problem.data() + offset, n);
+
+    ASSERT_TRUE(stream->Write(chunk_req)) << "Failed to write chunk at offset " << offset;
+
+    cuopt::remote::UploadJobResponse chunk_resp;
+    ASSERT_TRUE(stream->Read(&chunk_resp)) << "Failed to read ack for chunk at offset " << offset;
+
+    ASSERT_FALSE(chunk_resp.has_error())
+      << "Server rejected chunk at offset " << offset << ": " << chunk_resp.error().message();
+    ASSERT_TRUE(chunk_resp.has_ack());
+  }
+
+  // 4. Send finish message
+  cuopt::remote::UploadJobRequest finish_req;
+  auto* finish = finish_req.mutable_finish();
+  finish->set_upload_id(upload_id);
+  ASSERT_TRUE(stream->Write(finish_req));
+
+  // 5. Read finish response with job_id
+  cuopt::remote::UploadJobResponse finish_resp;
+  ASSERT_TRUE(stream->Read(&finish_resp));
+  ASSERT_TRUE(finish_resp.has_submit()) << "Expected submit response";
+  std::string job_id = finish_resp.submit().job_id();
+  ASSERT_FALSE(job_id.empty()) << "Job ID should not be empty";
+
+  stream->WritesDone();
+  grpc::Status status = stream->Finish();
+  ASSERT_TRUE(status.ok()) << "Stream finish failed: " << status.error_message();
+
+  std::cout << "[Test] Out-of-order upload succeeded, job_id=" << job_id << std::endl;
+
+  // 6. Wait for job completion and get result using a normal client
+  grpc_client_config_t config;
+  config.timeout_seconds = 60;
+  auto client            = create_client(config);
+  ASSERT_NE(client, nullptr);
+
+  // Wait for completion
+  auto wait_result = client->wait_for_completion(job_id);
+  ASSERT_TRUE(wait_result.success) << "Wait failed: " << wait_result.error_message;
+  ASSERT_EQ(wait_result.status, job_status_t::COMPLETED) << "Job did not complete successfully";
+
+  // Get the result
+  auto lp_result = client->get_lp_result<int32_t, double>(job_id);
+  ASSERT_TRUE(lp_result.success) << "Get result failed: " << lp_result.error_message;
+  ASSERT_TRUE(lp_result.solution != nullptr) << "Solution should not be null";
+
+  // AFIRO optimal objective is approximately -464.75 (minimization problem)
+  const double expected_objective = -464.75;
+  const double tolerance          = 1.0;  // Allow some tolerance for solver differences
+
+  std::cout << "[Test] Result objective: " << lp_result.solution->get_objective_value()
+            << std::endl;
+  std::cout << "[Test] Expected objective: " << expected_objective << std::endl;
+
+  EXPECT_NEAR(lp_result.solution->get_objective_value(), expected_objective, tolerance)
+    << "Objective value incorrect - server may have corrupted the problem data during "
+       "out-of-order chunk reassembly";
+
+  // Verify server logs show the upload was processed
+  std::string server_logs = log_capture.get_server_logs();
+  EXPECT_TRUE(server_logs.find("UploadAndSubmit") != std::string::npos)
+    << "Server logs should mention UploadAndSubmit";
 }
 
 TEST_F(GrpcIntegrationTest, StreamingUpload_VerySmallChunks)
@@ -869,6 +1248,758 @@ TEST_F(GrpcIntegrationTest, StreamingUpload_VerySmallChunks)
   // This should work despite small chunk sizes
   auto result = client->solve_mip(problem, settings, false);
   EXPECT_TRUE(result.success) << result.error_message;
+}
+
+// =============================================================================
+// Selective Retransmission Tests
+// =============================================================================
+
+TEST_F(GrpcIntegrationTest, SelectiveRetransmission_UploadWithMissingChunks)
+{
+  // Test that server correctly requests retransmission of missing chunks
+  // This test simulates chunk loss by sending an incomplete upload, then resending
+  ASSERT_TRUE(start_server({"--max-message-mb", "1", "--verbose"}));
+
+  GrpcTestLogCapture log_capture;
+  log_capture.set_server_log_path(server_.log_path());
+  log_capture.mark_test_start();
+
+  // Load and serialize afiro_original.mps problem
+  std::string mps_path = get_test_lp_path("afiro_original.mps");
+  auto problem         = load_problem_from_mps(mps_path);
+
+  pdlp_solver_settings_t<int32_t, double> settings;
+  settings.time_limit = 60.0;
+
+  auto submit_request = build_lp_submit_request(problem, settings);
+  const auto& lp_req  = submit_request.lp_request();
+  std::string serialized_problem;
+  ASSERT_TRUE(lp_req.SerializeToString(&serialized_problem));
+
+  // Create gRPC channel directly
+  auto channel =
+    grpc::CreateChannel("localhost:" + std::to_string(port_), grpc::InsecureChannelCredentials());
+  auto stub = cuopt::remote::CuOptRemoteService::NewStub(channel);
+
+  grpc::ClientContext context;
+  auto stream = stub->UploadAndSubmit(&context);
+
+  // 1. Send start message
+  cuopt::remote::UploadJobRequest start_req;
+  auto* start = start_req.mutable_start();
+  start->set_problem_type(cuopt::remote::LP);
+  start->set_resume(false);
+  start->set_total_size(serialized_problem.size());
+  ASSERT_TRUE(stream->Write(start_req));
+
+  cuopt::remote::UploadJobResponse start_resp;
+  ASSERT_TRUE(stream->Read(&start_resp));
+  ASSERT_TRUE(start_resp.has_ack());
+  std::string upload_id = start_resp.ack().upload_id();
+
+  // 2. Send only SOME chunks (skip every other chunk to create gaps)
+  const size_t chunk_size = 512;  // Small chunks to ensure multiple
+  size_t offset           = 0;
+  std::vector<size_t> skipped_offsets;
+
+  while (offset < serialized_problem.size()) {
+    size_t n = std::min(chunk_size, serialized_problem.size() - offset);
+
+    // Skip every other chunk
+    bool skip = (offset / chunk_size) % 2 == 1;
+    if (skip) {
+      skipped_offsets.push_back(offset);
+      offset += n;
+      continue;
+    }
+
+    cuopt::remote::UploadJobRequest chunk_req;
+    auto* chunk = chunk_req.mutable_chunk();
+    chunk->set_upload_id(upload_id);
+    chunk->set_offset(static_cast<int64_t>(offset));
+    chunk->set_data(serialized_problem.data() + offset, n);
+
+    ASSERT_TRUE(stream->Write(chunk_req));
+
+    cuopt::remote::UploadJobResponse chunk_resp;
+    ASSERT_TRUE(stream->Read(&chunk_resp));
+    ASSERT_TRUE(chunk_resp.has_ack()) << "Expected ack, got error";
+
+    offset += n;
+  }
+
+  std::cout << "[Test] Sent chunks with " << skipped_offsets.size() << " gaps" << std::endl;
+
+  // 3. Send finish - server should request resend of missing chunks
+  cuopt::remote::UploadJobRequest finish_req;
+  finish_req.mutable_finish()->set_upload_id(upload_id);
+  ASSERT_TRUE(stream->Write(finish_req));
+
+  cuopt::remote::UploadJobResponse finish_resp;
+  ASSERT_TRUE(stream->Read(&finish_resp));
+
+  // Server should request resend of missing ranges
+  ASSERT_TRUE(finish_resp.has_resend())
+    << "Expected ResendRequest, got: "
+    << (finish_resp.has_ack()      ? "ack"
+        : finish_resp.has_submit() ? "submit"
+        : finish_resp.has_error()  ? "error: " + finish_resp.error().message()
+                                   : "unknown");
+
+  std::cout << "[Test] Server requested resend of " << finish_resp.resend().missing_ranges_size()
+            << " ranges" << std::endl;
+
+  // 4. Resend the missing chunks
+  for (const auto& range : finish_resp.resend().missing_ranges()) {
+    int64_t range_offset = range.offset();
+    int64_t range_end    = range_offset + range.size();
+
+    while (range_offset < range_end) {
+      size_t n =
+        std::min(static_cast<size_t>(chunk_size), static_cast<size_t>(range_end - range_offset));
+
+      cuopt::remote::UploadJobRequest chunk_req;
+      auto* chunk = chunk_req.mutable_chunk();
+      chunk->set_upload_id(upload_id);
+      chunk->set_offset(range_offset);
+      chunk->set_data(serialized_problem.data() + range_offset, n);
+
+      ASSERT_TRUE(stream->Write(chunk_req));
+
+      cuopt::remote::UploadJobResponse chunk_resp;
+      ASSERT_TRUE(stream->Read(&chunk_resp));
+      ASSERT_TRUE(chunk_resp.has_ack());
+
+      range_offset += static_cast<int64_t>(n);
+    }
+  }
+
+  // 5. Send finish again
+  ASSERT_TRUE(stream->Write(finish_req));
+
+  cuopt::remote::UploadJobResponse final_resp;
+  ASSERT_TRUE(stream->Read(&final_resp));
+  ASSERT_TRUE(final_resp.has_submit())
+    << "Expected submit, got: "
+    << (final_resp.has_resend()  ? "resend (still missing data)"
+        : final_resp.has_error() ? "error: " + final_resp.error().message()
+                                 : "unknown");
+
+  std::string job_id = final_resp.submit().job_id();
+  std::cout << "[Test] Upload with retransmission succeeded, job_id=" << job_id << std::endl;
+
+  stream->WritesDone();
+  ASSERT_TRUE(stream->Finish().ok());
+
+  // 6. Verify the solution is correct
+  grpc_client_config_t config;
+  config.timeout_seconds = 60;
+  auto client            = create_client(config);
+  ASSERT_NE(client, nullptr);
+
+  auto wait_result = client->wait_for_completion(job_id);
+  ASSERT_TRUE(wait_result.success) << wait_result.error_message;
+  ASSERT_EQ(wait_result.status, job_status_t::COMPLETED);
+
+  auto lp_result = client->get_lp_result<int32_t, double>(job_id);
+  ASSERT_TRUE(lp_result.success) << lp_result.error_message;
+  ASSERT_TRUE(lp_result.solution != nullptr) << "Solution should not be null";
+
+  const double expected_objective = -464.75;
+  EXPECT_NEAR(lp_result.solution->get_objective_value(), expected_objective, 1.0)
+    << "Incorrect result after retransmission - data may have been corrupted";
+
+  // Check server logs for resend activity
+  std::string server_logs = log_capture.get_server_logs();
+  EXPECT_TRUE(server_logs.find("requesting resend") != std::string::npos ||
+              server_logs.find("ResendRequest") != std::string::npos)
+    << "Server logs should show resend activity";
+}
+
+TEST_F(GrpcIntegrationTest, SelectiveRetransmission_NormalUploadNoResend)
+{
+  // Test that normal complete uploads don't trigger unnecessary resends
+  ASSERT_TRUE(start_server({"--max-message-mb", "0"}));  // Force streaming
+
+  GrpcTestLogCapture log_capture;
+  log_capture.set_server_log_path(server_.log_path());
+
+  grpc_client_config_t config;
+  config.debug_log_callback = log_capture.client_callback();
+  config.max_message_bytes  = 32 * 1024;  // Force streaming
+  config.chunk_size_bytes   = 8 * 1024;
+
+  auto client = create_client(config);
+  ASSERT_NE(client, nullptr);
+
+  log_capture.mark_test_start();
+
+  std::string mps_path = get_test_lp_path("afiro_original.mps");
+  auto problem         = load_problem_from_mps(mps_path);
+
+  pdlp_solver_settings_t<int32_t, double> settings;
+  settings.time_limit = 60.0;
+
+  auto result = client->solve_lp(problem, settings);
+  EXPECT_TRUE(result.success) << result.error_message;
+
+  // Verify no resend requests occurred
+  std::string client_logs = log_capture.get_client_logs();
+  EXPECT_TRUE(client_logs.find("requested resend") == std::string::npos)
+    << "No resend should occur for complete uploads";
+  EXPECT_TRUE(client_logs.find("Requesting resend") == std::string::npos)
+    << "No resend should occur for complete uploads";
+}
+
+// =============================================================================
+// Timeout and Robustness Tests
+// =============================================================================
+
+TEST_F(GrpcIntegrationTest, ServerTimeout_AbandonedUpload)
+{
+  // Test that server correctly times out when client abandons upload mid-stream
+  // Use short timeout (3 seconds) so test completes quickly
+
+  ASSERT_TRUE(start_server({"--max-message-mb", "1", "--chunk-timeout", "3", "--verbose"}));
+
+  GrpcTestLogCapture log_capture;
+  log_capture.set_server_log_path(server_.log_path());
+  log_capture.mark_test_start();
+
+  // Create gRPC channel directly for low-level control
+  auto channel =
+    grpc::CreateChannel("localhost:" + std::to_string(port_), grpc::InsecureChannelCredentials());
+  auto stub = cuopt::remote::CuOptRemoteService::NewStub(channel);
+
+  grpc::ClientContext context;
+  auto stream = stub->UploadAndSubmit(&context);
+
+  // 1. Send start message with a large total_size
+  cuopt::remote::UploadJobRequest start_req;
+  auto* start = start_req.mutable_start();
+  start->set_problem_type(cuopt::remote::LP);
+  start->set_resume(false);
+  start->set_total_size(100000);  // Claim we'll send 100KB
+  ASSERT_TRUE(stream->Write(start_req));
+
+  cuopt::remote::UploadJobResponse start_resp;
+  ASSERT_TRUE(stream->Read(&start_resp));
+  ASSERT_TRUE(start_resp.has_ack());
+  std::string upload_id = start_resp.ack().upload_id();
+  std::cout << "[Test] Started upload " << upload_id << ", sending one chunk then abandoning"
+            << std::endl;
+
+  // 2. Send ONE chunk (10 bytes) then stop - don't send finish
+  cuopt::remote::UploadJobRequest chunk_req;
+  auto* chunk = chunk_req.mutable_chunk();
+  chunk->set_upload_id(upload_id);
+  chunk->set_offset(0);
+  chunk->set_data("0123456789");  // Only 10 bytes of claimed 100KB
+  ASSERT_TRUE(stream->Write(chunk_req));
+
+  cuopt::remote::UploadJobResponse chunk_resp;
+  ASSERT_TRUE(stream->Read(&chunk_resp));
+  ASSERT_TRUE(chunk_resp.has_ack());
+
+  std::cout << "[Test] Sent one chunk, now waiting for server timeout (~3 seconds)..." << std::endl;
+
+  // 3. DON'T send finish - just abandon the stream
+  // Try to read - server should eventually timeout and close the stream
+  auto start_time = std::chrono::steady_clock::now();
+
+  cuopt::remote::UploadJobResponse timeout_resp;
+  bool got_response = stream->Read(&timeout_resp);
+
+  auto elapsed =
+    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start_time)
+      .count();
+
+  std::cout << "[Test] Server responded after " << elapsed
+            << " seconds, got_response=" << (got_response ? "true" : "false") << std::endl;
+
+  // Server should have closed the stream (Read returns false) or sent an error
+  // The timeout should be around 3 seconds (not immediate, not much longer)
+  EXPECT_GE(elapsed, 2) << "Server should wait at least 2 seconds before timeout";
+  EXPECT_LE(elapsed, 10) << "Server should timeout within 10 seconds";
+
+  // Clean up
+  stream->WritesDone();
+  grpc::Status status = stream->Finish();
+
+  std::cout << "[Test] Stream finished with status: " << status.error_code() << " - "
+            << status.error_message() << std::endl;
+
+  // Check server logs for timeout message
+  std::string server_logs = log_capture.get_server_logs();
+  bool has_timeout_log    = server_logs.find("timeout") != std::string::npos ||
+                         server_logs.find("Timeout") != std::string::npos ||
+                         server_logs.find("TIMEOUT") != std::string::npos;
+
+  std::cout << "[Test] Server logs mention timeout: " << (has_timeout_log ? "yes" : "no")
+            << std::endl;
+}
+
+TEST_F(GrpcIntegrationTest, ServerTimeout_NoChunksSent)
+{
+  // Test that server times out when client sends start but never sends any chunks
+  // This tests the "stalled at start" scenario
+
+  ASSERT_TRUE(start_server({"--max-message-mb", "1", "--chunk-timeout", "3", "--verbose"}));
+
+  GrpcTestLogCapture log_capture;
+  log_capture.set_server_log_path(server_.log_path());
+  log_capture.mark_test_start();
+
+  auto channel =
+    grpc::CreateChannel("localhost:" + std::to_string(port_), grpc::InsecureChannelCredentials());
+  auto stub = cuopt::remote::CuOptRemoteService::NewStub(channel);
+
+  grpc::ClientContext context;
+  auto stream = stub->UploadAndSubmit(&context);
+
+  // Send start message only
+  cuopt::remote::UploadJobRequest start_req;
+  auto* start = start_req.mutable_start();
+  start->set_problem_type(cuopt::remote::LP);
+  start->set_resume(false);
+  start->set_total_size(50000);  // Claim 50KB
+  ASSERT_TRUE(stream->Write(start_req));
+
+  cuopt::remote::UploadJobResponse start_resp;
+  ASSERT_TRUE(stream->Read(&start_resp));
+  ASSERT_TRUE(start_resp.has_ack());
+
+  std::cout << "[Test] Sent start, waiting for server timeout (no chunks sent)..." << std::endl;
+
+  // Don't send any chunks - wait for server to timeout
+  auto start_time = std::chrono::steady_clock::now();
+
+  cuopt::remote::UploadJobResponse timeout_resp;
+  bool got_response = stream->Read(&timeout_resp);
+
+  auto elapsed =
+    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start_time)
+      .count();
+
+  std::cout << "[Test] Server responded after " << elapsed << " seconds" << std::endl;
+
+  EXPECT_GE(elapsed, 2) << "Server should wait before timeout";
+  EXPECT_LE(elapsed, 10) << "Server should timeout reasonably quickly";
+
+  stream->WritesDone();
+  stream->Finish();
+}
+
+TEST_F(GrpcIntegrationTest, SelectiveRetransmission_AllChunksMissing)
+{
+  // Test that server correctly requests retransmission when NO data chunks are sent
+  // Client sends start + finish immediately, server should request ALL data
+
+  ASSERT_TRUE(start_server({"--max-message-mb", "1", "--verbose"}));
+
+  GrpcTestLogCapture log_capture;
+  log_capture.set_server_log_path(server_.log_path());
+  log_capture.mark_test_start();
+
+  // Load a small problem
+  std::string mps_path = get_test_lp_path("afiro_original.mps");
+  auto problem         = load_problem_from_mps(mps_path);
+
+  pdlp_solver_settings_t<int32_t, double> settings;
+  settings.time_limit = 60.0;
+
+  auto submit_request = build_lp_submit_request(problem, settings);
+  const auto& lp_req  = submit_request.lp_request();
+  std::string serialized_problem;
+  ASSERT_TRUE(lp_req.SerializeToString(&serialized_problem));
+
+  auto channel =
+    grpc::CreateChannel("localhost:" + std::to_string(port_), grpc::InsecureChannelCredentials());
+  auto stub = cuopt::remote::CuOptRemoteService::NewStub(channel);
+
+  grpc::ClientContext context;
+  auto stream = stub->UploadAndSubmit(&context);
+
+  // 1. Send start
+  cuopt::remote::UploadJobRequest start_req;
+  auto* start = start_req.mutable_start();
+  start->set_problem_type(cuopt::remote::LP);
+  start->set_resume(false);
+  start->set_total_size(serialized_problem.size());
+  ASSERT_TRUE(stream->Write(start_req));
+
+  cuopt::remote::UploadJobResponse start_resp;
+  ASSERT_TRUE(stream->Read(&start_resp));
+  ASSERT_TRUE(start_resp.has_ack());
+  std::string upload_id = start_resp.ack().upload_id();
+
+  // 2. Send finish IMMEDIATELY without sending any chunks
+  cuopt::remote::UploadJobRequest finish_req;
+  finish_req.mutable_finish()->set_upload_id(upload_id);
+  ASSERT_TRUE(stream->Write(finish_req));
+
+  cuopt::remote::UploadJobResponse finish_resp;
+  ASSERT_TRUE(stream->Read(&finish_resp));
+
+  // Server should request resend of ALL data (entire range 0 to total_size)
+  ASSERT_TRUE(finish_resp.has_resend())
+    << "Expected ResendRequest for all missing data, got: "
+    << (finish_resp.has_ack()      ? "ack"
+        : finish_resp.has_submit() ? "submit"
+        : finish_resp.has_error()  ? "error: " + finish_resp.error().message()
+                                   : "unknown");
+
+  const auto& resend = finish_resp.resend();
+  ASSERT_GE(resend.missing_ranges_size(), 1) << "Should request at least one range";
+
+  // Calculate total missing bytes requested
+  int64_t total_missing = 0;
+  for (const auto& range : resend.missing_ranges()) {
+    total_missing += range.size();
+    std::cout << "[Test] Server requested range: offset=" << range.offset()
+              << " size=" << range.size() << std::endl;
+  }
+
+  EXPECT_EQ(total_missing, static_cast<int64_t>(serialized_problem.size()))
+    << "Server should request all " << serialized_problem.size() << " bytes";
+
+  // 3. Now actually send all the data
+  const size_t chunk_size = 1024;
+  for (const auto& range : resend.missing_ranges()) {
+    int64_t offset = range.offset();
+    int64_t end    = offset + range.size();
+
+    while (offset < end) {
+      size_t n = std::min(static_cast<size_t>(end - offset), chunk_size);
+
+      cuopt::remote::UploadJobRequest chunk_req;
+      auto* chunk = chunk_req.mutable_chunk();
+      chunk->set_upload_id(upload_id);
+      chunk->set_offset(offset);
+      chunk->set_data(serialized_problem.data() + offset, n);
+      ASSERT_TRUE(stream->Write(chunk_req));
+
+      cuopt::remote::UploadJobResponse chunk_resp;
+      ASSERT_TRUE(stream->Read(&chunk_resp));
+      ASSERT_TRUE(chunk_resp.has_ack());
+
+      offset += static_cast<int64_t>(n);
+    }
+  }
+
+  // 4. Send finish again
+  ASSERT_TRUE(stream->Write(finish_req));
+
+  cuopt::remote::UploadJobResponse final_resp;
+  ASSERT_TRUE(stream->Read(&final_resp));
+
+  // Should now get submit response with job_id
+  ASSERT_TRUE(final_resp.has_submit())
+    << "Expected submit after resending all data, got: "
+    << (final_resp.has_ack()      ? "ack"
+        : final_resp.has_resend() ? "resend (still missing data)"
+        : final_resp.has_error()  ? "error: " + final_resp.error().message()
+                                  : "unknown");
+
+  std::string job_id = final_resp.submit().job_id();
+  std::cout << "[Test] Upload complete, job_id=" << job_id << std::endl;
+
+  stream->WritesDone();
+  stream->Finish();
+}
+
+TEST_F(GrpcIntegrationTest, ClientDisconnect_GracefulStreamClose)
+{
+  // Test that server handles graceful client disconnect (WritesDone + Finish)
+  // This shouldn't cause any server errors or resource leaks
+
+  ASSERT_TRUE(start_server({"--max-message-mb", "1", "--chunk-timeout", "3", "--verbose"}));
+
+  GrpcTestLogCapture log_capture;
+  log_capture.set_server_log_path(server_.log_path());
+  log_capture.mark_test_start();
+
+  auto channel =
+    grpc::CreateChannel("localhost:" + std::to_string(port_), grpc::InsecureChannelCredentials());
+  auto stub = cuopt::remote::CuOptRemoteService::NewStub(channel);
+
+  grpc::ClientContext context;
+  // Set deadline so Finish() doesn't block forever waiting for server
+  context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+  auto stream = stub->UploadAndSubmit(&context);
+
+  // Send start
+  cuopt::remote::UploadJobRequest start_req;
+  auto* start = start_req.mutable_start();
+  start->set_problem_type(cuopt::remote::LP);
+  start->set_resume(false);
+  start->set_total_size(10000);
+  ASSERT_TRUE(stream->Write(start_req));
+
+  cuopt::remote::UploadJobResponse start_resp;
+  ASSERT_TRUE(stream->Read(&start_resp));
+  ASSERT_TRUE(start_resp.has_ack());
+
+  std::cout << "[Test] Started upload, now gracefully closing stream..." << std::endl;
+
+  // Gracefully close without sending all data
+  stream->WritesDone();
+  grpc::Status status = stream->Finish();
+
+  std::cout << "[Test] Stream closed with status: " << status.error_code() << " - "
+            << status.error_message() << std::endl;
+
+  // Server should handle this gracefully - check logs for errors
+  std::string server_logs = log_capture.get_server_logs();
+
+  // Look for crash indicators (shouldn't find any)
+  bool has_crash = server_logs.find("SEGV") != std::string::npos ||
+                   server_logs.find("SIGABRT") != std::string::npos ||
+                   server_logs.find("core dump") != std::string::npos;
+
+  EXPECT_FALSE(has_crash) << "Server should not crash on graceful disconnect";
+
+  // Server should still be responsive - try another operation
+  grpc_client_config_t config;
+  auto client = create_client(config);
+  ASSERT_NE(client, nullptr);
+
+  // Simple health check - server should respond
+  auto status_result = client->check_status("nonexistent-job");
+  EXPECT_TRUE(status_result.success) << "Server should still be responsive after client disconnect";
+}
+
+// =============================================================================
+// Streaming Path Verification Tests (verify correct path via client logs)
+// =============================================================================
+
+TEST_F(GrpcIntegrationTest, VerifyUnaryUpload_SmallProblem)
+{
+  // Verify that small problems use unary upload (not streaming)
+  ASSERT_TRUE(start_server());  // Default server with large message limit
+
+  GrpcTestLogCapture log_capture;
+
+  grpc_client_config_t config;
+  config.debug_log_callback = log_capture.client_callback();
+
+  auto client = create_client(config);
+  ASSERT_NE(client, nullptr);
+
+  log_capture.mark_test_start();
+
+  // Use a small problem that should fit in a single message
+  std::string mps_path = get_test_lp_path("afiro_original.mps");
+  auto problem         = load_problem_from_mps(mps_path);
+
+  pdlp_solver_settings_t<int32_t, double> settings;
+  settings.time_limit = 10.0;
+
+  auto result = client->solve_lp(problem, settings);
+  EXPECT_TRUE(result.success) << result.error_message;
+
+  // Verify unary path was used for upload
+  EXPECT_TRUE(log_capture.client_log_contains("Attempting unary submit"))
+    << "Should attempt unary submit for small problem. Logs:\n"
+    << log_capture.get_client_logs();
+  EXPECT_TRUE(log_capture.client_log_contains("Unary submit succeeded"))
+    << "Should succeed with unary submit. Logs:\n"
+    << log_capture.get_client_logs();
+  EXPECT_FALSE(log_capture.client_log_contains("Starting streaming upload"))
+    << "Should NOT use streaming upload for small problem. Logs:\n"
+    << log_capture.get_client_logs();
+}
+
+TEST_F(GrpcIntegrationTest, VerifyStreaming_LargeProblemBothDirections)
+{
+  // Verify that large problems use streaming for BOTH upload AND download
+  // Use a very small message limit to force streaming in both directions
+  ASSERT_TRUE(start_server({"--max-message-mb", "0"}));  // Minimum limit
+
+  GrpcTestLogCapture log_capture;
+
+  grpc_client_config_t config;
+  config.timeout_seconds    = 180;
+  config.max_message_bytes  = 4 * 1024;  // 4KB - very small to force streaming for results too
+  config.chunk_size_bytes   = 2 * 1024;  // 2KB chunks
+  config.debug_log_callback = log_capture.client_callback();
+
+  auto client = create_client(config);
+  ASSERT_NE(client, nullptr);
+
+  log_capture.mark_test_start();
+
+  // Load cod105_max.mps (2.6MB) - much larger than 4KB limit
+  // The solution will also be large enough to require streaming download
+  std::string mps_path = get_test_mip_path("cod105_max.mps");
+  auto problem         = load_problem_from_mps(mps_path);
+
+  mip_solver_settings_t<int32_t, double> settings;
+  settings.time_limit = 5.0;  // Short time - testing streaming, not solve accuracy
+
+  auto result = client->solve_mip(problem, settings, false);
+  EXPECT_TRUE(result.success) << result.error_message;
+
+  std::string client_logs = log_capture.get_client_logs();
+
+  // === Verify UPLOAD streaming ===
+  bool upload_streaming_used =
+    log_capture.client_log_contains("Starting streaming upload") ||
+    log_capture.client_log_contains("falling back to streaming upload") ||
+    log_capture.client_log_contains("Using streaming upload directly");
+  EXPECT_TRUE(upload_streaming_used) << "Should use streaming upload for large problem. Logs:\n"
+                                     << client_logs;
+
+  EXPECT_TRUE(log_capture.client_log_contains("Streaming upload completed"))
+    << "Streaming upload should complete. Logs:\n"
+    << client_logs;
+
+  EXPECT_TRUE(log_capture.client_log_contains_pattern("sent [0-9]+ chunks"))
+    << "Should log number of chunks sent. Logs:\n"
+    << client_logs;
+
+  // === Verify DOWNLOAD streaming ===
+  bool download_streaming_used =
+    log_capture.client_log_contains("Starting streaming download") ||
+    log_capture.client_log_contains("Using streaming download directly") ||
+    log_capture.client_log_contains("falling back to streaming");
+  EXPECT_TRUE(download_streaming_used) << "Should use streaming download for large result. Logs:\n"
+                                       << client_logs;
+
+  EXPECT_TRUE(log_capture.client_log_contains("Streaming download completed"))
+    << "Streaming download should complete. Logs:\n"
+    << client_logs;
+
+  EXPECT_TRUE(log_capture.client_log_contains_pattern("received [0-9]+ chunks"))
+    << "Should log number of chunks received. Logs:\n"
+    << client_logs;
+
+  // === Verify size negotiation logging ===
+  EXPECT_TRUE(log_capture.client_log_contains("data_size="))
+    << "Should log data size during upload. Logs:\n"
+    << client_logs;
+  EXPECT_TRUE(log_capture.client_log_contains("effective_max="))
+    << "Should log effective max limit. Logs:\n"
+    << client_logs;
+}
+
+TEST_F(GrpcIntegrationTest, VerifyUnaryDownload_SmallResult)
+{
+  // Verify that small results use unary download (not streaming)
+  ASSERT_TRUE(start_server());  // Default server with large message limit
+
+  GrpcTestLogCapture log_capture;
+
+  grpc_client_config_t config;
+  config.debug_log_callback = log_capture.client_callback();
+
+  auto client = create_client(config);
+  ASSERT_NE(client, nullptr);
+
+  // Use a small problem with a small result
+  std::string mps_path = get_test_lp_path("afiro_original.mps");
+  auto problem         = load_problem_from_mps(mps_path);
+
+  pdlp_solver_settings_t<int32_t, double> settings;
+  settings.time_limit = 10.0;
+
+  // Clear logs just before the solve to focus on download logs
+  log_capture.mark_test_start();
+
+  auto result = client->solve_lp(problem, settings);
+  EXPECT_TRUE(result.success) << result.error_message;
+
+  // Verify unary path was used for download
+  EXPECT_TRUE(log_capture.client_log_contains("Attempting unary GetResult"))
+    << "Should attempt unary GetResult for small result. Logs:\n"
+    << log_capture.get_client_logs();
+  EXPECT_TRUE(log_capture.client_log_contains("Unary GetResult succeeded"))
+    << "Should succeed with unary GetResult. Logs:\n"
+    << log_capture.get_client_logs();
+  EXPECT_FALSE(log_capture.client_log_contains("Starting streaming download"))
+    << "Should NOT use streaming download for small result. Logs:\n"
+    << log_capture.get_client_logs();
+}
+
+TEST_F(GrpcIntegrationTest, VerifyMessageSizeNegotiation)
+{
+  // Verify that client logs the size negotiation details
+  ASSERT_TRUE(start_server({"--max-message-mb", "1"}));
+
+  GrpcTestLogCapture log_capture;
+
+  grpc_client_config_t config;
+  config.timeout_seconds    = 120;
+  config.max_message_bytes  = 256 * 1024 * 1024;  // Client thinks 256MB is ok
+  config.debug_log_callback = log_capture.client_callback();
+
+  auto client = create_client(config);
+  ASSERT_NE(client, nullptr);
+
+  log_capture.mark_test_start();
+
+  // Load a problem larger than server's 1MB limit
+  std::string mps_path = get_test_mip_path("cod105_max.mps");
+  auto problem         = load_problem_from_mps(mps_path);
+
+  mip_solver_settings_t<int32_t, double> settings;
+  settings.time_limit = 5.0;  // Short time - testing negotiation, not solve accuracy
+
+  auto result = client->solve_mip(problem, settings, false);
+  EXPECT_TRUE(result.success) << result.error_message;
+
+  // Verify the logs show the size comparison
+  EXPECT_TRUE(log_capture.client_log_contains("data_size=")) << "Should log data size. Logs:\n"
+                                                             << log_capture.get_client_logs();
+  EXPECT_TRUE(log_capture.client_log_contains("client_max="))
+    << "Should log client max message size. Logs:\n"
+    << log_capture.get_client_logs();
+  EXPECT_TRUE(log_capture.client_log_contains("effective_max="))
+    << "Should log effective max (considering both client and server limits). Logs:\n"
+    << log_capture.get_client_logs();
+}
+
+TEST_F(GrpcIntegrationTest, VerifyStreamingFallbackOnResourceExhausted)
+{
+  // Verify that streaming is used when effective max is smaller than data size
+  // Use very small limits to force streaming for the ~620KB problem
+  ASSERT_TRUE(start_server({"--max-message-mb", "0"}));  // Minimum limit
+
+  GrpcTestLogCapture log_capture;
+
+  grpc_client_config_t config;
+  config.timeout_seconds = 120;
+  // Set client's max small so streaming is used directly
+  config.max_message_bytes  = 64 * 1024;  // 64KB - smaller than the ~620KB problem
+  config.chunk_size_bytes   = 32 * 1024;  // 32KB chunks
+  config.debug_log_callback = log_capture.client_callback();
+
+  auto client = create_client(config);
+  ASSERT_NE(client, nullptr);
+
+  log_capture.mark_test_start();
+
+  // Load a problem larger than 64KB limit
+  std::string mps_path = get_test_mip_path("cod105_max.mps");  // ~620KB
+  auto problem         = load_problem_from_mps(mps_path);
+
+  mip_solver_settings_t<int32_t, double> settings;
+  settings.time_limit = 5.0;  // Short time - testing streaming, not solve accuracy
+
+  auto result = client->solve_mip(problem, settings, false);
+  EXPECT_TRUE(result.success) << result.error_message;
+
+  // Client should recognize that data_size > effective_max and use streaming directly
+  bool streaming_used = log_capture.client_log_contains("falling back to streaming upload") ||
+                        log_capture.client_log_contains("Using streaming upload directly") ||
+                        log_capture.client_log_contains("Starting streaming upload");
+
+  EXPECT_TRUE(streaming_used) << "Should use streaming (either fallback or direct). Logs:\n"
+                              << log_capture.get_client_logs();
+
+  EXPECT_TRUE(log_capture.client_log_contains("Streaming upload completed"))
+    << "Streaming upload should complete successfully. Logs:\n"
+    << log_capture.get_client_logs();
 }
 
 // =============================================================================
@@ -941,7 +2072,7 @@ TEST_F(GrpcIntegrationTest, IncumbentCallbacks_MIP)
   auto problem         = load_problem_from_mps(mps_path);
 
   mip_solver_settings_t<int32_t, double> settings;
-  settings.time_limit = 30.0;
+  settings.time_limit = 15.0;  // Enough time to generate some incumbents
 
   // Solve with incumbents enabled
   auto result = client->solve_mip(problem, settings, true);
@@ -1024,7 +2155,7 @@ TEST_F(GrpcIntegrationTest, SolveInfeasibleLP)
   problem.set_constraint_upper_bounds(nullptr, 0);
 
   pdlp_solver_settings_t<int32_t, double> settings;
-  settings.time_limit = 30.0;
+  settings.time_limit = 10.0;
 
   auto result = client->solve_lp(problem, settings);
 
@@ -1166,6 +2297,87 @@ TEST_F(GrpcIntegrationTest, ConcurrentJobSubmission)
   }
 
   std::cout << "[Test] All 3 concurrent jobs completed successfully" << std::endl;
+}
+
+TEST_F(GrpcIntegrationTest, ConcurrentStreamingTransfers)
+{
+  // Test multiple clients performing streaming uploads/downloads simultaneously
+  // This verifies server handles concurrent streaming without data corruption
+  // Uses small message limits to force streaming even for small problems
+  ASSERT_TRUE(start_server({"--max-message-mb", "0"}));  // Force streaming
+
+  const int num_clients = 3;
+  std::vector<std::unique_ptr<grpc_client_t>> clients;
+  std::vector<std::future<bool>> futures;
+
+  // Create clients with very small message limits to force streaming
+  // afiro serialized is ~2.7KB, result is ~792 bytes
+  // Use 512 byte limit to force streaming in both directions
+  for (int i = 0; i < num_clients; ++i) {
+    grpc_client_config_t config;
+    config.timeout_seconds   = 30;
+    config.max_message_bytes = 512;  // 512 bytes - force streaming for afiro
+    config.chunk_size_bytes  = 256;  // 256 byte chunks
+    auto client              = create_client(config);
+    ASSERT_NE(client, nullptr) << "Failed to create client " << i;
+    clients.push_back(std::move(client));
+  }
+
+  // Load test problem - use afiro for speed (small but verifiable)
+  // afiro serialized is ~2.7KB, result is ~792 bytes - both will stream with 512B limit
+  std::string mps_path = get_test_lp_path("afiro_original.mps");
+  auto problem         = load_problem_from_mps(mps_path);
+
+  pdlp_solver_settings_t<int32_t, double> settings;
+  settings.time_limit = 10.0;  // Short timeout for speed
+
+  // Launch concurrent streaming solves
+  std::atomic<int> success_count{0};
+  std::atomic<int> failure_count{0};
+
+  auto solve_task = [&](int client_idx) -> bool {
+    try {
+      auto result = clients[client_idx]->solve_lp(problem, settings);
+      if (result.success && result.solution != nullptr) {
+        double obj = result.solution->get_objective_value();
+        if (std::abs(obj - (-464.753)) < 1.0) {
+          success_count++;
+          return true;
+        } else {
+          std::cerr << "[Test] Client " << client_idx << " wrong objective: " << obj << std::endl;
+          failure_count++;
+          return false;
+        }
+      } else {
+        std::cerr << "[Test] Client " << client_idx << " failed: " << result.error_message
+                  << std::endl;
+        failure_count++;
+        return false;
+      }
+    } catch (const std::exception& e) {
+      std::cerr << "[Test] Client " << client_idx << " exception: " << e.what() << std::endl;
+      failure_count++;
+      return false;
+    }
+  };
+
+  // Launch all clients in parallel
+  for (int i = 0; i < num_clients; ++i) {
+    futures.push_back(std::async(std::launch::async, solve_task, i));
+  }
+
+  // Wait for all to complete
+  for (int i = 0; i < num_clients; ++i) {
+    bool result = futures[i].get();
+    EXPECT_TRUE(result) << "Client " << i << " streaming solve failed";
+  }
+
+  EXPECT_EQ(success_count.load(), num_clients)
+    << "Expected all " << num_clients << " clients to succeed, got " << success_count.load()
+    << " successes, " << failure_count.load() << " failures";
+
+  std::cout << "[Test] All " << num_clients << " concurrent streaming transfers completed"
+            << std::endl;
 }
 
 // =============================================================================
@@ -1341,7 +2553,7 @@ TEST_F(GrpcTlsIntegrationTest, TLS_SolveLP)
   std::string mps_path = get_test_lp_path("afiro_original.mps");
   auto problem         = load_problem_from_mps(mps_path);
   pdlp_solver_settings_t<int32_t, double> settings;
-  settings.time_limit = 30.0;
+  settings.time_limit = 10.0;
 
   auto result = client->solve_lp(problem, settings);
   EXPECT_TRUE(result.success) << result.error_message;
