@@ -28,7 +28,7 @@ template <typename i_t, typename f_t>
 cpu_optimization_problem_t<i_t, f_t>::cpu_optimization_problem_t(raft::handle_t const* handle_ptr)
   : handle_ptr_(handle_ptr)
 {
-  fprintf(stderr, "cpu_optimization_problem_t constructor: Using CPU backend\n");
+  CUOPT_LOG_INFO("cpu_optimization_problem_t constructor: Using CPU backend");
 }
 
 // ==============================================================================

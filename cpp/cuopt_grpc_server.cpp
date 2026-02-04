@@ -1203,33 +1203,14 @@ void result_retrieval_thread()
           error_message = result_queue[i].error_message;
         }
 
-        // Check if there's a blocking waiter
-        {
-          std::lock_guard<std::mutex> lock(waiters_mutex);
-          auto wit = waiting_threads.find(job_id);
-          if (wit != waiting_threads.end()) {
-            // Wake up all waiting threads sharing this waiter
-            auto waiter = wit->second;
-            {
-              std::lock_guard<std::mutex> waiter_lock(waiter->mutex);
-              waiter->result_data   = std::move(result_data);
-              waiter->error_message = error_message;
-              waiter->success       = success;
-              waiter->ready         = true;
-            }
-            waiter->cv.notify_all();
-            waiting_threads.erase(wit);
-          }
-        }
-
-        // Update job tracker
+        // Update job tracker first (before moving data to waiter)
         {
           std::lock_guard<std::mutex> lock(tracker_mutex);
           auto it = job_tracker.find(job_id);
           if (it != job_tracker.end()) {
             if (success) {
               it->second.status      = JobStatus::COMPLETED;
-              it->second.result_data = result_data;
+              it->second.result_data = result_data;  // Copy before potential move
               if (config.verbose) {
                 std::cout << "[Server] Marked job COMPLETED in job_tracker: " << job_id
                           << " result_bytes=" << result_data.size() << "\n";
@@ -1252,6 +1233,25 @@ void result_retrieval_thread()
                 std::cout.flush();
               }
             }
+          }
+        }
+
+        // Check if there's a blocking waiter
+        {
+          std::lock_guard<std::mutex> lock(waiters_mutex);
+          auto wit = waiting_threads.find(job_id);
+          if (wit != waiting_threads.end()) {
+            // Wake up all waiting threads sharing this waiter
+            auto waiter = wit->second;
+            {
+              std::lock_guard<std::mutex> waiter_lock(waiter->mutex);
+              waiter->result_data   = std::move(result_data);
+              waiter->error_message = error_message;
+              waiter->success       = success;
+              waiter->ready         = true;
+            }
+            waiter->cv.notify_all();
+            waiting_threads.erase(wit);
           } else if (config.verbose) {
             std::cout << "[Server] WARNING: result for unknown job_id (not in job_tracker): "
                       << job_id << "\n";
@@ -2607,13 +2607,25 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
   {
     std::string job_id = request->job_id();
 
+    size_t erased = 0;
     {
       std::lock_guard<std::mutex> lock(tracker_mutex);
-      job_tracker.erase(job_id);
+      erased = job_tracker.erase(job_id);
+    }
+
+    if (erased == 0) {
+      // Job not found in tracker
+      response->set_status(cuopt::remote::ERROR_NOT_FOUND);
+      response->set_message("Job not found: " + job_id);
+      if (config.verbose) {
+        std::cout << "[gRPC] DeleteResult job not found: " << job_id << std::endl;
+      }
+      return Status::OK;
     }
 
     delete_log_file(job_id);
 
+    response->set_status(cuopt::remote::SUCCESS);
     response->set_message("Result deleted");
 
     if (config.verbose) { std::cout << "[gRPC] Result deleted for job: " << job_id << std::endl; }
@@ -2724,12 +2736,10 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
         std::string msg;
         JobStatus s = check_job_status(job_id, msg);
         if (s == JobStatus::NOT_FOUND) {
-          cuopt::remote::LogMessage m;
-          m.set_line("Job not found");
-          m.set_byte_offset(from_byte);
-          m.set_job_complete(true);
-          writer->Write(m);
-          return Status::OK;
+          if (config.verbose) {
+            std::cout << "[gRPC] StreamLogs job not found: " << job_id << std::endl;
+          }
+          return Status(grpc::StatusCode::NOT_FOUND, "Job not found: " + job_id);
         }
         // else job exists but log not yet created; keep waiting
         waited_ms = 0;

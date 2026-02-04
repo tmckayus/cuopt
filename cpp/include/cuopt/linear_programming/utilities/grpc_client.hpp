@@ -29,6 +29,10 @@ class CuOptRemoteService;
 
 namespace cuopt::linear_programming {
 
+// Forward declarations for test helper functions (implemented in grpc_client.cu)
+void grpc_test_inject_mock_stub(class grpc_client_t& client, std::shared_ptr<void> stub);
+void grpc_test_mark_as_connected(class grpc_client_t& client);
+
 /**
  * @brief Configuration options for the gRPC client
  *
@@ -40,8 +44,8 @@ namespace cuopt::linear_programming {
  */
 struct grpc_client_config_t {
   std::string server_address = "localhost:9112";
-  int poll_interval_ms       = 500;    // How often to poll for status (when use_wait=false)
-  int timeout_seconds        = 3600;   // Max time to wait for job completion (1 hour default)
+  int poll_interval_ms       = 500;  // How often to poll for status (when use_wait=false)
+  int timeout_seconds        = -1;  // Max time to wait for job completion (-1 = use default 1 hour)
   bool use_wait              = false;  // Use WaitForCompletion RPC instead of polling CheckStatus
   bool stream_logs           = false;  // Whether to stream logs from server
   std::function<void(const std::string&)> log_callback = nullptr;  // Called for each log line
@@ -185,6 +189,10 @@ struct remote_mip_result_t {
  * - solve_lp_remote() and solve_mip_remote() for production use
  */
 class grpc_client_t {
+  // Allow test helpers to access internal implementation for mock injection
+  friend void grpc_test_inject_mock_stub(grpc_client_t&, std::shared_ptr<void>);
+  friend void grpc_test_mark_as_connected(grpc_client_t&);
+
  public:
   /**
    * @brief Construct a gRPC client with configuration
