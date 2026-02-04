@@ -7,10 +7,11 @@
 
 #pragma once
 
+#include <cuopt/linear_programming/cpu_optimization_problem.hpp>
+#include <cuopt/linear_programming/gpu_optimization_problem.hpp>
 #include <cuopt/linear_programming/mip/solver_settings.hpp>
 #include <cuopt/linear_programming/mip/solver_solution.hpp>
 #include <cuopt/linear_programming/optimization_problem.hpp>
-#include <cuopt/linear_programming/optimization_problem_interface.hpp>
 #include <cuopt/linear_programming/optimization_problem_solution_interface.hpp>
 #include <cuopt/linear_programming/pdlp/solver_settings.hpp>
 #include <cuopt/linear_programming/pdlp/solver_solution.hpp>
@@ -148,7 +149,51 @@ optimization_problem_t<i_t, f_t> mps_data_model_to_optimization_problem(
   const cuopt::mps_parser::mps_data_model_t<i_t, f_t>& data_model);
 
 // ============================================================================
-// New overloads for optimization_problem_interface_t with remote execution
+// CPU problem overloads (convert to GPU, solve, convert solution back)
+// ============================================================================
+
+/**
+ * @brief Linear programming solve function for CPU-backed problems.
+ *
+ * Converts the CPU problem to GPU, calls the GPU solver, and converts
+ * the solution back to CPU format.
+ *
+ * @tparam i_t Data type of indexes
+ * @tparam f_t Data type of the variables and their weights in the equations
+ * @param[in] cpu_problem  A cpu_optimization_problem_t with the problem data
+ * @param[in] settings  PDLP solver settings
+ * @param[in] problem_checking  If true, the problem is checked for consistency
+ * @param[in] use_pdlp_solver_mode  If true, use PDLP hyperparameters from solver mode
+ * @param[in] is_batch_mode  If true, batch solve mode is enabled
+ * @return std::unique_ptr<lp_solution_interface_t<i_t, f_t>> CPU solution
+ */
+template <typename i_t, typename f_t>
+std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp(
+  cpu_optimization_problem_t<i_t, f_t>& cpu_problem,
+  pdlp_solver_settings_t<i_t, f_t> const& settings = pdlp_solver_settings_t<i_t, f_t>{},
+  bool problem_checking                            = true,
+  bool use_pdlp_solver_mode                        = true,
+  bool is_batch_mode                               = false);
+
+/**
+ * @brief Mixed integer programming solve function for CPU-backed problems.
+ *
+ * Converts the CPU problem to GPU, calls the GPU solver, and converts
+ * the solution back to CPU format.
+ *
+ * @tparam i_t Data type of indexes
+ * @tparam f_t Data type of the variables and their weights in the equations
+ * @param[in] cpu_problem  A cpu_optimization_problem_t with the problem data
+ * @param[in] settings  MIP solver settings
+ * @return std::unique_ptr<mip_solution_interface_t<i_t, f_t>> CPU solution
+ */
+template <typename i_t, typename f_t>
+std::unique_ptr<mip_solution_interface_t<i_t, f_t>> solve_mip(
+  cpu_optimization_problem_t<i_t, f_t>& cpu_problem,
+  mip_solver_settings_t<i_t, f_t> const& settings = mip_solver_settings_t<i_t, f_t>{});
+
+// ============================================================================
+// Interface-based overloads with remote execution support
 // ============================================================================
 
 /**
@@ -233,13 +278,13 @@ std::unique_ptr<mip_solution_interface_t<i_t, f_t>> solve_mip_remote(
  *
  * @tparam i_t Data type of indexes
  * @tparam f_t Data type of the variables and their weights in the equations
- * @param[in] gpu_problem  GPU-backed optimization problem
+ * @param[in] problem  GPU-backed optimization problem
  * @param[in] settings  PDLP solver settings
  * @return std::unique_ptr<lp_solution_interface_t<i_t, f_t>> Solution interface
  */
 template <typename i_t, typename f_t>
 std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp_remote(
-  gpu_optimization_problem_t<i_t, f_t>& gpu_problem,
+  optimization_problem_t<i_t, f_t>& problem,
   pdlp_solver_settings_t<i_t, f_t> const& settings = pdlp_solver_settings_t<i_t, f_t>{});
 
 /**
@@ -250,13 +295,13 @@ std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp_remote(
  *
  * @tparam i_t Data type of indexes
  * @tparam f_t Data type of the variables and their weights in the equations
- * @param[in] gpu_problem  GPU-backed optimization problem
+ * @param[in] problem  GPU-backed optimization problem
  * @param[in] settings  MIP solver settings
  * @return std::unique_ptr<mip_solution_interface_t<i_t, f_t>> Solution interface
  */
 template <typename i_t, typename f_t>
 std::unique_ptr<mip_solution_interface_t<i_t, f_t>> solve_mip_remote(
-  gpu_optimization_problem_t<i_t, f_t>& gpu_problem,
+  optimization_problem_t<i_t, f_t>& problem,
   mip_solver_settings_t<i_t, f_t> const& settings = mip_solver_settings_t<i_t, f_t>{});
 
 }  // namespace cuopt::linear_programming

@@ -6,7 +6,7 @@
 /* clang-format on */
 #pragma once
 
-#include <cuopt/linear_programming/optimization_problem.hpp>
+#include <cuopt/linear_programming/gpu_optimization_problem.hpp>
 namespace cuopt::linear_programming::detail {
 
 template <typename i_t, typename f_t>

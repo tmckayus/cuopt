@@ -8,9 +8,10 @@
 #pragma once
 
 #include <cuopt/linear_programming/cuopt_c.h>
+#include <cuopt/linear_programming/cpu_optimization_problem.hpp>
+#include <cuopt/linear_programming/gpu_optimization_problem.hpp>
 #include <cuopt/linear_programming/mip/solver_solution.hpp>
 #include <cuopt/linear_programming/optimization_problem.hpp>
-#include <cuopt/linear_programming/optimization_problem_interface.hpp>
 #include <cuopt/linear_programming/optimization_problem_solution_interface.hpp>
 #include <cuopt/linear_programming/pdlp/solver_solution.hpp>
 
@@ -28,7 +29,7 @@ struct problem_and_stream_view_t {
       // GPU memory backend: Allocate CUDA resources
       stream_view_ptr = new rmm::cuda_stream_view(rmm::cuda_stream_per_thread);
       handle_ptr      = new raft::handle_t(*stream_view_ptr);
-      gpu_problem     = new gpu_optimization_problem_t<cuopt_int_t, cuopt_float_t>(handle_ptr);
+      gpu_problem     = new optimization_problem_t<cuopt_int_t, cuopt_float_t>(handle_ptr);
       cpu_problem     = nullptr;
     } else {
       // CPU memory backend: No CUDA resources allocated (for remote execution on CPU-only hosts)
@@ -56,17 +57,17 @@ struct problem_and_stream_view_t {
                  cpu_problem);
   }
 
-  optimization_problem_t<cuopt_int_t, cuopt_float_t> to_optimization_problem()
+  optimization_problem_t<cuopt_int_t, cuopt_float_t>* get_gpu_problem()
   {
     if (memory_backend == memory_backend_t::GPU) {
-      return gpu_problem->to_optimization_problem();
+      return gpu_problem;
     } else {
-      return cpu_problem->to_optimization_problem();
+      return nullptr;
     }
   }
 
   memory_backend_t memory_backend;
-  gpu_optimization_problem_t<cuopt_int_t, cuopt_float_t>* gpu_problem;
+  optimization_problem_t<cuopt_int_t, cuopt_float_t>* gpu_problem;
   cpu_optimization_problem_t<cuopt_int_t, cuopt_float_t>* cpu_problem;
   rmm::cuda_stream_view*
     stream_view_ptr;           // nullptr for CPU memory backend to avoid CUDA initialization

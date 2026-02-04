@@ -1,13 +1,13 @@
 /* clang-format off */
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 /* clang-format on */
 #pragma once
 
+#include <cuopt/linear_programming/gpu_optimization_problem.hpp>
 #include <cuopt/linear_programming/mip/solver_settings.hpp>
-#include <cuopt/linear_programming/optimization_problem.hpp>
 #include <cuopt/linear_programming/pdlp/solver_settings.hpp>
 
 namespace rmm {

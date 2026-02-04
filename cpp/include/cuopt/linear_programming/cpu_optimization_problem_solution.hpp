@@ -331,6 +331,7 @@ class cpu_lp_solution_t : public lp_solution_interface_t<i_t, f_t> {
   /**
    * @brief Convert CPU solution to GPU solution
    * Copies data from host (std::vector) to device (rmm::device_uvector)
+   * Also converts warmstart data from CPU to GPU format
    */
   optimization_problem_solution_t<i_t, f_t> to_gpu_solution(
     rmm::cuda_stream_view stream_view) override
@@ -356,16 +357,95 @@ class cpu_lp_solution_t : public lp_solution_interface_t<i_t, f_t> {
     using additional_info_t =
       typename optimization_problem_solution_t<i_t, f_t>::additional_termination_information_t;
     std::vector<additional_info_t> termination_stats(1);
-    termination_stats[0].primal_objective = primal_objective_;
-    termination_stats[0].dual_objective   = dual_objective_;
-    termination_stats[0].solve_time       = solve_time_;
+    termination_stats[0].primal_objective      = primal_objective_;
+    termination_stats[0].dual_objective        = dual_objective_;
+    termination_stats[0].solve_time            = solve_time_;
+    termination_stats[0].l2_primal_residual    = l2_primal_residual_;
+    termination_stats[0].l2_dual_residual      = l2_dual_residual_;
+    termination_stats[0].gap                   = gap_;
+    termination_stats[0].number_of_steps_taken = num_iterations_;
+    termination_stats[0].solved_by_pdlp        = solved_by_pdlp_;
 
     std::vector<pdlp_termination_status_t> termination_status_vec = {termination_status_};
 
-    // Create GPU solution
+    // Convert CPU warmstart data to GPU format
+    pdlp_warm_start_data_t<i_t, f_t> gpu_warmstart;
+    const auto& ws = pdlp_warm_start_data_;
+
+    if (!ws.current_primal_solution_.empty()) {
+      // Allocate GPU vectors
+      gpu_warmstart.current_primal_solution_ =
+        rmm::device_uvector<f_t>(ws.current_primal_solution_.size(), stream_view);
+      gpu_warmstart.current_dual_solution_ =
+        rmm::device_uvector<f_t>(ws.current_dual_solution_.size(), stream_view);
+      gpu_warmstart.initial_primal_average_ =
+        rmm::device_uvector<f_t>(ws.initial_primal_average_.size(), stream_view);
+      gpu_warmstart.initial_dual_average_ =
+        rmm::device_uvector<f_t>(ws.initial_dual_average_.size(), stream_view);
+      gpu_warmstart.current_ATY_ = rmm::device_uvector<f_t>(ws.current_ATY_.size(), stream_view);
+      gpu_warmstart.sum_primal_solutions_ =
+        rmm::device_uvector<f_t>(ws.sum_primal_solutions_.size(), stream_view);
+      gpu_warmstart.sum_dual_solutions_ =
+        rmm::device_uvector<f_t>(ws.sum_dual_solutions_.size(), stream_view);
+      gpu_warmstart.last_restart_duality_gap_primal_solution_ =
+        rmm::device_uvector<f_t>(ws.last_restart_duality_gap_primal_solution_.size(), stream_view);
+      gpu_warmstart.last_restart_duality_gap_dual_solution_ =
+        rmm::device_uvector<f_t>(ws.last_restart_duality_gap_dual_solution_.size(), stream_view);
+
+      // Copy data from host to device
+      raft::copy(gpu_warmstart.current_primal_solution_.data(),
+                 ws.current_primal_solution_.data(),
+                 ws.current_primal_solution_.size(),
+                 stream_view);
+      raft::copy(gpu_warmstart.current_dual_solution_.data(),
+                 ws.current_dual_solution_.data(),
+                 ws.current_dual_solution_.size(),
+                 stream_view);
+      raft::copy(gpu_warmstart.initial_primal_average_.data(),
+                 ws.initial_primal_average_.data(),
+                 ws.initial_primal_average_.size(),
+                 stream_view);
+      raft::copy(gpu_warmstart.initial_dual_average_.data(),
+                 ws.initial_dual_average_.data(),
+                 ws.initial_dual_average_.size(),
+                 stream_view);
+      raft::copy(gpu_warmstart.current_ATY_.data(),
+                 ws.current_ATY_.data(),
+                 ws.current_ATY_.size(),
+                 stream_view);
+      raft::copy(gpu_warmstart.sum_primal_solutions_.data(),
+                 ws.sum_primal_solutions_.data(),
+                 ws.sum_primal_solutions_.size(),
+                 stream_view);
+      raft::copy(gpu_warmstart.sum_dual_solutions_.data(),
+                 ws.sum_dual_solutions_.data(),
+                 ws.sum_dual_solutions_.size(),
+                 stream_view);
+      raft::copy(gpu_warmstart.last_restart_duality_gap_primal_solution_.data(),
+                 ws.last_restart_duality_gap_primal_solution_.data(),
+                 ws.last_restart_duality_gap_primal_solution_.size(),
+                 stream_view);
+      raft::copy(gpu_warmstart.last_restart_duality_gap_dual_solution_.data(),
+                 ws.last_restart_duality_gap_dual_solution_.data(),
+                 ws.last_restart_duality_gap_dual_solution_.size(),
+                 stream_view);
+
+      // Copy scalar warmstart values
+      gpu_warmstart.initial_primal_weight_         = ws.initial_primal_weight_;
+      gpu_warmstart.initial_step_size_             = ws.initial_step_size_;
+      gpu_warmstart.total_pdlp_iterations_         = ws.total_pdlp_iterations_;
+      gpu_warmstart.total_pdhg_iterations_         = ws.total_pdhg_iterations_;
+      gpu_warmstart.last_candidate_kkt_score_      = ws.last_candidate_kkt_score_;
+      gpu_warmstart.last_restart_kkt_score_        = ws.last_restart_kkt_score_;
+      gpu_warmstart.sum_solution_weight_           = ws.sum_solution_weight_;
+      gpu_warmstart.iterations_since_last_restart_ = ws.iterations_since_last_restart_;
+    }
+
+    // Create GPU solution with warmstart data
     return optimization_problem_solution_t<i_t, f_t>(primal_device,
                                                      dual_device,
                                                      reduced_cost_device,
+                                                     std::move(gpu_warmstart),
                                                      "",  // objective_name
                                                      {},  // var_names
                                                      {},  // row_names

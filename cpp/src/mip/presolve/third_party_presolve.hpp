@@ -10,7 +10,7 @@
 #include <optional>
 #include <vector>
 
-#include <cuopt/linear_programming/optimization_problem.hpp>
+#include <cuopt/linear_programming/gpu_optimization_problem.hpp>
 
 namespace cuopt::linear_programming::detail {
 
