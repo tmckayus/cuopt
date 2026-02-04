@@ -49,6 +49,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -70,6 +71,112 @@ using grpc::StatusCode;
 
 using namespace cuopt::linear_programming;
 // Note: NOT using "using namespace cuopt::remote" to avoid JobStatus enum conflict
+
+// =============================================================================
+// Data Integrity - Simple Hash for Transfer Verification
+// =============================================================================
+
+/**
+ * @brief Compute FNV-1a 64-bit hash for data integrity verification.
+ * Same algorithm as client - allows comparison of upload/download hashes.
+ */
+inline uint64_t compute_data_hash(const uint8_t* data, size_t size)
+{
+  constexpr uint64_t FNV_OFFSET_BASIS = 14695981039346656037ULL;
+  constexpr uint64_t FNV_PRIME        = 1099511628211ULL;
+  uint64_t hash                       = FNV_OFFSET_BASIS;
+  for (size_t i = 0; i < size; ++i) {
+    hash ^= static_cast<uint64_t>(data[i]);
+    hash *= FNV_PRIME;
+  }
+  return hash;
+}
+
+inline std::string hash_to_hex(uint64_t hash)
+{
+  std::ostringstream oss;
+  oss << std::hex << std::setfill('0') << std::setw(16) << hash;
+  return oss.str();
+}
+
+// ============================================================================
+// Server Stream Watchdog - Timeout Detection for Streaming Operations
+// ============================================================================
+
+/**
+ * @brief RAII watchdog that tracks activity and can trigger context cancellation on timeout.
+ *
+ * For server-side use with ServerContext. Since ServerContext::TryCancel() is less
+ * commonly used, this watchdog primarily tracks activity for manual timeout checking.
+ */
+class ServerStreamWatchdog {
+ public:
+  ServerStreamWatchdog(ServerContext* context, int timeout_seconds)
+    : context_(context),
+      timeout_seconds_(timeout_seconds),
+      last_activity_(std::chrono::steady_clock::now()),
+      timed_out_(false),
+      stop_(false)
+  {
+    if (timeout_seconds_ > 0) {
+      watchdog_thread_ = std::thread([this]() { run(); });
+    }
+  }
+
+  ~ServerStreamWatchdog() { stop(); }
+
+  ServerStreamWatchdog(const ServerStreamWatchdog&)            = delete;
+  ServerStreamWatchdog& operator=(const ServerStreamWatchdog&) = delete;
+
+  void activity()
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    last_activity_ = std::chrono::steady_clock::now();
+  }
+
+  bool timed_out() const { return timed_out_.load(); }
+
+  void stop()
+  {
+    stop_.store(true);
+    if (watchdog_thread_.joinable()) { watchdog_thread_.join(); }
+  }
+
+ private:
+  void run()
+  {
+    while (!stop_.load()) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+
+      if (stop_.load()) break;
+
+      std::chrono::steady_clock::time_point last;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last = last_activity_;
+      }
+
+      auto now     = std::chrono::steady_clock::now();
+      auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last).count();
+
+      if (elapsed >= timeout_seconds_) {
+        timed_out_.store(true);
+        // Try to cancel the RPC to unblock any pending Read/Write operations
+        // This may not work perfectly for all operations, but it's our best option
+        if (context_) { context_->TryCancel(); }
+        break;
+      }
+    }
+  }
+
+  ServerContext* context_;
+  int timeout_seconds_;
+  std::chrono::steady_clock::time_point last_activity_;
+  std::atomic<bool> timed_out_;
+  std::atomic<bool> stop_;
+  std::mutex mutex_;
+  std::thread watchdog_thread_;
+};
 
 // ============================================================================
 // Shared Memory Structures (must match between main process and workers)
@@ -182,9 +289,14 @@ struct ServerConfig {
   bool use_pipes      = true;
   bool log_to_console = false;
   // gRPC max message size in MiB. 0 => unlimited (gRPC uses -1 internally).
-  int max_message_mb  = 256;
-  bool enable_tls     = false;
-  bool require_client = false;
+  int max_message_mb = 256;
+  // Per-chunk/message timeout in seconds for streaming operations.
+  // If no message is received within this time, the stream is cancelled.
+  int chunk_timeout_seconds = 60;
+  // Enable data integrity hash logging for streaming transfers (for testing/debugging)
+  bool enable_transfer_hash = false;
+  bool enable_tls           = false;
+  bool require_client       = false;
   std::string tls_cert_path;
   std::string tls_key_path;
   std::string tls_root_path;
@@ -2112,14 +2224,15 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
                          ServerReaderWriter<cuopt::remote::UploadJobResponse,
                                             cuopt::remote::UploadJobRequest>* stream) override
   {
-    (void)context;
-
     if (!config.use_pipes) {
       return Status(StatusCode::FAILED_PRECONDITION,
                     "UploadAndSubmit currently requires pipe mode (do not use --use-shm)");
     }
 
     ensure_upload_dir_exists();
+
+    // Create watchdog for per-message timeout
+    ServerStreamWatchdog watchdog(context, config.chunk_timeout_seconds);
 
     cuopt::remote::UploadJobRequest in;
     cuopt::remote::UploadJobResponse out;
@@ -2142,10 +2255,17 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
 
     // First message must be UploadStart.
     if (!stream->Read(&in) || !in.has_start()) {
+      if (watchdog.timed_out()) {
+        std::cerr << "[gRPC] Streaming upload TIMEOUT after " << config.chunk_timeout_seconds
+                  << " seconds waiting for UploadStart\n";
+        std::cerr.flush();
+        return Status(StatusCode::DEADLINE_EXCEEDED, "Timeout waiting for UploadStart");
+      }
       set_upload_error("", "First message must be UploadStart", 0);
       stream->Write(out);
       return Status(StatusCode::INVALID_ARGUMENT, "Missing UploadStart");
     }
+    watchdog.activity();
 
     const auto& start       = in.start();
     std::string upload_id   = start.upload_id().empty() ? generate_job_id() : start.upload_id();
@@ -2164,12 +2284,85 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
 
     int fd = -1;
     std::vector<uint8_t> mem_buffer;
+    // Track which byte ranges have been received for out-of-order chunk support
+    // Each pair is (start_offset, end_offset) - exclusive end
+    // Ranges are kept sorted and merged for efficient gap detection
+    std::vector<std::pair<int64_t, int64_t>> received_ranges;
+
     auto cleanup_file = [&]() {
       if (fd >= 0) {
         close(fd);
         delete_upload_file(upload_id);
         fd = -1;
       }
+    };
+
+    // Helper to merge a new range into received_ranges (keeps ranges sorted and merged)
+    auto add_received_range = [&](int64_t start, int64_t end) {
+      if (start >= end) return;
+
+      // Find insertion point
+      auto it = std::lower_bound(received_ranges.begin(),
+                                 received_ranges.end(),
+                                 std::make_pair(start, end),
+                                 [](const auto& a, const auto& b) { return a.first < b.first; });
+
+      // Check if we can merge with previous range
+      if (it != received_ranges.begin()) {
+        auto prev = std::prev(it);
+        if (prev->second >= start) {
+          // Merge with previous
+          prev->second = std::max(prev->second, end);
+          // Check if we need to merge with following ranges
+          while (it != received_ranges.end() && prev->second >= it->first) {
+            prev->second = std::max(prev->second, it->second);
+            it           = received_ranges.erase(it);
+          }
+          return;
+        }
+      }
+
+      // Check if we can merge with next range
+      if (it != received_ranges.end() && end >= it->first) {
+        it->first  = start;
+        it->second = std::max(it->second, end);
+        // Check if we need to merge with following ranges
+        auto next = std::next(it);
+        while (next != received_ranges.end() && it->second >= next->first) {
+          it->second = std::max(it->second, next->second);
+          next       = received_ranges.erase(next);
+        }
+        return;
+      }
+
+      // No merge possible, insert new range
+      received_ranges.insert(it, {start, end});
+    };
+
+    // Helper to compute missing ranges given expected total size
+    auto compute_missing_ranges =
+      [&](int64_t expected_size) -> std::vector<std::pair<int64_t, int64_t>> {
+      std::vector<std::pair<int64_t, int64_t>> missing;
+      int64_t expected_start = 0;
+
+      for (const auto& range : received_ranges) {
+        if (expected_start < range.first) { missing.push_back({expected_start, range.first}); }
+        expected_start = std::max(expected_start, range.second);
+      }
+
+      // Check for gap at the end
+      if (expected_start < expected_size) { missing.push_back({expected_start, expected_size}); }
+
+      return missing;
+    };
+
+    // Helper to compute total bytes received
+    auto get_total_received = [&]() -> int64_t {
+      int64_t total = 0;
+      for (const auto& range : received_ranges) {
+        total += (range.second - range.first);
+      }
+      return total;
     };
 
     if (config.verbose) {
@@ -2181,8 +2374,9 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
     }
 
     auto open_upload_file = [&](bool resume) -> bool {
-      int flags = O_CREAT | O_WRONLY;
-      flags |= resume ? O_APPEND : O_TRUNC;
+      // Use O_RDWR to support pwrite for out-of-order chunks
+      int flags = O_CREAT | O_RDWR;
+      flags |= resume ? 0 : O_TRUNC;  // Don't use O_APPEND - we use pwrite with explicit offsets
       fd = open(upload_path.c_str(), flags | O_CLOEXEC, 0600);
       if (fd < 0) {
         set_upload_error(
@@ -2222,10 +2416,23 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
     ack->set_committed_size(committed);
     ack->set_max_message_bytes(max_message_bytes);
     stream->Write(out);
+    watchdog.activity();
 
     // Read chunks until finish.
     while (stream->Read(&in)) {
-      // Check for client cancellation
+      watchdog.activity();
+
+      // Check for timeout or client cancellation
+      if (watchdog.timed_out()) {
+        std::cerr << "[gRPC] Streaming upload TIMEOUT after " << config.chunk_timeout_seconds
+                  << " seconds of inactivity, upload_id=" << upload_id << " committed=" << committed
+                  << "/" << total_size_hint << " bytes\n";
+        std::cerr.flush();
+        cleanup_file();
+        mem_buffer.clear();  // Clean up memory
+        mem_buffer.shrink_to_fit();
+        return Status(StatusCode::DEADLINE_EXCEEDED, "Upload timeout - no message received");
+      }
       if (context->IsCancelled()) {
         if (config.verbose) {
           std::cout << "[gRPC] UploadAndSubmit cancelled by client upload_id=" << upload_id
@@ -2233,6 +2440,8 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
           std::cout.flush();
         }
         cleanup_file();
+        mem_buffer.clear();  // Clean up memory
+        mem_buffer.shrink_to_fit();
         return Status(StatusCode::CANCELLED, "Upload cancelled by client");
       }
 
@@ -2244,30 +2453,32 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
           cleanup_file();
           return Status(StatusCode::INVALID_ARGUMENT, "upload_id mismatch");
         }
-        if (ch.offset() != committed) {
-          set_upload_error(upload_id, "Non-sequential chunk offset", committed);
-          stream->Write(out);
-          close(fd);
-          return Status(StatusCode::OUT_OF_RANGE, "Non-sequential chunk offset");
-        }
 
-        const std::string& data = ch.data();
+        // Support out-of-order chunks - use offset to place data at correct position
+        const int64_t chunk_offset = ch.offset();
+        const std::string& data    = ch.data();
+
         if (!data.empty()) {
+          const int64_t chunk_end = chunk_offset + static_cast<int64_t>(data.size());
+
           if (use_memory) {
-            // Switch to file if threshold exceeded or unknown size grows too large.
-            if (threshold_bytes >= 0 &&
-                committed + static_cast<int64_t>(data.size()) > threshold_bytes) {
+            // Check if we need to switch to file mode
+            int64_t required_size = chunk_end;
+            if (threshold_bytes >= 0 && required_size > threshold_bytes) {
               if (config.verbose) {
                 std::cout << "[gRPC] Upload spill to disk upload_id=" << upload_id
-                          << " committed=" << committed << " chunk=" << data.size()
+                          << " chunk_offset=" << chunk_offset << " chunk_size=" << data.size()
                           << " threshold_bytes=" << threshold_bytes << "\n";
                 std::cout.flush();
               }
               if (!open_upload_file(false)) {
                 return Status(StatusCode::INTERNAL, "Failed to open upload file");
               }
+              // Write existing memory buffer to file at correct positions
               if (!mem_buffer.empty()) {
-                if (!write_to_pipe(fd, mem_buffer.data(), mem_buffer.size())) {
+                // Use pwrite to write at position 0
+                ssize_t written = pwrite(fd, mem_buffer.data(), mem_buffer.size(), 0);
+                if (written != static_cast<ssize_t>(mem_buffer.size())) {
                   set_upload_error(upload_id, "Failed to spill memory buffer to disk", committed);
                   stream->Write(out);
                   cleanup_file();
@@ -2280,22 +2491,33 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
           }
 
           if (use_memory) {
-            mem_buffer.insert(mem_buffer.end(), data.begin(), data.end());
+            // Ensure buffer is large enough for this chunk
+            if (static_cast<int64_t>(mem_buffer.size()) < chunk_end) {
+              mem_buffer.resize(static_cast<size_t>(chunk_end));
+            }
+            // Copy data at the correct offset
+            std::memcpy(mem_buffer.data() + chunk_offset, data.data(), data.size());
           } else {
-            if (!write_to_pipe(fd, data.data(), data.size())) {
+            // Use pwrite to write at specific offset (supports out-of-order)
+            ssize_t written = pwrite(fd, data.data(), data.size(), chunk_offset);
+            if (written != static_cast<ssize_t>(data.size())) {
               set_upload_error(upload_id, "Failed to write chunk to disk", committed);
               stream->Write(out);
               cleanup_file();
               return Status(StatusCode::INTERNAL, "Failed to write chunk");
             }
           }
-          committed += static_cast<int64_t>(data.size());
+
+          // Track received range and update committed to max endpoint
+          add_received_range(chunk_offset, chunk_end);
+          if (chunk_end > committed) { committed = chunk_end; }
         }
 
         // Light progress logging for large uploads
-        if (config.verbose && (committed % (256LL * kMiB) < static_cast<int64_t>(data.size()))) {
+        int64_t total_rcvd = get_total_received();
+        if (config.verbose && (total_rcvd % (256LL * kMiB) < static_cast<int64_t>(data.size()))) {
           std::cout << "[gRPC] Upload progress upload_id=" << upload_id
-                    << " committed=" << committed << " bytes\n";
+                    << " total_received=" << total_rcvd << " committed=" << committed << " bytes\n";
           std::cout.flush();
         }
 
@@ -2316,6 +2538,38 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
           cleanup_file();
           return Status(StatusCode::INVALID_ARGUMENT, "upload_id mismatch on finish");
         }
+
+        // Check for missing ranges and request retransmission if needed
+        if (total_size_hint > 0) {
+          auto missing = compute_missing_ranges(total_size_hint);
+          if (!missing.empty()) {
+            // Send ResendRequest to client
+            out.Clear();
+            auto* resend = out.mutable_resend();
+            resend->set_transfer_id(upload_id);
+            for (const auto& range : missing) {
+              auto* mr = resend->add_missing_ranges();
+              mr->set_offset(range.first);
+              mr->set_size(range.second - range.first);
+            }
+
+            if (config.verbose) {
+              std::cout << "[gRPC] UploadAndSubmit requesting resend of " << missing.size()
+                        << " ranges for upload_id=" << upload_id << "\n";
+              for (const auto& range : missing) {
+                std::cout << "  - offset=" << range.first
+                          << " size=" << (range.second - range.first) << "\n";
+              }
+              std::cout.flush();
+            }
+
+            stream->Write(out);
+            // Continue reading - client will send the missing chunks
+            continue;
+          }
+        }
+
+        // All data received, exit the loop
         break;
       }
 
@@ -2327,14 +2581,28 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
 
     if (fd >= 0) { close(fd); }
 
-    if (total_size_hint > 0 && committed != total_size_hint) {
-      set_upload_error(upload_id,
-                       std::string("Upload incomplete: committed size mismatch (max_message_mb=") +
-                         std::to_string(config.max_message_mb) + ")",
-                       committed);
-      stream->Write(out);
-      cleanup_file();
-      return Status(StatusCode::OUT_OF_RANGE, "Upload incomplete: committed size mismatch");
+    // Final verification that we have all the data
+    if (total_size_hint > 0) {
+      int64_t actual_received = get_total_received();
+      if (actual_received != total_size_hint) {
+        set_upload_error(upload_id,
+                         std::string("Upload incomplete: received ") +
+                           std::to_string(actual_received) + " of " +
+                           std::to_string(total_size_hint) + " bytes",
+                         committed);
+        stream->Write(out);
+        cleanup_file();
+        return Status(StatusCode::OUT_OF_RANGE, "Upload incomplete: size mismatch");
+      }
+    }
+
+    // Compute hash for data integrity verification (only if enabled)
+    if (config.enable_transfer_hash && use_memory && !mem_buffer.empty()) {
+      uint64_t received_hash = compute_data_hash(mem_buffer.data(), mem_buffer.size());
+      std::cerr << "[gRPC] Streaming upload complete: upload_id=" << upload_id
+                << " size=" << mem_buffer.size() << " bytes"
+                << " data_hash=" << hash_to_hex(received_hash) << "\n";
+      std::cerr.flush();
     }
 
     // Enqueue job using file-backed payload or in-memory buffer
@@ -2499,11 +2767,32 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
     return Status::OK;
   }
 
-  Status StreamResult(ServerContext* context,
-                      const cuopt::remote::GetResultRequest* request,
-                      ServerWriter<cuopt::remote::ResultChunk>* writer) override
+  Status StreamResult(
+    ServerContext* context,
+    ServerReaderWriter<cuopt::remote::ResultChunk, cuopt::remote::DownloadRequest>* stream) override
   {
-    std::string job_id = request->job_id();
+    // Create watchdog for per-message timeout
+    ServerStreamWatchdog watchdog(context, config.chunk_timeout_seconds);
+
+    // Wait for initial DownloadStart message from client
+    cuopt::remote::DownloadRequest init_req;
+    if (!stream->Read(&init_req) || !init_req.has_start()) {
+      if (watchdog.timed_out()) {
+        std::cerr << "[gRPC] Streaming download TIMEOUT after " << config.chunk_timeout_seconds
+                  << " seconds waiting for DownloadStart\n";
+        std::cerr.flush();
+        return Status(StatusCode::DEADLINE_EXCEEDED, "Timeout waiting for DownloadStart");
+      }
+      cuopt::remote::ResultChunk err;
+      err.set_error_message("First message must be DownloadStart");
+      err.set_done(true);
+      stream->Write(err);
+      return Status::OK;
+    }
+    watchdog.activity();
+
+    std::string job_id          = init_req.start().job_id();
+    int64_t client_max_msg_size = init_req.start().max_message_bytes();
 
     std::vector<uint8_t> bytes;
     bool is_mip = false;
@@ -2516,7 +2805,7 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
         chunk.set_offset(0);
         chunk.set_done(true);
         chunk.set_error_message("Job not found");
-        writer->Write(chunk);
+        stream->Write(chunk);
         return Status::OK;
       }
 
@@ -2526,7 +2815,7 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
         chunk.set_offset(0);
         chunk.set_done(true);
         chunk.set_error_message("Result not ready");
-        writer->Write(chunk);
+        stream->Write(chunk);
         return Status::OK;
       }
 
@@ -2535,65 +2824,154 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
       is_mip = it->second.is_mip;
     }
 
-    // Compute chunk size respecting server's max message configuration.
-    // Use half of max to leave room for protobuf overhead.
+    // Compute hash for data integrity verification (only if enabled)
+    if (config.enable_transfer_hash) {
+      uint64_t result_hash = compute_data_hash(bytes.data(), bytes.size());
+      std::cerr << "[gRPC] Streaming download starting: job_id=" << job_id
+                << " size=" << bytes.size() << " bytes"
+                << " data_hash=" << hash_to_hex(result_hash) << "\n";
+      std::cerr.flush();
+    }
+
+    // Compute chunk size respecting both server's and client's max message configuration.
     size_t chunk_size = kMiB;  // Default 1 MiB
     if (config.max_message_mb > 0) {
       size_t max_chunk = static_cast<size_t>(config.max_message_mb) * kMiB / 2;
       if (max_chunk > 0 && max_chunk < chunk_size) { chunk_size = max_chunk; }
     }
-
-    size_t offset       = 0;
-    bool client_aborted = false;
-    while (offset < bytes.size()) {
-      // Check for client cancellation before each chunk
-      if (context->IsCancelled()) {
-        if (config.verbose) {
-          std::cout << "[gRPC] StreamResult cancelled by client job_id=" << job_id
-                    << " at offset=" << offset << "/" << bytes.size() << "\n";
-          std::cout.flush();
-        }
-        client_aborted = true;
-        break;
-      }
-
-      size_t n = bytes.size() - offset;
-      if (n > chunk_size) { n = chunk_size; }
-
-      cuopt::remote::ResultChunk chunk;
-      chunk.set_job_id(job_id);
-      chunk.set_offset(static_cast<int64_t>(offset));
-      chunk.set_data(reinterpret_cast<const char*>(bytes.data() + offset), n);
-      chunk.set_done(false);
-
-      if (!writer->Write(chunk)) {
-        // Write failed - client likely disconnected
-        if (config.verbose) {
-          std::cout << "[gRPC] StreamResult write failed job_id=" << job_id
-                    << " at offset=" << offset << "/" << bytes.size()
-                    << " (client disconnected?)\n";
-          std::cout.flush();
-        }
-        client_aborted = true;
-        break;
-      }
-      offset += n;
+    if (client_max_msg_size > 0) {
+      size_t client_max_chunk = static_cast<size_t>(client_max_msg_size) / 2;
+      if (client_max_chunk > 0 && client_max_chunk < chunk_size) { chunk_size = client_max_chunk; }
     }
 
-    // Only send done message if client is still connected
-    if (!client_aborted) {
+    // Helper to send a range of bytes
+    auto send_range = [&](int64_t range_start, int64_t range_size) -> bool {
+      int64_t range_end = range_start + range_size;
+      int64_t offset    = range_start;
+
+      while (offset < range_end && offset < static_cast<int64_t>(bytes.size())) {
+        if (watchdog.timed_out() || context->IsCancelled()) { return false; }
+
+        size_t n = std::min(static_cast<size_t>(range_end - offset),
+                            std::min(chunk_size, bytes.size() - static_cast<size_t>(offset)));
+
+        cuopt::remote::ResultChunk chunk;
+        chunk.set_job_id(job_id);
+        chunk.set_offset(offset);
+        chunk.set_data(reinterpret_cast<const char*>(bytes.data() + offset), n);
+        chunk.set_done(false);
+
+        if (!stream->Write(chunk)) { return false; }
+        watchdog.activity();
+        offset += static_cast<int64_t>(n);
+      }
+      return true;
+    };
+
+    // Send all data initially
+    if (!send_range(0, static_cast<int64_t>(bytes.size()))) {
+      if (config.verbose) {
+        std::cout << "[gRPC] StreamResult: client disconnected during initial send job_id="
+                  << job_id << "\n";
+        std::cout.flush();
+      }
+      return Status::OK;
+    }
+
+    // Send done message with total size
+    {
       cuopt::remote::ResultChunk done;
       done.set_job_id(job_id);
       done.set_offset(static_cast<int64_t>(bytes.size()));
       done.set_done(true);
+      done.set_total_size(static_cast<int64_t>(bytes.size()));
       done.set_error_message("");  // Empty = success
-      writer->Write(done);
+      if (!stream->Write(done)) { return Status::OK; }
+    }
+
+    // Handle resend requests from client
+    const int kMaxResendLoops = 10;
+    int resend_loops          = 0;
+
+    cuopt::remote::DownloadRequest client_req;
+    while (resend_loops < kMaxResendLoops && stream->Read(&client_req)) {
+      watchdog.activity();
+
+      if (watchdog.timed_out()) {
+        std::cerr << "[gRPC] Streaming download TIMEOUT after " << config.chunk_timeout_seconds
+                  << " seconds of inactivity waiting for client, job_id=" << job_id << " sent "
+                  << bytes.size() << " bytes\n";
+        std::cerr.flush();
+        bytes.clear();  // Clean up memory
+        bytes.shrink_to_fit();
+        break;
+      }
+      if (context->IsCancelled()) {
+        bytes.clear();  // Clean up memory
+        bytes.shrink_to_fit();
+        break;
+      }
+
+      if (client_req.has_finish()) {
+        // Client confirms download complete
+        if (config.verbose) {
+          std::cout << "[gRPC] StreamResult: client confirmed download complete job_id=" << job_id
+                    << " received=" << client_req.finish().total_received() << " bytes\n";
+          std::cout.flush();
+        }
+        break;
+      }
+
+      if (client_req.has_resend()) {
+        // Client is requesting we resend missing ranges
+        const auto& resend = client_req.resend();
+        ++resend_loops;
+
+        if (config.verbose) {
+          std::cout << "[gRPC] StreamResult: client requested resend of "
+                    << resend.missing_ranges_size() << " ranges (loop " << resend_loops << "/"
+                    << kMaxResendLoops << ") job_id=" << job_id << "\n";
+          std::cout.flush();
+        }
+
+        // Resend each missing range
+        for (const auto& range : resend.missing_ranges()) {
+          if (!send_range(range.offset(), range.size())) {
+            if (config.verbose) {
+              std::cout << "[gRPC] StreamResult: client disconnected during resend job_id="
+                        << job_id << "\n";
+              std::cout.flush();
+            }
+            return Status::OK;
+          }
+        }
+
+        // Send done message again
+        cuopt::remote::ResultChunk done;
+        done.set_job_id(job_id);
+        done.set_offset(static_cast<int64_t>(bytes.size()));
+        done.set_done(true);
+        done.set_total_size(static_cast<int64_t>(bytes.size()));
+        done.set_error_message("");
+        if (!stream->Write(done)) { return Status::OK; }
+
+        continue;
+      }
+
+      if (client_req.has_ack()) {
+        // Client ack - just log for now
+        if (config.verbose) {
+          std::cout << "[gRPC] StreamResult: received ack, total_received="
+                    << client_req.ack().total_received() << " job_id=" << job_id << "\n";
+          std::cout.flush();
+        }
+        continue;
+      }
     }
 
     if (config.verbose) {
       std::cout << "[gRPC] StreamResult finished job_id=" << job_id << " bytes=" << bytes.size()
-                << " is_mip=" << (is_mip ? 1 : 0) << " client_aborted=" << (client_aborted ? 1 : 0)
-                << "\n";
+                << " is_mip=" << (is_mip ? 1 : 0) << " resend_loops=" << resend_loops << "\n";
       std::cout.flush();
     }
 
@@ -2885,6 +3263,9 @@ void print_usage(const char* prog)
     << "      --use-shm           Use per-job shared memory for payload transfer (default: pipes)\n"
     << "      --max-message-mb N  gRPC max send/recv message size in MiB (default: 256, "
        "0=unlimited)\n"
+    << "      --chunk-timeout N   Per-chunk timeout in seconds for streaming (default: 60, "
+       "0=disabled)\n"
+    << "      --enable-transfer-hash  Log data hashes for streaming transfers (for testing)\n"
     << "      --tls               Enable TLS (requires --tls-cert and --tls-key)\n"
     << "      --tls-cert PATH     Path to PEM-encoded server certificate\n"
     << "      --tls-key PATH      Path to PEM-encoded server private key\n"
@@ -2911,6 +3292,10 @@ int main(int argc, char** argv)
       config.use_pipes = false;
     } else if (arg == "--max-message-mb") {
       if (i + 1 < argc) { config.max_message_mb = std::stoi(argv[++i]); }
+    } else if (arg == "--chunk-timeout") {
+      if (i + 1 < argc) { config.chunk_timeout_seconds = std::stoi(argv[++i]); }
+    } else if (arg == "--enable-transfer-hash") {
+      config.enable_transfer_hash = true;
     } else if (arg == "--tls") {
       config.enable_tls = true;
     } else if (arg == "--tls-cert") {

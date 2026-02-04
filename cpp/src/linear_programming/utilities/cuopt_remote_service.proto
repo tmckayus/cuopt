@@ -35,7 +35,8 @@ service CuOptRemoteService {
 
   // Stream the result of a completed job in chunks (effectively unlimited total size).
   // Each chunk message must still fit within gRPC per-message limits.
-  rpc StreamResult(GetResultRequest) returns (stream ResultChunk);
+  // Bidirectional: server sends chunks, client sends acks and can request resends.
+  rpc StreamResult(stream DownloadRequest) returns (stream ResultChunk);
 
   // Delete a result from server memory
   rpc DeleteResult(DeleteRequest) returns (DeleteResponse);
@@ -66,6 +67,50 @@ service CuOptRemoteService {
   // -------------------------
 
   // (SolveSync removed - use SubmitJob + WaitForResult (+ StreamLogs/CancelJob) instead)
+}
+
+// =============================================================================
+// Request Messages
+// =============================================================================
+
+// =============================================================================
+// Common Flow Control Messages (used by both upload and download)
+// =============================================================================
+
+// Byte range specification for tracking received data and requesting resends
+message ByteRange {
+  int64 offset = 1;  // Starting byte offset
+  int64 size = 2;    // Number of bytes in this range
+}
+
+// Acknowledgment for chunk transfer (sent by receiver to sender)
+// Used by server during upload, and by client during download
+message TransferAck {
+  string transfer_id = 1;                   // upload_id or job_id
+  int64 total_received = 2;                 // Total bytes received so far
+  repeated ByteRange received_ranges = 3;   // Explicit ranges received (for out-of-order)
+  int64 max_message_bytes = 4;              // Receiver's max message size hint
+}
+
+// Request to resend specific byte ranges (sent by receiver to sender)
+// Used by server to request client resend during upload
+// Used by client to request server resend during download
+message ResendRequest {
+  string transfer_id = 1;                   // upload_id or job_id
+  repeated ByteRange missing_ranges = 2;    // Ranges that need to be resent
+}
+
+// Signal that sender believes transfer is complete
+// Receiver should check for gaps and either confirm or send ResendRequest
+message TransferFinish {
+  string transfer_id = 1;
+  int64 total_size = 2;                     // Total bytes that should have been sent
+}
+
+// Confirmation that transfer completed successfully
+message TransferComplete {
+  string transfer_id = 1;
+  int64 total_size = 2;                     // Total bytes received
 }
 
 // =============================================================================
@@ -147,6 +192,8 @@ message UploadJobResponse {
     UploadAck ack = 1;
     SubmitJobResponse submit = 2;
     UploadError error = 3;
+    ResendRequest resend = 4;        // Server requests client to resend missing ranges
+    TransferComplete complete = 5;   // Server confirms upload complete (alternative to submit)
   }
 }
 
@@ -160,6 +207,37 @@ message GetResultRequest {
   string job_id = 1;
 }
 
+// =============================================================================
+// Streaming Download (Bidirectional)
+// =============================================================================
+
+// Client -> Server messages during result download
+message DownloadStart {
+  string job_id = 1;
+  int64 max_message_bytes = 2;    // Client's max message size hint (0 = no limit)
+}
+
+message DownloadAck {
+  string job_id = 1;
+  int64 total_received = 2;                 // Total bytes received so far
+  repeated ByteRange received_ranges = 3;   // Explicit ranges received (for verification)
+}
+
+message DownloadFinish {
+  string job_id = 1;
+  int64 total_received = 2;                 // Total bytes client received
+}
+
+message DownloadRequest {
+  oneof msg {
+    DownloadStart start = 1;      // Initial request to start download
+    DownloadAck ack = 2;          // Acknowledge received chunks
+    ResendRequest resend = 3;     // Request server to resend missing ranges
+    DownloadFinish finish = 4;    // Client confirms download complete
+  }
+}
+
+// Server -> Client messages during result download
 // Chunked result payload (raw serialized solution bytes).
 // Client reassembles all chunks (by offset) and then parses as:
 // - cuopt.remote.LPSolution (if LP) OR cuopt.remote.MIPSolution (if MIP)
@@ -167,8 +245,9 @@ message ResultChunk {
   string job_id = 1;
   int64 offset = 2;
   bytes data = 3;
-  bool done = 4;
+  bool done = 4;                  // Server signals it has sent all chunks (client should verify)
   string error_message = 5;
+  int64 total_size = 6;           // Total expected size (sent with done=true)
 }
 
 // Request to delete result
