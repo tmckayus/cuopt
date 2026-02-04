@@ -7,7 +7,7 @@
 
 #pragma once
 
-#include <cuopt/linear_programming/optimization_problem.hpp>
+#include <cuopt/linear_programming/gpu_optimization_problem.hpp>
 
 #include <thrust/sequence.h>
 #include <thrust/uninitialized_fill.h>
