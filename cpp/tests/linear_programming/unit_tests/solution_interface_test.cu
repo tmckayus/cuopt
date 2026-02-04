@@ -21,10 +21,11 @@
  * - Solution to Python return type conversions
  */
 
+#include <cuopt/linear_programming/cpu_optimization_problem.hpp>
 #include <cuopt/linear_programming/cpu_optimization_problem_solution.hpp>
 #include <cuopt/linear_programming/cpu_pdlp_warm_start_data.hpp>
+#include <cuopt/linear_programming/gpu_optimization_problem.hpp>
 #include <cuopt/linear_programming/gpu_optimization_problem_solution.hpp>
-#include <cuopt/linear_programming/optimization_problem_interface.hpp>
 #include <cuopt/linear_programming/optimization_problem_utils.hpp>
 #include <cuopt/linear_programming/solve.hpp>
 #include <mps_parser/parser.hpp>
@@ -55,7 +56,7 @@ TEST_F(SolutionInterfaceTest, lp_solution_throws_on_mip_methods)
   auto mps_data = cuopt::mps_parser::parse_mps<int, double>(lp_file_);
   raft::handle_t handle;
 
-  auto problem = std::make_unique<gpu_optimization_problem_t<int, double>>(&handle);
+  auto problem = std::make_unique<optimization_problem_t<int, double>>(&handle);
   populate_from_mps_data_model(problem.get(), mps_data);
 
   pdlp_solver_settings_t<int, double> settings;
@@ -75,7 +76,7 @@ TEST_F(SolutionInterfaceTest, mip_solution_throws_on_lp_methods)
   auto mps_data = cuopt::mps_parser::parse_mps<int, double>(mip_file_);
   raft::handle_t handle;
 
-  auto problem = std::make_unique<gpu_optimization_problem_t<int, double>>(&handle);
+  auto problem = std::make_unique<optimization_problem_t<int, double>>(&handle);
   populate_from_mps_data_model(problem.get(), mps_data);
 
   mip_solver_settings_t<int, double> settings;
@@ -96,7 +97,7 @@ TEST_F(SolutionInterfaceTest, lp_solution_polymorphic_methods)
   auto mps_data = cuopt::mps_parser::parse_mps<int, double>(lp_file_);
   raft::handle_t handle;
 
-  auto problem = std::make_unique<gpu_optimization_problem_t<int, double>>(&handle);
+  auto problem = std::make_unique<optimization_problem_t<int, double>>(&handle);
   populate_from_mps_data_model(problem.get(), mps_data);
 
   pdlp_solver_settings_t<int, double> settings;
@@ -127,7 +128,7 @@ TEST_F(SolutionInterfaceTest, mip_solution_polymorphic_methods)
   auto mps_data = cuopt::mps_parser::parse_mps<int, double>(mip_file_);
   raft::handle_t handle;
 
-  auto problem = std::make_unique<gpu_optimization_problem_t<int, double>>(&handle);
+  auto problem = std::make_unique<optimization_problem_t<int, double>>(&handle);
   populate_from_mps_data_model(problem.get(), mps_data);
 
   mip_solver_settings_t<int, double> settings;
@@ -157,7 +158,7 @@ TEST_F(SolutionInterfaceTest, termination_status_int_values)
   auto mps_data = cuopt::mps_parser::parse_mps<int, double>(lp_file_);
   raft::handle_t handle;
 
-  auto problem = std::make_unique<gpu_optimization_problem_t<int, double>>(&handle);
+  auto problem = std::make_unique<optimization_problem_t<int, double>>(&handle);
   populate_from_mps_data_model(problem.get(), mps_data);
 
   pdlp_solver_settings_t<int, double> settings;
@@ -181,22 +182,19 @@ TEST_F(SolutionInterfaceTest, termination_status_int_values)
 // =============================================================================
 
 // Test GPU problem to_optimization_problem (move semantics)
-TEST_F(SolutionInterfaceTest, gpu_problem_to_optimization_problem)
+TEST_F(SolutionInterfaceTest, gpu_problem_is_optimization_problem)
 {
   auto mps_data = cuopt::mps_parser::parse_mps<int, double>(lp_file_);
   raft::handle_t handle;
 
-  auto problem = std::make_unique<gpu_optimization_problem_t<int, double>>(&handle);
+  // optimization_problem_t IS the GPU class - no conversion needed
+  auto problem = std::make_unique<optimization_problem_t<int, double>>(&handle);
   populate_from_mps_data_model(problem.get(), mps_data);
 
-  int orig_n_vars        = problem->get_n_variables();
-  int orig_n_constraints = problem->get_n_constraints();
-
-  // Convert to concrete optimization_problem_t
-  auto concrete_problem = problem->to_optimization_problem();
-
-  EXPECT_EQ(concrete_problem.get_n_variables(), orig_n_vars);
-  EXPECT_EQ(concrete_problem.get_n_constraints(), orig_n_constraints);
+  // Verify the problem is populated correctly
+  EXPECT_EQ(problem->get_n_variables(), mps_data.get_n_variables());
+  EXPECT_EQ(problem->get_n_constraints(), mps_data.get_n_constraints());
+  EXPECT_EQ(problem->get_nnz(), mps_data.get_nnz());
 }
 
 // Test CPU problem to_optimization_problem (copies data to GPU)
@@ -212,11 +210,60 @@ TEST_F(SolutionInterfaceTest, cpu_problem_to_optimization_problem)
   int orig_n_vars        = problem->get_n_variables();
   int orig_n_constraints = problem->get_n_constraints();
 
-  // Convert to concrete GPU-backed optimization_problem_t
-  auto concrete_problem = problem->to_optimization_problem();
+  // Convert to concrete GPU-backed optimization_problem_t (returns owned unique_ptr)
+  auto gpu_problem = problem->to_optimization_problem();
 
-  EXPECT_EQ(concrete_problem.get_n_variables(), orig_n_vars);
-  EXPECT_EQ(concrete_problem.get_n_constraints(), orig_n_constraints);
+  ASSERT_NE(gpu_problem, nullptr);  // CPU problem returns non-null (new GPU problem)
+  EXPECT_EQ(gpu_problem->get_n_variables(), orig_n_vars);
+  EXPECT_EQ(gpu_problem->get_n_constraints(), orig_n_constraints);
+}
+
+// Test GPU problem to_optimization_problem returns nullptr (no-op)
+TEST_F(SolutionInterfaceTest, gpu_problem_to_optimization_problem_returns_nullptr)
+{
+  auto mps_data = cuopt::mps_parser::parse_mps<int, double>(lp_file_);
+  raft::handle_t handle;
+
+  auto gpu_problem = std::make_unique<optimization_problem_t<int, double>>(&handle);
+  populate_from_mps_data_model(gpu_problem.get(), mps_data);
+
+  // GPU problem's to_optimization_problem() returns nullptr (already is one)
+  auto result = gpu_problem->to_optimization_problem();
+  EXPECT_EQ(result, nullptr);
+}
+
+// Test GPU problem to_cpu_optimization_problem creates CPU copy
+TEST_F(SolutionInterfaceTest, gpu_problem_to_cpu_optimization_problem)
+{
+  auto mps_data = cuopt::mps_parser::parse_mps<int, double>(lp_file_);
+  raft::handle_t handle;
+
+  auto gpu_problem = std::make_unique<optimization_problem_t<int, double>>(&handle);
+  populate_from_mps_data_model(gpu_problem.get(), mps_data);
+
+  int orig_n_vars        = gpu_problem->get_n_variables();
+  int orig_n_constraints = gpu_problem->get_n_constraints();
+
+  // Convert GPU problem to CPU (returns owned unique_ptr)
+  auto cpu_problem = gpu_problem->to_cpu_optimization_problem();
+
+  ASSERT_NE(cpu_problem, nullptr);  // GPU problem returns non-null (new CPU problem)
+  EXPECT_EQ(cpu_problem->get_n_variables(), orig_n_vars);
+  EXPECT_EQ(cpu_problem->get_n_constraints(), orig_n_constraints);
+}
+
+// Test CPU problem to_cpu_optimization_problem returns nullptr (no-op)
+TEST_F(SolutionInterfaceTest, cpu_problem_to_cpu_optimization_problem_returns_nullptr)
+{
+  auto mps_data = cuopt::mps_parser::parse_mps<int, double>(lp_file_);
+  raft::handle_t handle;
+
+  auto cpu_problem = std::make_unique<cpu_optimization_problem_t<int, double>>(&handle);
+  populate_from_mps_data_model(cpu_problem.get(), mps_data);
+
+  // CPU problem's to_cpu_optimization_problem() returns nullptr (already is one)
+  auto result = cpu_problem->to_cpu_optimization_problem();
+  EXPECT_EQ(result, nullptr);
 }
 
 // Test MPS data model to optimization problem conversion
@@ -301,7 +348,7 @@ TEST_F(SolutionInterfaceTest, gpu_lp_solution_to_python_ret)
   auto mps_data = cuopt::mps_parser::parse_mps<int, double>(lp_file_);
   raft::handle_t handle;
 
-  auto problem = std::make_unique<gpu_optimization_problem_t<int, double>>(&handle);
+  auto problem = std::make_unique<optimization_problem_t<int, double>>(&handle);
   populate_from_mps_data_model(problem.get(), mps_data);
 
   pdlp_solver_settings_t<int, double> settings;
@@ -356,7 +403,7 @@ TEST_F(SolutionInterfaceTest, gpu_mip_solution_to_python_ret)
   auto mps_data = cuopt::mps_parser::parse_mps<int, double>(mip_file_);
   raft::handle_t handle;
 
-  auto problem = std::make_unique<gpu_optimization_problem_t<int, double>>(&handle);
+  auto problem = std::make_unique<optimization_problem_t<int, double>>(&handle);
   populate_from_mps_data_model(problem.get(), mps_data);
 
   mip_solver_settings_t<int, double> settings;
@@ -413,7 +460,7 @@ TEST_F(SolutionInterfaceTest, gpu_warmstart_to_cpu)
   auto mps_data = cuopt::mps_parser::parse_mps<int, double>(lp_file_);
   raft::handle_t handle;
 
-  auto problem = std::make_unique<gpu_optimization_problem_t<int, double>>(&handle);
+  auto problem = std::make_unique<optimization_problem_t<int, double>>(&handle);
   populate_from_mps_data_model(problem.get(), mps_data);
 
   pdlp_solver_settings_t<int, double> settings;
@@ -476,7 +523,7 @@ TEST_F(SolutionInterfaceTest, gpu_problem_copy_to_host_methods)
   auto mps_data = cuopt::mps_parser::parse_mps<int, double>(lp_file_);
   raft::handle_t handle;
 
-  auto problem = std::make_unique<gpu_optimization_problem_t<int, double>>(&handle);
+  auto problem = std::make_unique<optimization_problem_t<int, double>>(&handle);
   populate_from_mps_data_model(problem.get(), mps_data);
 
   int n_vars        = problem->get_n_variables();

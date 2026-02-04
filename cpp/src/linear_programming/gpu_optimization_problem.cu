@@ -5,26 +5,42 @@
  */
 /* clang-format on */
 
-#include <cuopt/linear_programming/optimization_problem_interface.hpp>
+#include <cuopt/linear_programming/cpu_optimization_problem.hpp>
+#include <cuopt/linear_programming/gpu_optimization_problem.hpp>
 #include <cuopt/linear_programming/solve_remote.hpp>
 
+#include <cuopt/error.hpp>
 #include <mip/mip_constants.hpp>
 #include <mps_parser/writer.hpp>
+#include <utilities/copy_helpers.hpp>
 #include <utilities/logger.hpp>
 
+#include <raft/common/nvtx.hpp>
 #include <raft/core/copy.hpp>
 #include <raft/core/cuda_support.hpp>
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/operators.hpp>
+#include <raft/util/cuda_utils.cuh>
 #include <raft/util/cudart_utils.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_uvector.hpp>
+#include <rmm/exec_policy.hpp>
 
+#include <thrust/binary_search.h>
 #include <thrust/copy.h>
 #include <thrust/count.h>
+#include <thrust/equal.h>
 #include <thrust/execution_policy.h>
+#include <thrust/gather.h>
+#include <thrust/iterator/permutation_iterator.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/sort.h>
+#include <thrust/tuple.h>
 
+#include <cuda_profiler_api.h>
+
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <unordered_map>
@@ -36,7 +52,7 @@ namespace cuopt::linear_programming {
 // ==============================================================================
 
 template <typename i_t, typename f_t>
-gpu_optimization_problem_t<i_t, f_t>::gpu_optimization_problem_t(raft::handle_t const* handle_ptr)
+optimization_problem_t<i_t, f_t>::optimization_problem_t(raft::handle_t const* handle_ptr)
   : handle_ptr_(handle_ptr),
     stream_view_(handle_ptr->get_stream()),
     A_(0, stream_view_),
@@ -51,7 +67,40 @@ gpu_optimization_problem_t<i_t, f_t>::gpu_optimization_problem_t(raft::handle_t 
     row_types_(0, stream_view_),
     variable_types_(0, stream_view_)
 {
-  CUOPT_LOG_INFO("gpu_optimization_problem_t constructor: Using GPU backend");
+  raft::common::nvtx::range fun_scope("optimization problem construction");
+  CUOPT_LOG_INFO("optimization_problem_t constructor: Using GPU backend");
+}
+
+template <typename i_t, typename f_t>
+optimization_problem_t<i_t, f_t>::optimization_problem_t(
+  const optimization_problem_t<i_t, f_t>& other)
+  : handle_ptr_(other.get_handle_ptr()),
+    stream_view_(handle_ptr_->get_stream()),
+    maximize_{other.get_sense()},
+    n_vars_{other.get_n_variables()},
+    n_constraints_{other.get_n_constraints()},
+    A_{other.get_constraint_matrix_values(), stream_view_},
+    A_indices_{other.get_constraint_matrix_indices(), stream_view_},
+    A_offsets_{other.get_constraint_matrix_offsets(), stream_view_},
+    b_{other.get_constraint_bounds(), stream_view_},
+    c_{other.get_objective_coefficients(), stream_view_},
+    objective_scaling_factor_{other.get_objective_scaling_factor()},
+    objective_offset_{other.get_objective_offset()},
+    Q_offsets_{other.get_quadratic_objective_offsets()},
+    Q_indices_{other.get_quadratic_objective_indices()},
+    Q_values_{other.get_quadratic_objective_values()},
+    variable_lower_bounds_{other.get_variable_lower_bounds(), stream_view_},
+    variable_upper_bounds_{other.get_variable_upper_bounds(), stream_view_},
+    constraint_lower_bounds_{other.get_constraint_lower_bounds(), stream_view_},
+    constraint_upper_bounds_{other.get_constraint_upper_bounds(), stream_view_},
+    row_types_{other.get_row_types(), stream_view_},
+    variable_types_{other.get_variable_types(), stream_view_},
+    objective_name_{other.get_objective_name()},
+    problem_name_{other.get_problem_name()},
+    problem_category_{other.get_problem_category()},
+    var_names_{other.get_variable_names()},
+    row_names_{other.get_row_names()}
+{
 }
 
 // ==============================================================================
@@ -59,60 +108,70 @@ gpu_optimization_problem_t<i_t, f_t>::gpu_optimization_problem_t(raft::handle_t 
 // ==============================================================================
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::set_maximize(bool maximize)
+void optimization_problem_t<i_t, f_t>::set_maximize(bool maximize)
 {
   maximize_ = maximize;
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::set_csr_constraint_matrix(const f_t* A_values,
-                                                                     i_t size_values,
-                                                                     const i_t* A_indices,
-                                                                     i_t size_indices,
-                                                                     const i_t* A_offsets,
-                                                                     i_t size_offsets)
+void optimization_problem_t<i_t, f_t>::set_csr_constraint_matrix(const f_t* A_values,
+                                                                 i_t size_values,
+                                                                 const i_t* A_indices,
+                                                                 i_t size_indices,
+                                                                 const i_t* A_offsets,
+                                                                 i_t size_offsets)
 {
-  n_constraints_ = size_offsets - 1;
-
+  if (size_values != 0) {
+    cuopt_expects(A_values != nullptr, error_type_t::ValidationError, "A_values cannot be null");
+  }
   A_.resize(size_values, stream_view_);
-  A_indices_.resize(size_indices, stream_view_);
-  A_offsets_.resize(size_offsets, stream_view_);
-
   raft::copy(A_.data(), A_values, size_values, stream_view_);
+
+  if (size_indices != 0) {
+    cuopt_expects(A_indices != nullptr, error_type_t::ValidationError, "A_indices cannot be null");
+  }
+  A_indices_.resize(size_indices, stream_view_);
   raft::copy(A_indices_.data(), A_indices, size_indices, stream_view_);
+
+  cuopt_expects(A_offsets != nullptr, error_type_t::ValidationError, "A_offsets cannot be null");
+  A_offsets_.resize(size_offsets, stream_view_);
   raft::copy(A_offsets_.data(), A_offsets, size_offsets, stream_view_);
+
+  n_constraints_ = size_offsets - 1;
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::set_constraint_bounds(const f_t* b, i_t size)
+void optimization_problem_t<i_t, f_t>::set_constraint_bounds(const f_t* b, i_t size)
 {
+  cuopt_expects(b != nullptr, error_type_t::ValidationError, "b cannot be null");
   b_.resize(size, stream_view_);
+  n_constraints_ = size;
   raft::copy(b_.data(), b, size, stream_view_);
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::set_objective_coefficients(const f_t* c, i_t size)
+void optimization_problem_t<i_t, f_t>::set_objective_coefficients(const f_t* c, i_t size)
 {
+  cuopt_expects(c != nullptr, error_type_t::ValidationError, "c cannot be null");
   n_vars_ = size;
   c_.resize(size, stream_view_);
   raft::copy(c_.data(), c, size, stream_view_);
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::set_objective_scaling_factor(
-  f_t objective_scaling_factor)
+void optimization_problem_t<i_t, f_t>::set_objective_scaling_factor(f_t objective_scaling_factor)
 {
   objective_scaling_factor_ = objective_scaling_factor;
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::set_objective_offset(f_t objective_offset)
+void optimization_problem_t<i_t, f_t>::set_objective_offset(f_t objective_offset)
 {
   objective_offset_ = objective_offset;
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::set_quadratic_objective_matrix(
+void optimization_problem_t<i_t, f_t>::set_quadratic_objective_matrix(
   const f_t* Q_values,
   i_t size_values,
   const i_t* Q_indices,
@@ -121,38 +180,139 @@ void gpu_optimization_problem_t<i_t, f_t>::set_quadratic_objective_matrix(
   i_t size_offsets,
   bool validate_positive_semi_definite)
 {
-  Q_values_.resize(size_values);
-  Q_indices_.resize(size_indices);
-  Q_offsets_.resize(size_offsets);
+  cuopt_expects(Q_values != nullptr, error_type_t::ValidationError, "Q_values cannot be null");
+  cuopt_expects(
+    size_values > 0, error_type_t::ValidationError, "size_values must be greater than 0");
 
-  std::copy(Q_values, Q_values + size_values, Q_values_.begin());
-  std::copy(Q_indices, Q_indices + size_indices, Q_indices_.begin());
-  std::copy(Q_offsets, Q_offsets + size_offsets, Q_offsets_.begin());
+  if (size_indices != 0) {
+    cuopt_expects(Q_indices != nullptr, error_type_t::ValidationError, "Q_indices cannot be null");
+  }
+
+  if (size_offsets != 0) {
+    cuopt_expects(Q_offsets != nullptr, error_type_t::ValidationError, "Q_offsets cannot be null");
+  }
+
+  // Replace Q with Q + Q^T
+  i_t qn    = size_offsets - 1;  // Number of variables
+  i_t q_nnz = size_indices;
+  // Construct H = Q + Q^T in triplet form first
+  std::vector<i_t> H_i;
+  std::vector<i_t> H_j;
+  std::vector<f_t> H_x;
+
+  H_i.reserve(2 * q_nnz);
+  H_j.reserve(2 * q_nnz);
+  H_x.reserve(2 * q_nnz);
+
+  for (i_t i = 0; i < qn; ++i) {
+    i_t row_start = Q_offsets[i];
+    i_t row_end   = Q_offsets[i + 1];
+    for (i_t p = row_start; p < row_end; ++p) {
+      i_t j = Q_indices[p];
+      f_t x = Q_values[p];
+      // Add H(i,j)
+      H_i.push_back(i);
+      H_j.push_back(j);
+      if (i == j) { H_x.push_back(2 * x); }
+      if (i != j) {
+        H_x.push_back(x);
+        // Add H(j,i)
+        H_i.push_back(j);
+        H_j.push_back(i);
+        H_x.push_back(x);
+      }
+    }
+  }
+  // Convert H to CSR format
+  // Get row counts
+  i_t H_nz = H_x.size();
+  std::vector<i_t> H_row_counts(qn, 0);
+  for (i_t k = 0; k < H_nz; ++k) {
+    H_row_counts[H_i[k]]++;
+  }
+  std::vector<i_t> H_cumulative_counts(qn + 1, 0);
+  for (i_t k = 0; k < qn; ++k) {
+    H_cumulative_counts[k + 1] = H_cumulative_counts[k] + H_row_counts[k];
+  }
+  std::vector<i_t> H_row_starts = H_cumulative_counts;
+  std::vector<i_t> H_indices(H_nz);
+  std::vector<f_t> H_values(H_nz);
+  for (i_t k = 0; k < H_nz; ++k) {
+    i_t p        = H_cumulative_counts[H_i[k]]++;
+    H_indices[p] = H_j[k];
+    H_values[p]  = H_x[k];
+  }
+
+  // H_row_starts, H_indices, H_values are the CSR representation of H
+  // But this contains duplicate entries
+
+  std::vector<i_t> workspace(qn, -1);
+  Q_offsets_.resize(qn + 1);
+  std::fill(Q_offsets_.begin(), Q_offsets_.end(), 0);
+  Q_indices_.resize(H_nz);
+  Q_values_.resize(H_nz);
+  i_t nz = 0;
+  for (i_t i = 0; i < qn; ++i) {
+    i_t q               = nz;  // row i will start at q
+    const i_t row_start = H_row_starts[i];
+    const i_t row_end   = H_row_starts[i + 1];
+    for (i_t p = row_start; p < row_end; ++p) {
+      i_t j = H_indices[p];
+      if (workspace[j] >= q) {
+        Q_values_[workspace[j]] += H_values[p];  // H(i,j) is duplicate
+      } else {
+        workspace[j]   = nz;  // record where column j occurs
+        Q_indices_[nz] = j;   // keep H(i,j)
+        Q_values_[nz]  = H_values[p];
+        nz++;
+      }
+    }
+    Q_offsets_[i] = q;  // record start of row i
+  }
+
+  Q_offsets_[qn] = nz;  // finalize Q
+  Q_indices_.resize(nz);
+  Q_values_.resize(nz);
+  // FIX ME:: check for positive semi definite matrix
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::set_variable_lower_bounds(
-  const f_t* variable_lower_bounds, i_t size)
+void optimization_problem_t<i_t, f_t>::set_variable_lower_bounds(const f_t* variable_lower_bounds,
+                                                                 i_t size)
 {
+  if (size != 0) {
+    cuopt_expects(variable_lower_bounds != nullptr,
+                  error_type_t::ValidationError,
+                  "variable_lower_bounds cannot be null");
+  }
+  n_vars_ = size;
   variable_lower_bounds_.resize(size, stream_view_);
   raft::copy(variable_lower_bounds_.data(), variable_lower_bounds, size, stream_view_);
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::set_variable_upper_bounds(
-  const f_t* variable_upper_bounds, i_t size)
+void optimization_problem_t<i_t, f_t>::set_variable_upper_bounds(const f_t* variable_upper_bounds,
+                                                                 i_t size)
 {
+  if (size != 0) {
+    cuopt_expects(variable_upper_bounds != nullptr,
+                  error_type_t::ValidationError,
+                  "variable_upper_bounds cannot be null");
+  }
+  n_vars_ = size;
   variable_upper_bounds_.resize(size, stream_view_);
   raft::copy(variable_upper_bounds_.data(), variable_upper_bounds, size, stream_view_);
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::set_variable_types(const var_t* variable_types, i_t size)
+void optimization_problem_t<i_t, f_t>::set_variable_types(const var_t* variable_types, i_t size)
 {
+  cuopt_expects(
+    variable_types != nullptr, error_type_t::ValidationError, "variable_types cannot be null");
   variable_types_.resize(size, stream_view_);
   raft::copy(variable_types_.data(), variable_types, size, stream_view_);
 
-  // Auto-detect problem category based on variable types (matching original optimization_problem_t)
+  // Auto-detect problem category based on variable types
   i_t n_integer = thrust::count_if(handle_ptr_->get_thrust_policy(),
                                    variable_types_.begin(),
                                    variable_types_.end(),
@@ -166,57 +326,141 @@ void gpu_optimization_problem_t<i_t, f_t>::set_variable_types(const var_t* varia
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::set_problem_category(const problem_category_t& category)
+void optimization_problem_t<i_t, f_t>::set_problem_category(const problem_category_t& category)
 {
   problem_category_ = category;
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::set_constraint_lower_bounds(
+void optimization_problem_t<i_t, f_t>::set_constraint_lower_bounds(
   const f_t* constraint_lower_bounds, i_t size)
 {
+  if (size != 0) {
+    cuopt_expects(constraint_lower_bounds != nullptr,
+                  error_type_t::ValidationError,
+                  "constraint_lower_bounds cannot be null");
+  }
+  n_constraints_ = size;
   constraint_lower_bounds_.resize(size, stream_view_);
   raft::copy(constraint_lower_bounds_.data(), constraint_lower_bounds, size, stream_view_);
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::set_constraint_upper_bounds(
+void optimization_problem_t<i_t, f_t>::set_constraint_upper_bounds(
   const f_t* constraint_upper_bounds, i_t size)
 {
+  if (size != 0) {
+    cuopt_expects(constraint_upper_bounds != nullptr,
+                  error_type_t::ValidationError,
+                  "constraint_upper_bounds cannot be null");
+  }
+  n_constraints_ = size;
   constraint_upper_bounds_.resize(size, stream_view_);
   raft::copy(constraint_upper_bounds_.data(), constraint_upper_bounds, size, stream_view_);
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::set_row_types(const char* row_types, i_t size)
+void optimization_problem_t<i_t, f_t>::set_row_types(const char* row_types, i_t size)
 {
+  cuopt_expects(row_types != nullptr, error_type_t::ValidationError, "row_types cannot be null");
+  n_constraints_ = size;
   row_types_.resize(size, stream_view_);
   raft::copy(row_types_.data(), row_types, size, stream_view_);
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::set_objective_name(const std::string& objective_name)
+void optimization_problem_t<i_t, f_t>::set_objective_name(const std::string& objective_name)
 {
   objective_name_ = objective_name;
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::set_problem_name(const std::string& problem_name)
+void optimization_problem_t<i_t, f_t>::set_problem_name(const std::string& problem_name)
 {
   problem_name_ = problem_name;
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::set_variable_names(
+void optimization_problem_t<i_t, f_t>::set_variable_names(
   const std::vector<std::string>& variable_names)
 {
   var_names_ = variable_names;
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::set_row_names(const std::vector<std::string>& row_names)
+void optimization_problem_t<i_t, f_t>::set_row_names(const std::vector<std::string>& row_names)
 {
   row_names_ = row_names;
+}
+
+// ============================================================================
+// Move-based setters (zero-copy, transfers ownership)
+// ============================================================================
+
+template <typename i_t, typename f_t>
+void optimization_problem_t<i_t, f_t>::set_csr_constraint_matrix_move(
+  rmm::device_uvector<f_t>&& A_values,
+  rmm::device_uvector<i_t>&& A_indices,
+  rmm::device_uvector<i_t>&& A_offsets)
+{
+  A_             = std::move(A_values);
+  A_indices_     = std::move(A_indices);
+  A_offsets_     = std::move(A_offsets);
+  n_constraints_ = A_offsets_.size() - 1;
+}
+
+template <typename i_t, typename f_t>
+void optimization_problem_t<i_t, f_t>::set_constraint_bounds_move(rmm::device_uvector<f_t>&& b)
+{
+  b_ = std::move(b);
+}
+
+template <typename i_t, typename f_t>
+void optimization_problem_t<i_t, f_t>::set_objective_coefficients_move(rmm::device_uvector<f_t>&& c)
+{
+  c_      = std::move(c);
+  n_vars_ = c_.size();
+}
+
+template <typename i_t, typename f_t>
+void optimization_problem_t<i_t, f_t>::set_variable_lower_bounds_move(
+  rmm::device_uvector<f_t>&& variable_lower_bounds)
+{
+  variable_lower_bounds_ = std::move(variable_lower_bounds);
+}
+
+template <typename i_t, typename f_t>
+void optimization_problem_t<i_t, f_t>::set_variable_upper_bounds_move(
+  rmm::device_uvector<f_t>&& variable_upper_bounds)
+{
+  variable_upper_bounds_ = std::move(variable_upper_bounds);
+}
+
+template <typename i_t, typename f_t>
+void optimization_problem_t<i_t, f_t>::set_variable_types_move(
+  rmm::device_uvector<var_t>&& variable_types)
+{
+  variable_types_ = std::move(variable_types);
+}
+
+template <typename i_t, typename f_t>
+void optimization_problem_t<i_t, f_t>::set_constraint_lower_bounds_move(
+  rmm::device_uvector<f_t>&& constraint_lower_bounds)
+{
+  constraint_lower_bounds_ = std::move(constraint_lower_bounds);
+}
+
+template <typename i_t, typename f_t>
+void optimization_problem_t<i_t, f_t>::set_constraint_upper_bounds_move(
+  rmm::device_uvector<f_t>&& constraint_upper_bounds)
+{
+  constraint_upper_bounds_ = std::move(constraint_upper_bounds);
+}
+
+template <typename i_t, typename f_t>
+void optimization_problem_t<i_t, f_t>::set_row_types_move(rmm::device_uvector<char>&& row_types)
+{
+  row_types_ = std::move(row_types);
 }
 
 // ==============================================================================
@@ -224,251 +468,329 @@ void gpu_optimization_problem_t<i_t, f_t>::set_row_names(const std::vector<std::
 // ==============================================================================
 
 template <typename i_t, typename f_t>
-i_t gpu_optimization_problem_t<i_t, f_t>::get_n_variables() const
+i_t optimization_problem_t<i_t, f_t>::get_n_variables() const
 {
   return n_vars_;
 }
 
 template <typename i_t, typename f_t>
-i_t gpu_optimization_problem_t<i_t, f_t>::get_n_constraints() const
+i_t optimization_problem_t<i_t, f_t>::get_n_constraints() const
 {
   return n_constraints_;
 }
 
 template <typename i_t, typename f_t>
-i_t gpu_optimization_problem_t<i_t, f_t>::get_nnz() const
+i_t optimization_problem_t<i_t, f_t>::get_nnz() const
 {
   return A_.size();
 }
 
 template <typename i_t, typename f_t>
-i_t gpu_optimization_problem_t<i_t, f_t>::get_n_integers() const
+i_t optimization_problem_t<i_t, f_t>::get_n_integers() const
 {
-  if (variable_types_.size() == 0) return 0;
+  i_t n_integers = 0;
+  if (get_n_variables() != 0) {
+    auto enum_variable_types = cuopt::host_copy(get_variable_types(), handle_ptr_->get_stream());
 
-  std::vector<var_t> host_types(variable_types_.size());
-  raft::copy(host_types.data(), variable_types_.data(), variable_types_.size(), stream_view_);
-  handle_ptr_->sync_stream();
-
-  i_t count = 0;
-  for (const auto& type : host_types) {
-    if (type == var_t::INTEGER) count++;
+    for (size_t i = 0; i < enum_variable_types.size(); ++i) {
+      if (enum_variable_types[i] == var_t::INTEGER) { n_integers++; }
+    }
   }
-  return count;
+  return n_integers;
 }
 
 template <typename i_t, typename f_t>
-const rmm::device_uvector<f_t>& gpu_optimization_problem_t<i_t, f_t>::get_constraint_matrix_values()
+const rmm::device_uvector<f_t>& optimization_problem_t<i_t, f_t>::get_constraint_matrix_values()
   const
 {
   return A_;
 }
 
 template <typename i_t, typename f_t>
-rmm::device_uvector<f_t>& gpu_optimization_problem_t<i_t, f_t>::get_constraint_matrix_values()
+rmm::device_uvector<f_t>& optimization_problem_t<i_t, f_t>::get_constraint_matrix_values()
 {
   return A_;
 }
 
 template <typename i_t, typename f_t>
-const rmm::device_uvector<i_t>&
-gpu_optimization_problem_t<i_t, f_t>::get_constraint_matrix_indices() const
-{
-  return A_indices_;
-}
-
-template <typename i_t, typename f_t>
-rmm::device_uvector<i_t>& gpu_optimization_problem_t<i_t, f_t>::get_constraint_matrix_indices()
-{
-  return A_indices_;
-}
-
-template <typename i_t, typename f_t>
-const rmm::device_uvector<i_t>&
-gpu_optimization_problem_t<i_t, f_t>::get_constraint_matrix_offsets() const
-{
-  return A_offsets_;
-}
-
-template <typename i_t, typename f_t>
-rmm::device_uvector<i_t>& gpu_optimization_problem_t<i_t, f_t>::get_constraint_matrix_offsets()
-{
-  return A_offsets_;
-}
-
-template <typename i_t, typename f_t>
-const rmm::device_uvector<f_t>& gpu_optimization_problem_t<i_t, f_t>::get_constraint_bounds() const
-{
-  return b_;
-}
-
-template <typename i_t, typename f_t>
-rmm::device_uvector<f_t>& gpu_optimization_problem_t<i_t, f_t>::get_constraint_bounds()
-{
-  return b_;
-}
-
-template <typename i_t, typename f_t>
-const rmm::device_uvector<f_t>& gpu_optimization_problem_t<i_t, f_t>::get_objective_coefficients()
+const rmm::device_uvector<i_t>& optimization_problem_t<i_t, f_t>::get_constraint_matrix_indices()
   const
 {
-  return c_;
+  return A_indices_;
 }
 
 template <typename i_t, typename f_t>
-rmm::device_uvector<f_t>& gpu_optimization_problem_t<i_t, f_t>::get_objective_coefficients()
+rmm::device_uvector<i_t>& optimization_problem_t<i_t, f_t>::get_constraint_matrix_indices()
+{
+  return A_indices_;
+}
+
+template <typename i_t, typename f_t>
+const rmm::device_uvector<i_t>& optimization_problem_t<i_t, f_t>::get_constraint_matrix_offsets()
+  const
+{
+  return A_offsets_;
+}
+
+template <typename i_t, typename f_t>
+rmm::device_uvector<i_t>& optimization_problem_t<i_t, f_t>::get_constraint_matrix_offsets()
+{
+  return A_offsets_;
+}
+
+template <typename i_t, typename f_t>
+const rmm::device_uvector<f_t>& optimization_problem_t<i_t, f_t>::get_constraint_bounds() const
+{
+  return b_;
+}
+
+template <typename i_t, typename f_t>
+rmm::device_uvector<f_t>& optimization_problem_t<i_t, f_t>::get_constraint_bounds()
+{
+  return b_;
+}
+
+template <typename i_t, typename f_t>
+const rmm::device_uvector<f_t>& optimization_problem_t<i_t, f_t>::get_objective_coefficients() const
 {
   return c_;
 }
 
 template <typename i_t, typename f_t>
-f_t gpu_optimization_problem_t<i_t, f_t>::get_objective_scaling_factor() const
+rmm::device_uvector<f_t>& optimization_problem_t<i_t, f_t>::get_objective_coefficients()
+{
+  return c_;
+}
+
+template <typename i_t, typename f_t>
+f_t optimization_problem_t<i_t, f_t>::get_objective_scaling_factor() const
 {
   return objective_scaling_factor_;
 }
 
 template <typename i_t, typename f_t>
-f_t gpu_optimization_problem_t<i_t, f_t>::get_objective_offset() const
+f_t optimization_problem_t<i_t, f_t>::get_objective_offset() const
 {
   return objective_offset_;
 }
 
 template <typename i_t, typename f_t>
-const rmm::device_uvector<f_t>& gpu_optimization_problem_t<i_t, f_t>::get_variable_lower_bounds()
-  const
+const rmm::device_uvector<f_t>& optimization_problem_t<i_t, f_t>::get_variable_lower_bounds() const
 {
   return variable_lower_bounds_;
 }
 
 template <typename i_t, typename f_t>
-rmm::device_uvector<f_t>& gpu_optimization_problem_t<i_t, f_t>::get_variable_lower_bounds()
+rmm::device_uvector<f_t>& optimization_problem_t<i_t, f_t>::get_variable_lower_bounds()
 {
   return variable_lower_bounds_;
 }
 
 template <typename i_t, typename f_t>
-const rmm::device_uvector<f_t>& gpu_optimization_problem_t<i_t, f_t>::get_variable_upper_bounds()
-  const
+const rmm::device_uvector<f_t>& optimization_problem_t<i_t, f_t>::get_variable_upper_bounds() const
 {
   return variable_upper_bounds_;
 }
 
 template <typename i_t, typename f_t>
-rmm::device_uvector<f_t>& gpu_optimization_problem_t<i_t, f_t>::get_variable_upper_bounds()
+rmm::device_uvector<f_t>& optimization_problem_t<i_t, f_t>::get_variable_upper_bounds()
 {
   return variable_upper_bounds_;
 }
 
 template <typename i_t, typename f_t>
-const rmm::device_uvector<f_t>& gpu_optimization_problem_t<i_t, f_t>::get_constraint_lower_bounds()
+const rmm::device_uvector<f_t>& optimization_problem_t<i_t, f_t>::get_constraint_lower_bounds()
   const
 {
   return constraint_lower_bounds_;
 }
 
 template <typename i_t, typename f_t>
-rmm::device_uvector<f_t>& gpu_optimization_problem_t<i_t, f_t>::get_constraint_lower_bounds()
+rmm::device_uvector<f_t>& optimization_problem_t<i_t, f_t>::get_constraint_lower_bounds()
 {
   return constraint_lower_bounds_;
 }
 
 template <typename i_t, typename f_t>
-const rmm::device_uvector<f_t>& gpu_optimization_problem_t<i_t, f_t>::get_constraint_upper_bounds()
+const rmm::device_uvector<f_t>& optimization_problem_t<i_t, f_t>::get_constraint_upper_bounds()
   const
 {
   return constraint_upper_bounds_;
 }
 
 template <typename i_t, typename f_t>
-rmm::device_uvector<f_t>& gpu_optimization_problem_t<i_t, f_t>::get_constraint_upper_bounds()
+rmm::device_uvector<f_t>& optimization_problem_t<i_t, f_t>::get_constraint_upper_bounds()
 {
   return constraint_upper_bounds_;
 }
 
 template <typename i_t, typename f_t>
-const rmm::device_uvector<char>& gpu_optimization_problem_t<i_t, f_t>::get_row_types() const
+const rmm::device_uvector<char>& optimization_problem_t<i_t, f_t>::get_row_types() const
 {
   return row_types_;
 }
 
 template <typename i_t, typename f_t>
-const rmm::device_uvector<var_t>& gpu_optimization_problem_t<i_t, f_t>::get_variable_types() const
+const rmm::device_uvector<var_t>& optimization_problem_t<i_t, f_t>::get_variable_types() const
 {
   return variable_types_;
 }
 
 template <typename i_t, typename f_t>
-bool gpu_optimization_problem_t<i_t, f_t>::get_sense() const
+bool optimization_problem_t<i_t, f_t>::get_sense() const
 {
   return maximize_;
 }
 
 template <typename i_t, typename f_t>
-bool gpu_optimization_problem_t<i_t, f_t>::empty() const
+bool optimization_problem_t<i_t, f_t>::empty() const
 {
-  return n_vars_ == 0 || n_constraints_ == 0;
+  return n_vars_ == 0 && n_constraints_ == 0;
 }
 
 template <typename i_t, typename f_t>
-std::string gpu_optimization_problem_t<i_t, f_t>::get_objective_name() const
+std::string optimization_problem_t<i_t, f_t>::get_objective_name() const
 {
   return objective_name_;
 }
 
 template <typename i_t, typename f_t>
-std::string gpu_optimization_problem_t<i_t, f_t>::get_problem_name() const
+std::string optimization_problem_t<i_t, f_t>::get_problem_name() const
 {
   return problem_name_;
 }
 
 template <typename i_t, typename f_t>
-problem_category_t gpu_optimization_problem_t<i_t, f_t>::get_problem_category() const
+problem_category_t optimization_problem_t<i_t, f_t>::get_problem_category() const
 {
   return problem_category_;
 }
 
 template <typename i_t, typename f_t>
-const std::vector<std::string>& gpu_optimization_problem_t<i_t, f_t>::get_variable_names() const
+const std::vector<std::string>& optimization_problem_t<i_t, f_t>::get_variable_names() const
 {
   return var_names_;
 }
 
 template <typename i_t, typename f_t>
-const std::vector<std::string>& gpu_optimization_problem_t<i_t, f_t>::get_row_names() const
+const std::vector<std::string>& optimization_problem_t<i_t, f_t>::get_row_names() const
 {
   return row_names_;
 }
 
 template <typename i_t, typename f_t>
-const std::vector<i_t>& gpu_optimization_problem_t<i_t, f_t>::get_quadratic_objective_offsets()
-  const
+const std::vector<i_t>& optimization_problem_t<i_t, f_t>::get_quadratic_objective_offsets() const
 {
   return Q_offsets_;
 }
 
 template <typename i_t, typename f_t>
-const std::vector<i_t>& gpu_optimization_problem_t<i_t, f_t>::get_quadratic_objective_indices()
-  const
+const std::vector<i_t>& optimization_problem_t<i_t, f_t>::get_quadratic_objective_indices() const
 {
   return Q_indices_;
 }
 
 template <typename i_t, typename f_t>
-const std::vector<f_t>& gpu_optimization_problem_t<i_t, f_t>::get_quadratic_objective_values() const
+const std::vector<f_t>& optimization_problem_t<i_t, f_t>::get_quadratic_objective_values() const
 {
   return Q_values_;
 }
 
 template <typename i_t, typename f_t>
-bool gpu_optimization_problem_t<i_t, f_t>::has_quadratic_objective() const
+bool optimization_problem_t<i_t, f_t>::has_quadratic_objective() const
 {
   return !Q_values_.empty();
 }
 
 template <typename i_t, typename f_t>
-raft::handle_t const* gpu_optimization_problem_t<i_t, f_t>::get_handle_ptr() const noexcept
+raft::handle_t const* optimization_problem_t<i_t, f_t>::get_handle_ptr() const noexcept
 {
   return handle_ptr_;
+}
+
+// ==============================================================================
+// Conversion
+// ==============================================================================
+
+template <typename i_t, typename f_t>
+std::unique_ptr<optimization_problem_t<i_t, f_t>>
+optimization_problem_t<i_t, f_t>::to_optimization_problem()
+{
+  // Already a GPU problem, return nullptr
+  return nullptr;
+}
+
+template <typename i_t, typename f_t>
+std::unique_ptr<cpu_optimization_problem_t<i_t, f_t>>
+optimization_problem_t<i_t, f_t>::to_cpu_optimization_problem() const
+{
+  // Create CPU problem (no CUDA resources needed for CPU-only operations)
+  auto cpu_problem = std::make_unique<cpu_optimization_problem_t<i_t, f_t>>(nullptr);
+
+  // Copy scalar properties
+  cpu_problem->set_maximize(get_sense());
+  cpu_problem->set_objective_offset(get_objective_offset());
+  cpu_problem->set_problem_category(get_problem_category());
+
+  // Copy names
+  cpu_problem->set_problem_name(get_problem_name());
+  cpu_problem->set_objective_name(get_objective_name());
+  cpu_problem->set_variable_names(get_variable_names());
+  cpu_problem->set_row_names(get_row_names());
+
+  // Copy objective coefficients
+  auto obj_coeffs = get_objective_coefficients_host();
+  if (!obj_coeffs.empty()) {
+    cpu_problem->set_objective_coefficients(obj_coeffs.data(), obj_coeffs.size());
+  }
+
+  // Copy constraint matrix (CSR format)
+  auto matrix_values  = get_constraint_matrix_values_host();
+  auto matrix_indices = get_constraint_matrix_indices_host();
+  auto matrix_offsets = get_constraint_matrix_offsets_host();
+  if (!matrix_values.empty()) {
+    cpu_problem->set_csr_constraint_matrix(matrix_values.data(),
+                                           matrix_values.size(),
+                                           matrix_indices.data(),
+                                           matrix_indices.size(),
+                                           matrix_offsets.data(),
+                                           matrix_offsets.size());
+  }
+
+  // Copy constraint bounds
+  auto constraint_lb = get_constraint_lower_bounds_host();
+  auto constraint_ub = get_constraint_upper_bounds_host();
+  if (!constraint_lb.empty()) {
+    cpu_problem->set_constraint_lower_bounds(constraint_lb.data(), constraint_lb.size());
+  }
+  if (!constraint_ub.empty()) {
+    cpu_problem->set_constraint_upper_bounds(constraint_ub.data(), constraint_ub.size());
+  }
+
+  // Copy variable bounds
+  auto var_lb = get_variable_lower_bounds_host();
+  auto var_ub = get_variable_upper_bounds_host();
+  if (!var_lb.empty()) { cpu_problem->set_variable_lower_bounds(var_lb.data(), var_lb.size()); }
+  if (!var_ub.empty()) { cpu_problem->set_variable_upper_bounds(var_ub.data(), var_ub.size()); }
+
+  // Copy variable types
+  auto var_types = get_variable_types_host();
+  if (!var_types.empty()) { cpu_problem->set_variable_types(var_types.data(), var_types.size()); }
+
+  // Copy quadratic objective if present
+  if (has_quadratic_objective()) {
+    auto quad_offsets = get_quadratic_objective_offsets();
+    auto quad_indices = get_quadratic_objective_indices();
+    auto quad_values  = get_quadratic_objective_values();
+    cpu_problem->set_quadratic_objective_matrix(quad_values.data(),
+                                                quad_values.size(),
+                                                quad_indices.data(),
+                                                quad_indices.size(),
+                                                quad_offsets.data(),
+                                                quad_offsets.size());
+  }
+
+  return cpu_problem;
 }
 
 // ==============================================================================
@@ -476,7 +798,7 @@ raft::handle_t const* gpu_optimization_problem_t<i_t, f_t>::get_handle_ptr() con
 // ==============================================================================
 
 template <typename i_t, typename f_t>
-std::vector<f_t> gpu_optimization_problem_t<i_t, f_t>::get_constraint_matrix_values_host() const
+std::vector<f_t> optimization_problem_t<i_t, f_t>::get_constraint_matrix_values_host() const
 {
   std::vector<f_t> host_data(A_.size());
   raft::copy(host_data.data(), A_.data(), A_.size(), stream_view_);
@@ -485,7 +807,7 @@ std::vector<f_t> gpu_optimization_problem_t<i_t, f_t>::get_constraint_matrix_val
 }
 
 template <typename i_t, typename f_t>
-std::vector<i_t> gpu_optimization_problem_t<i_t, f_t>::get_constraint_matrix_indices_host() const
+std::vector<i_t> optimization_problem_t<i_t, f_t>::get_constraint_matrix_indices_host() const
 {
   std::vector<i_t> host_data(A_indices_.size());
   raft::copy(host_data.data(), A_indices_.data(), A_indices_.size(), stream_view_);
@@ -494,7 +816,7 @@ std::vector<i_t> gpu_optimization_problem_t<i_t, f_t>::get_constraint_matrix_ind
 }
 
 template <typename i_t, typename f_t>
-std::vector<i_t> gpu_optimization_problem_t<i_t, f_t>::get_constraint_matrix_offsets_host() const
+std::vector<i_t> optimization_problem_t<i_t, f_t>::get_constraint_matrix_offsets_host() const
 {
   std::vector<i_t> host_data(A_offsets_.size());
   raft::copy(host_data.data(), A_offsets_.data(), A_offsets_.size(), stream_view_);
@@ -503,7 +825,7 @@ std::vector<i_t> gpu_optimization_problem_t<i_t, f_t>::get_constraint_matrix_off
 }
 
 template <typename i_t, typename f_t>
-std::vector<f_t> gpu_optimization_problem_t<i_t, f_t>::get_constraint_bounds_host() const
+std::vector<f_t> optimization_problem_t<i_t, f_t>::get_constraint_bounds_host() const
 {
   std::vector<f_t> host_data(b_.size());
   raft::copy(host_data.data(), b_.data(), b_.size(), stream_view_);
@@ -512,7 +834,7 @@ std::vector<f_t> gpu_optimization_problem_t<i_t, f_t>::get_constraint_bounds_hos
 }
 
 template <typename i_t, typename f_t>
-std::vector<f_t> gpu_optimization_problem_t<i_t, f_t>::get_objective_coefficients_host() const
+std::vector<f_t> optimization_problem_t<i_t, f_t>::get_objective_coefficients_host() const
 {
   std::vector<f_t> host_data(c_.size());
   raft::copy(host_data.data(), c_.data(), c_.size(), stream_view_);
@@ -521,7 +843,7 @@ std::vector<f_t> gpu_optimization_problem_t<i_t, f_t>::get_objective_coefficient
 }
 
 template <typename i_t, typename f_t>
-std::vector<f_t> gpu_optimization_problem_t<i_t, f_t>::get_variable_lower_bounds_host() const
+std::vector<f_t> optimization_problem_t<i_t, f_t>::get_variable_lower_bounds_host() const
 {
   std::vector<f_t> host_data(variable_lower_bounds_.size());
   raft::copy(
@@ -531,7 +853,7 @@ std::vector<f_t> gpu_optimization_problem_t<i_t, f_t>::get_variable_lower_bounds
 }
 
 template <typename i_t, typename f_t>
-std::vector<f_t> gpu_optimization_problem_t<i_t, f_t>::get_variable_upper_bounds_host() const
+std::vector<f_t> optimization_problem_t<i_t, f_t>::get_variable_upper_bounds_host() const
 {
   std::vector<f_t> host_data(variable_upper_bounds_.size());
   raft::copy(
@@ -541,7 +863,7 @@ std::vector<f_t> gpu_optimization_problem_t<i_t, f_t>::get_variable_upper_bounds
 }
 
 template <typename i_t, typename f_t>
-std::vector<f_t> gpu_optimization_problem_t<i_t, f_t>::get_constraint_lower_bounds_host() const
+std::vector<f_t> optimization_problem_t<i_t, f_t>::get_constraint_lower_bounds_host() const
 {
   std::vector<f_t> host_data(constraint_lower_bounds_.size());
   raft::copy(host_data.data(),
@@ -553,7 +875,7 @@ std::vector<f_t> gpu_optimization_problem_t<i_t, f_t>::get_constraint_lower_boun
 }
 
 template <typename i_t, typename f_t>
-std::vector<f_t> gpu_optimization_problem_t<i_t, f_t>::get_constraint_upper_bounds_host() const
+std::vector<f_t> optimization_problem_t<i_t, f_t>::get_constraint_upper_bounds_host() const
 {
   std::vector<f_t> host_data(constraint_upper_bounds_.size());
   raft::copy(host_data.data(),
@@ -565,7 +887,7 @@ std::vector<f_t> gpu_optimization_problem_t<i_t, f_t>::get_constraint_upper_boun
 }
 
 template <typename i_t, typename f_t>
-std::vector<char> gpu_optimization_problem_t<i_t, f_t>::get_row_types_host() const
+std::vector<char> optimization_problem_t<i_t, f_t>::get_row_types_host() const
 {
   std::vector<char> host_data(row_types_.size());
   raft::copy(host_data.data(), row_types_.data(), row_types_.size(), stream_view_);
@@ -574,7 +896,7 @@ std::vector<char> gpu_optimization_problem_t<i_t, f_t>::get_row_types_host() con
 }
 
 template <typename i_t, typename f_t>
-std::vector<var_t> gpu_optimization_problem_t<i_t, f_t>::get_variable_types_host() const
+std::vector<var_t> optimization_problem_t<i_t, f_t>::get_variable_types_host() const
 {
   std::vector<var_t> host_data(variable_types_.size());
   raft::copy(host_data.data(), variable_types_.data(), variable_types_.size(), stream_view_);
@@ -583,78 +905,37 @@ std::vector<var_t> gpu_optimization_problem_t<i_t, f_t>::get_variable_types_host
 }
 
 // ==============================================================================
-// Conversion to optimization_problem_t
+// View
 // ==============================================================================
 
 template <typename i_t, typename f_t>
-optimization_problem_t<i_t, f_t> gpu_optimization_problem_t<i_t, f_t>::to_optimization_problem()
+typename optimization_problem_t<i_t, f_t>::view_t optimization_problem_t<i_t, f_t>::view() const
 {
-  optimization_problem_t<i_t, f_t> problem(handle_ptr_);
-
-  // Set scalar values
-  problem.set_maximize(maximize_);
-  problem.set_objective_scaling_factor(objective_scaling_factor_);
-  problem.set_objective_offset(objective_offset_);
-  problem.set_problem_category(problem_category_);
-
-  // Set string values (copy is acceptable for small strings)
-  if (!objective_name_.empty()) problem.set_objective_name(objective_name_);
-  if (!problem_name_.empty()) problem.set_problem_name(problem_name_);
-  if (!var_names_.empty()) problem.set_variable_names(var_names_);
-  if (!row_names_.empty()) problem.set_row_names(row_names_);
-
-  // MOVE all device vectors (zero-copy transfer of ownership)
-  // This avoids expensive GPU-to-GPU memory copies
-
-  // Move CSR constraint matrix
-  if (A_.size() > 0) {
-    problem.set_csr_constraint_matrix_move(
-      std::move(A_), std::move(A_indices_), std::move(A_offsets_));
-  }
-
-  // Move constraint bounds
-  if (b_.size() > 0) { problem.set_constraint_bounds_move(std::move(b_)); }
-
-  // Move objective coefficients
-  if (c_.size() > 0) { problem.set_objective_coefficients_move(std::move(c_)); }
-
-  // Set quadratic objective if present (stored in std::vector, not device_uvector)
-  if (!Q_values_.empty()) {
-    problem.set_quadratic_objective_matrix(Q_values_.data(),
-                                           Q_values_.size(),
-                                           Q_indices_.data(),
-                                           Q_indices_.size(),
-                                           Q_offsets_.data(),
-                                           Q_offsets_.size());
-  }
-
-  // Move variable bounds
-  if (variable_lower_bounds_.size() > 0) {
-    problem.set_variable_lower_bounds_move(std::move(variable_lower_bounds_));
-  }
-  if (variable_upper_bounds_.size() > 0) {
-    problem.set_variable_upper_bounds_move(std::move(variable_upper_bounds_));
-  }
-
-  // Move variable types
-  if (variable_types_.size() > 0) { problem.set_variable_types_move(std::move(variable_types_)); }
-
-  // Move constraint bounds
-  if (constraint_lower_bounds_.size() > 0) {
-    problem.set_constraint_lower_bounds_move(std::move(constraint_lower_bounds_));
-  }
-  if (constraint_upper_bounds_.size() > 0) {
-    problem.set_constraint_upper_bounds_move(std::move(constraint_upper_bounds_));
-  }
-
-  // Move row types
-  if (row_types_.size() > 0) { problem.set_row_types_move(std::move(row_types_)); }
-
-  // NOTE: After this return, the gpu_optimization_problem_t is left in a valid
-  // but empty state (all device_uvectors are moved from). This is intentional
-  // as we're transferring ownership to optimization_problem_t.
-
-  return problem;
+  optimization_problem_t<i_t, f_t>::view_t v;
+  v.n_vars        = get_n_variables();
+  v.n_constraints = get_n_constraints();
+  v.nnz           = get_nnz();
+  v.A             = raft::device_span<f_t>{const_cast<f_t*>(get_constraint_matrix_values().data()),
+                                           get_constraint_matrix_values().size()};
+  v.A_indices     = raft::device_span<const i_t>{get_constraint_matrix_indices().data(),
+                                                 get_constraint_matrix_indices().size()};
+  v.A_offsets     = raft::device_span<const i_t>{get_constraint_matrix_offsets().data(),
+                                                 get_constraint_matrix_offsets().size()};
+  v.b =
+    raft::device_span<const f_t>{get_constraint_bounds().data(), get_constraint_bounds().size()};
+  v.c                     = raft::device_span<const f_t>{get_objective_coefficients().data(),
+                                                         get_objective_coefficients().size()};
+  v.variable_lower_bounds = raft::device_span<const f_t>{get_variable_lower_bounds().data(),
+                                                         get_variable_lower_bounds().size()};
+  v.variable_upper_bounds = raft::device_span<const f_t>{get_variable_upper_bounds().data(),
+                                                         get_variable_upper_bounds().size()};
+  v.variable_types =
+    raft::device_span<const var_t>{get_variable_types().data(), get_variable_types().size()};
+  v.constraint_lower_bounds = raft::device_span<const f_t>{get_constraint_lower_bounds().data(),
+                                                           get_constraint_lower_bounds().size()};
+  v.constraint_upper_bounds = raft::device_span<const f_t>{get_constraint_upper_bounds().data(),
+                                                           get_constraint_upper_bounds().size()};
+  return v;
 }
 
 // ==============================================================================
@@ -662,28 +943,28 @@ optimization_problem_t<i_t, f_t> gpu_optimization_problem_t<i_t, f_t>::to_optimi
 // ==============================================================================
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::write_to_mps(const std::string& mps_file_path)
+void optimization_problem_t<i_t, f_t>::write_to_mps(const std::string& mps_file_path)
 {
-  // Use the existing host getters to get data, then write to MPS
   cuopt::mps_parser::data_model_view_t<i_t, f_t> data_model_view;
 
   // Set optimization sense
   data_model_view.set_maximize(get_sense());
 
-  // Copy to host using host getters
-  auto constraint_matrix_values  = get_constraint_matrix_values_host();
-  auto constraint_matrix_indices = get_constraint_matrix_indices_host();
-  auto constraint_matrix_offsets = get_constraint_matrix_offsets_host();
-  auto constraint_bounds         = get_constraint_bounds_host();
-  auto objective_coefficients    = get_objective_coefficients_host();
-  auto variable_lower_bounds     = get_variable_lower_bounds_host();
-  auto variable_upper_bounds     = get_variable_upper_bounds_host();
-  auto constraint_lower_bounds   = get_constraint_lower_bounds_host();
-  auto constraint_upper_bounds   = get_constraint_upper_bounds_host();
-  auto row_types                 = get_row_types_host();
+  // Copy to host
+  auto stream                    = handle_ptr_->get_stream();
+  auto constraint_matrix_values  = cuopt::host_copy(get_constraint_matrix_values(), stream);
+  auto constraint_matrix_indices = cuopt::host_copy(get_constraint_matrix_indices(), stream);
+  auto constraint_matrix_offsets = cuopt::host_copy(get_constraint_matrix_offsets(), stream);
+  auto constraint_bounds         = cuopt::host_copy(get_constraint_bounds(), stream);
+  auto objective_coefficients    = cuopt::host_copy(get_objective_coefficients(), stream);
+  auto variable_lower_bounds     = cuopt::host_copy(get_variable_lower_bounds(), stream);
+  auto variable_upper_bounds     = cuopt::host_copy(get_variable_upper_bounds(), stream);
+  auto constraint_lower_bounds   = cuopt::host_copy(get_constraint_lower_bounds(), stream);
+  auto constraint_upper_bounds   = cuopt::host_copy(get_constraint_upper_bounds(), stream);
+  auto row_types                 = cuopt::host_copy(get_row_types(), stream);
 
   // Set constraint matrix in CSR format
-  if (!constraint_matrix_values.empty()) {
+  if (get_nnz() != 0) {
     data_model_view.set_csr_constraint_matrix(constraint_matrix_values.data(),
                                               constraint_matrix_values.size(),
                                               constraint_matrix_indices.data(),
@@ -693,22 +974,22 @@ void gpu_optimization_problem_t<i_t, f_t>::write_to_mps(const std::string& mps_f
   }
 
   // Set constraint bounds (RHS)
-  if (!constraint_bounds.empty()) {
+  if (get_n_constraints() != 0) {
     data_model_view.set_constraint_bounds(constraint_bounds.data(), constraint_bounds.size());
   }
 
   // Set objective coefficients
-  if (!objective_coefficients.empty()) {
+  if (get_n_variables() != 0) {
     data_model_view.set_objective_coefficients(objective_coefficients.data(),
                                                objective_coefficients.size());
   }
 
   // Set objective scaling and offset
-  data_model_view.set_objective_scaling_factor(objective_scaling_factor_);
-  data_model_view.set_objective_offset(objective_offset_);
+  data_model_view.set_objective_scaling_factor(get_objective_scaling_factor());
+  data_model_view.set_objective_offset(get_objective_offset());
 
   // Set variable bounds
-  if (!variable_lower_bounds.empty()) {
+  if (get_n_variables() != 0) {
     data_model_view.set_variable_lower_bounds(variable_lower_bounds.data(),
                                               variable_lower_bounds.size());
     data_model_view.set_variable_upper_bounds(variable_upper_bounds.data(),
@@ -716,10 +997,12 @@ void gpu_optimization_problem_t<i_t, f_t>::write_to_mps(const std::string& mps_f
   }
 
   // Set row types (constraint types)
-  if (!row_types.empty()) { data_model_view.set_row_types(row_types.data(), row_types.size()); }
+  if (get_row_types().size() != 0) {
+    data_model_view.set_row_types(row_types.data(), row_types.size());
+  }
 
   // Set constraint bounds (lower and upper)
-  if (!constraint_lower_bounds.empty() && !constraint_upper_bounds.empty()) {
+  if (get_constraint_lower_bounds().size() != 0 && get_constraint_upper_bounds().size() != 0) {
     data_model_view.set_constraint_lower_bounds(constraint_lower_bounds.data(),
                                                 constraint_lower_bounds.size());
     data_model_view.set_constraint_upper_bounds(constraint_upper_bounds.data(),
@@ -727,19 +1010,20 @@ void gpu_optimization_problem_t<i_t, f_t>::write_to_mps(const std::string& mps_f
   }
 
   // Set problem and variable names FIRST (before variable types)
-  if (!problem_name_.empty()) { data_model_view.set_problem_name(problem_name_); }
-  if (!objective_name_.empty()) { data_model_view.set_objective_name(objective_name_); }
-  if (!var_names_.empty()) { data_model_view.set_variable_names(var_names_); }
-  if (!row_names_.empty()) { data_model_view.set_row_names(row_names_); }
+  if (!get_problem_name().empty()) { data_model_view.set_problem_name(get_problem_name()); }
+  if (!get_objective_name().empty()) { data_model_view.set_objective_name(get_objective_name()); }
+  if (!get_variable_names().empty()) { data_model_view.set_variable_names(get_variable_names()); }
+  if (!get_row_names().empty()) { data_model_view.set_row_names(get_row_names()); }
 
   // Set variable types AFTER names (convert from enum to char)
   // CRITICAL: Declare variable_types OUTSIDE the if block so it stays alive
   // until after write_mps() is called, since data_model_view stores a span (pointer) to it
   std::vector<char> variable_types;
-  if (n_vars_ > 0) {
-    auto enum_variable_types = get_variable_types_host();
+  if (get_n_variables() != 0) {
+    auto enum_variable_types = cuopt::host_copy(get_variable_types(), stream);
     variable_types.resize(enum_variable_types.size());
 
+    // Convert enum types to char types
     for (size_t i = 0; i < variable_types.size(); ++i) {
       variable_types[i] = (enum_variable_types[i] == var_t::INTEGER) ? 'I' : 'C';
     }
@@ -750,12 +1034,345 @@ void gpu_optimization_problem_t<i_t, f_t>::write_to_mps(const std::string& mps_f
   cuopt::mps_parser::write_mps(data_model_view, mps_file_path);
 }
 
+template <typename i_t, typename f_t>
+void optimization_problem_t<i_t, f_t>::print_scaling_information() const
+{
+  auto stream = handle_ptr_->get_stream();
+  std::vector<f_t> constraint_matrix_values =
+    cuopt::host_copy(get_constraint_matrix_values(), stream);
+  std::vector<f_t> constraint_rhs         = cuopt::host_copy(get_constraint_bounds(), stream);
+  std::vector<f_t> objective_coefficients = cuopt::host_copy(get_objective_coefficients(), stream);
+  std::vector<f_t> variable_lower_bounds  = cuopt::host_copy(get_variable_lower_bounds(), stream);
+  std::vector<f_t> variable_upper_bounds  = cuopt::host_copy(get_variable_upper_bounds(), stream);
+  std::vector<f_t> constraint_lower_bounds =
+    cuopt::host_copy(get_constraint_lower_bounds(), stream);
+  std::vector<f_t> constraint_upper_bounds =
+    cuopt::host_copy(get_constraint_upper_bounds(), stream);
+
+  auto findMaxAbs = [](const std::vector<f_t>& vec) -> f_t {
+    if (vec.empty()) { return 0.0; }
+    const f_t inf = std::numeric_limits<f_t>::infinity();
+
+    const size_t sz = vec.size();
+    f_t max_abs_val = f_t(0.0);
+    for (size_t i = 0; i < sz; ++i) {
+      const f_t val = std::abs(vec[i]);
+      if (val < inf) { max_abs_val = std::max(max_abs_val, val); }
+    }
+    return max_abs_val;
+  };
+
+  auto findMinAbs = [](const std::vector<f_t>& vec) -> f_t {
+    if (vec.empty()) { return f_t(0.0); }
+    const size_t sz = vec.size();
+    const f_t inf   = std::numeric_limits<f_t>::infinity();
+    f_t min_abs_val = inf;
+    for (size_t i = 0; i < sz; ++i) {
+      const f_t val = std::abs(vec[i]);
+      if (val > f_t(0.0)) { min_abs_val = std::min(min_abs_val, val); }
+    }
+    return min_abs_val < inf ? min_abs_val : f_t(0.0);
+  };
+
+  f_t A_max          = findMaxAbs(constraint_matrix_values);
+  f_t A_min          = findMinAbs(constraint_matrix_values);
+  f_t b_max          = findMaxAbs(constraint_rhs);
+  f_t b_min          = findMinAbs(constraint_rhs);
+  f_t c_max          = findMaxAbs(objective_coefficients);
+  f_t c_min          = findMinAbs(objective_coefficients);
+  f_t x_lower_max    = findMaxAbs(variable_lower_bounds);
+  f_t x_lower_min    = findMinAbs(variable_lower_bounds);
+  f_t x_upper_max    = findMaxAbs(variable_upper_bounds);
+  f_t x_upper_min    = findMinAbs(variable_upper_bounds);
+  f_t cstr_lower_max = findMaxAbs(constraint_lower_bounds);
+  f_t cstr_lower_min = findMinAbs(constraint_lower_bounds);
+  f_t cstr_upper_max = findMaxAbs(constraint_upper_bounds);
+  f_t cstr_upper_min = findMinAbs(constraint_upper_bounds);
+
+  f_t rhs_max = std::max(b_max, std::max(cstr_lower_max, cstr_upper_max));
+  f_t rhs_min = std::min(b_min, std::min(cstr_lower_min, cstr_upper_min));
+
+  f_t bound_max = std::max(x_upper_max, x_lower_max);
+  f_t bound_min = std::min(x_upper_min, x_lower_min);
+
+  CUOPT_LOG_INFO("Problem scaling:");
+  CUOPT_LOG_INFO("Objective coefficents range:          [%.0e, %.0e]", c_min, c_max);
+  CUOPT_LOG_INFO("Constraint matrix coefficients range: [%.0e, %.0e]", A_min, A_max);
+  CUOPT_LOG_INFO("Constraint rhs / bounds range:        [%.0e, %.0e]", rhs_min, rhs_max);
+  CUOPT_LOG_INFO("Variable bounds range:                [%.0e, %.0e]", bound_min, bound_max);
+
+  auto safelog10 = [](f_t x) { return x > 0 ? std::log10(x) : 0.0; };
+
+  f_t obj_range   = safelog10(c_max) - safelog10(c_min);
+  f_t A_range     = safelog10(A_max) - safelog10(A_min);
+  f_t rhs_range   = safelog10(rhs_max) - safelog10(rhs_min);
+  f_t bound_range = safelog10(bound_max) - safelog10(bound_min);
+
+  if (obj_range >= 6.0 || A_range >= 6.0 || rhs_range >= 6.0 || bound_range >= 6.0) {
+    CUOPT_LOG_INFO(
+      "Warning: input problem contains a large range of coefficients: consider reformulating to "
+      "avoid numerical difficulties.");
+  }
+  CUOPT_LOG_INFO("");
+}
+
 // ==============================================================================
 // Comparison
 // ==============================================================================
 
+/**
+ * @brief Compare two CSR matrices for equivalence under row and column permutations.
+ *
+ * @param this_offsets Row offsets of first matrix
+ * @param this_indices Column indices of first matrix
+ * @param this_values Values of first matrix
+ * @param other_offsets Row offsets of second matrix
+ * @param other_indices Column indices of second matrix
+ * @param other_values Values of second matrix
+ * @param d_row_perm_inv Inverse row permutation (maps other's row indices to this's)
+ * @param d_col_perm_inv Inverse column permutation (maps other's col indices to this's)
+ * @param n_cols Number of columns (used for sort key computation)
+ * @param stream CUDA stream
+ * @return true if matrices are equivalent under the given permutations
+ */
 template <typename i_t, typename f_t>
-bool gpu_optimization_problem_t<i_t, f_t>::is_equivalent(
+static bool csr_matrices_equivalent_with_permutation(const rmm::device_uvector<i_t>& this_offsets,
+                                                     const rmm::device_uvector<i_t>& this_indices,
+                                                     const rmm::device_uvector<f_t>& this_values,
+                                                     const rmm::device_uvector<i_t>& other_offsets,
+                                                     const rmm::device_uvector<i_t>& other_indices,
+                                                     const rmm::device_uvector<f_t>& other_values,
+                                                     const rmm::device_uvector<i_t>& d_row_perm_inv,
+                                                     const rmm::device_uvector<i_t>& d_col_perm_inv,
+                                                     i_t n_cols,
+                                                     rmm::cuda_stream_view stream)
+{
+  const i_t nnz = static_cast<i_t>(this_values.size());
+  if (nnz != static_cast<i_t>(other_values.size())) { return false; }
+  if (nnz == 0) { return true; }
+
+  auto policy = rmm::exec_policy(stream);
+
+  // Expand CSR row offsets to row indices for 'this'
+  rmm::device_uvector<i_t> this_rows(nnz, stream);
+  rmm::device_uvector<i_t> this_cols(nnz, stream);
+  rmm::device_uvector<f_t> this_vals(nnz, stream);
+
+  // upper_bound returns 1-based indices; convert to 0-based
+  thrust::upper_bound(policy,
+                      this_offsets.begin(),
+                      this_offsets.end(),
+                      thrust::make_counting_iterator<i_t>(0),
+                      thrust::make_counting_iterator<i_t>(nnz),
+                      this_rows.begin());
+  thrust::transform(
+    policy, this_rows.begin(), this_rows.end(), this_rows.begin(), [] __device__(i_t r) {
+      return r - 1;
+    });
+
+  thrust::copy(policy, this_indices.begin(), this_indices.end(), this_cols.begin());
+  thrust::copy(policy, this_values.begin(), this_values.end(), this_vals.begin());
+
+  // For 'other': expand and apply inverse permutations to map to 'this' coordinate system
+  rmm::device_uvector<i_t> other_rows(nnz, stream);
+  rmm::device_uvector<i_t> other_cols(nnz, stream);
+  rmm::device_uvector<f_t> other_vals(nnz, stream);
+
+  thrust::upper_bound(policy,
+                      other_offsets.begin(),
+                      other_offsets.end(),
+                      thrust::make_counting_iterator<i_t>(0),
+                      thrust::make_counting_iterator<i_t>(nnz),
+                      other_rows.begin());
+  thrust::transform(
+    policy, other_rows.begin(), other_rows.end(), other_rows.begin(), [] __device__(i_t r) {
+      return r - 1;
+    });
+
+  thrust::gather(
+    policy, other_rows.begin(), other_rows.end(), d_row_perm_inv.begin(), other_rows.begin());
+
+  thrust::gather(
+    policy, other_indices.begin(), other_indices.end(), d_col_perm_inv.begin(), other_cols.begin());
+
+  thrust::copy(policy, other_values.begin(), other_values.end(), other_vals.begin());
+
+  // Create sort keys: row * n_cols + col (to sort by row then column)
+  rmm::device_uvector<int64_t> this_keys(nnz, stream);
+  rmm::device_uvector<int64_t> other_keys(nnz, stream);
+
+  const int64_t n_cols_64 = n_cols;
+  thrust::transform(policy,
+                    thrust::make_zip_iterator(this_rows.begin(), this_cols.begin()),
+                    thrust::make_zip_iterator(this_rows.end(), this_cols.end()),
+                    this_keys.begin(),
+                    [n_cols_64] __device__(thrust::tuple<i_t, i_t> rc) {
+                      return static_cast<int64_t>(thrust::get<0>(rc)) * n_cols_64 +
+                             static_cast<int64_t>(thrust::get<1>(rc));
+                    });
+
+  thrust::transform(policy,
+                    thrust::make_zip_iterator(other_rows.begin(), other_cols.begin()),
+                    thrust::make_zip_iterator(other_rows.end(), other_cols.end()),
+                    other_keys.begin(),
+                    [n_cols_64] __device__(thrust::tuple<i_t, i_t> rc) {
+                      return static_cast<int64_t>(thrust::get<0>(rc)) * n_cols_64 +
+                             static_cast<int64_t>(thrust::get<1>(rc));
+                    });
+
+  thrust::sort_by_key(policy, this_keys.begin(), this_keys.end(), this_vals.begin());
+  thrust::sort_by_key(policy, other_keys.begin(), other_keys.end(), other_vals.begin());
+
+  if (!thrust::equal(policy, this_keys.begin(), this_keys.end(), other_keys.begin())) {
+    return false;
+  }
+
+  if (!thrust::equal(policy, this_vals.begin(), this_vals.end(), other_vals.begin())) {
+    return false;
+  }
+
+  return true;
+}
+
+template <typename i_t, typename f_t>
+bool optimization_problem_t<i_t, f_t>::is_equivalent(
+  const optimization_problem_t<i_t, f_t>& other) const
+{
+  if (maximize_ != other.maximize_) { return false; }
+  if (n_vars_ != other.n_vars_) { return false; }
+  if (n_constraints_ != other.n_constraints_) { return false; }
+  if (objective_scaling_factor_ != other.objective_scaling_factor_) { return false; }
+  if (objective_offset_ != other.objective_offset_) { return false; }
+  if (problem_category_ != other.problem_category_) { return false; }
+  if (A_.size() != other.A_.size()) { return false; }
+
+  if (var_names_.empty() || other.var_names_.empty()) { return false; }
+  if (row_names_.empty() || other.row_names_.empty()) { return false; }
+
+  // Build variable permutation: var_perm[i] = index j in other where var_names_[i] ==
+  // other.var_names_[j]
+  std::unordered_map<std::string, i_t> other_var_idx;
+  for (size_t j = 0; j < other.var_names_.size(); ++j) {
+    other_var_idx[other.var_names_[j]] = static_cast<i_t>(j);
+  }
+  std::vector<i_t> var_perm(n_vars_);
+  for (i_t i = 0; i < n_vars_; ++i) {
+    auto it = other_var_idx.find(var_names_[i]);
+    if (it == other_var_idx.end()) { return false; }
+    var_perm[i] = it->second;
+  }
+
+  // Build row permutation: row_perm[i] = index j in other where row_names_[i] ==
+  // other.row_names_[j]
+  std::unordered_map<std::string, i_t> other_row_idx;
+  for (size_t j = 0; j < other.row_names_.size(); ++j) {
+    other_row_idx[other.row_names_[j]] = static_cast<i_t>(j);
+  }
+  std::vector<i_t> row_perm(n_constraints_);
+  for (i_t i = 0; i < n_constraints_; ++i) {
+    auto it = other_row_idx.find(row_names_[i]);
+    if (it == other_row_idx.end()) { return false; }
+    row_perm[i] = it->second;
+  }
+
+  // Upload permutations to GPU
+  rmm::device_uvector<i_t> d_var_perm(n_vars_, stream_view_);
+  rmm::device_uvector<i_t> d_row_perm(n_constraints_, stream_view_);
+  raft::copy(d_var_perm.data(), var_perm.data(), n_vars_, stream_view_);
+  raft::copy(d_row_perm.data(), row_perm.data(), n_constraints_, stream_view_);
+
+  auto policy = rmm::exec_policy(stream_view_);
+
+  auto permuted_eq = [&](auto this_begin, auto this_end, auto other_begin, auto perm_begin) {
+    auto other_perm = thrust::make_permutation_iterator(other_begin, perm_begin);
+    return thrust::equal(policy, this_begin, this_end, other_perm);
+  };
+
+  // Compare variable-indexed arrays
+  if (c_.size() != other.c_.size()) { return false; }
+  if (!permuted_eq(c_.begin(), c_.end(), other.c_.begin(), d_var_perm.begin())) { return false; }
+  if (variable_lower_bounds_.size() != other.variable_lower_bounds_.size()) { return false; }
+  if (!permuted_eq(variable_lower_bounds_.begin(),
+                   variable_lower_bounds_.end(),
+                   other.variable_lower_bounds_.begin(),
+                   d_var_perm.begin())) {
+    return false;
+  }
+  if (variable_upper_bounds_.size() != other.variable_upper_bounds_.size()) { return false; }
+  if (!permuted_eq(variable_upper_bounds_.begin(),
+                   variable_upper_bounds_.end(),
+                   other.variable_upper_bounds_.begin(),
+                   d_var_perm.begin())) {
+    return false;
+  }
+  if (variable_types_.size() != other.variable_types_.size()) { return false; }
+  if (!permuted_eq(variable_types_.begin(),
+                   variable_types_.end(),
+                   other.variable_types_.begin(),
+                   d_var_perm.begin())) {
+    return false;
+  }
+
+  // Compare constraint-indexed arrays
+  if (b_.size() != other.b_.size()) { return false; }
+  if (!permuted_eq(b_.begin(), b_.end(), other.b_.begin(), d_row_perm.begin())) { return false; }
+  if (constraint_lower_bounds_.size() != other.constraint_lower_bounds_.size()) { return false; }
+  if (!permuted_eq(constraint_lower_bounds_.begin(),
+                   constraint_lower_bounds_.end(),
+                   other.constraint_lower_bounds_.begin(),
+                   d_row_perm.begin())) {
+    return false;
+  }
+  if (constraint_upper_bounds_.size() != other.constraint_upper_bounds_.size()) { return false; }
+  if (!permuted_eq(constraint_upper_bounds_.begin(),
+                   constraint_upper_bounds_.end(),
+                   other.constraint_upper_bounds_.begin(),
+                   d_row_perm.begin())) {
+    return false;
+  }
+  if (row_types_.size() != other.row_types_.size()) { return false; }
+  if (!permuted_eq(
+        row_types_.begin(), row_types_.end(), other.row_types_.begin(), d_row_perm.begin())) {
+    return false;
+  }
+
+  // Build inverse permutations on CPU (needed for CSR comparisons)
+  std::vector<i_t> var_perm_inv(n_vars_);
+  for (i_t i = 0; i < n_vars_; ++i) {
+    var_perm_inv[var_perm[i]] = i;
+  }
+  std::vector<i_t> row_perm_inv(n_constraints_);
+  for (i_t i = 0; i < n_constraints_; ++i) {
+    row_perm_inv[row_perm[i]] = i;
+  }
+
+  // Upload inverse permutations to GPU
+  rmm::device_uvector<i_t> d_var_perm_inv(n_vars_, stream_view_);
+  rmm::device_uvector<i_t> d_row_perm_inv(n_constraints_, stream_view_);
+  raft::copy(d_var_perm_inv.data(), var_perm_inv.data(), n_vars_, stream_view_);
+  raft::copy(d_row_perm_inv.data(), row_perm_inv.data(), n_constraints_, stream_view_);
+
+  // Constraint matrix (A) comparison with row and column permutations
+  if (!csr_matrices_equivalent_with_permutation(A_offsets_,
+                                                A_indices_,
+                                                A_,
+                                                other.A_offsets_,
+                                                other.A_indices_,
+                                                other.A_,
+                                                d_row_perm_inv,
+                                                d_var_perm_inv,
+                                                n_vars_,
+                                                stream_view_)) {
+    return false;
+  }
+
+  // Q matrix writing to MPS not supported yet. Don't check for equivalence here
+
+  return true;
+}
+
+template <typename i_t, typename f_t>
+bool optimization_problem_t<i_t, f_t>::is_equivalent(
   const optimization_problem_interface_t<i_t, f_t>& other) const
 {
   // Compare scalar properties
@@ -854,22 +1471,22 @@ bool gpu_optimization_problem_t<i_t, f_t>::is_equivalent(
 
 template <typename i_t, typename f_t>
 std::unique_ptr<lp_solution_interface_t<i_t, f_t>>
-gpu_optimization_problem_t<i_t, f_t>::solve_lp_remote(
+optimization_problem_t<i_t, f_t>::solve_lp_remote(
   pdlp_solver_settings_t<i_t, f_t> const& settings) const
 {
-  // Forward to the gpu_optimization_problem_t overload
+  // Forward to the optimization_problem_t overload
   // Need to cast away const since solve functions take non-const reference
-  auto& non_const_this = const_cast<gpu_optimization_problem_t<i_t, f_t>&>(*this);
+  auto& non_const_this = const_cast<optimization_problem_t<i_t, f_t>&>(*this);
   return ::cuopt::linear_programming::solve_lp_remote(non_const_this, settings);
 }
 
 template <typename i_t, typename f_t>
 std::unique_ptr<mip_solution_interface_t<i_t, f_t>>
-gpu_optimization_problem_t<i_t, f_t>::solve_mip_remote(
+optimization_problem_t<i_t, f_t>::solve_mip_remote(
   mip_solver_settings_t<i_t, f_t> const& settings) const
 {
-  // Forward to the gpu_optimization_problem_t overload
-  auto& non_const_this = const_cast<gpu_optimization_problem_t<i_t, f_t>&>(*this);
+  // Forward to the optimization_problem_t overload
+  auto& non_const_this = const_cast<optimization_problem_t<i_t, f_t>&>(*this);
   return ::cuopt::linear_programming::solve_mip_remote(non_const_this, settings);
 }
 
@@ -878,14 +1495,14 @@ gpu_optimization_problem_t<i_t, f_t>::solve_mip_remote(
 // ==============================================================================
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::copy_objective_coefficients_to_host(f_t* output,
-                                                                               i_t size) const
+void optimization_problem_t<i_t, f_t>::copy_objective_coefficients_to_host(f_t* output,
+                                                                           i_t size) const
 {
   RAFT_CUDA_TRY(cudaMemcpy(output, c_.data(), size * sizeof(f_t), cudaMemcpyDeviceToHost));
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::copy_constraint_matrix_to_host(
+void optimization_problem_t<i_t, f_t>::copy_constraint_matrix_to_host(
   f_t* values, i_t* indices, i_t* offsets, i_t num_values, i_t num_indices, i_t num_offsets) const
 {
   RAFT_CUDA_TRY(cudaMemcpy(values, A_.data(), num_values * sizeof(f_t), cudaMemcpyDeviceToHost));
@@ -896,53 +1513,51 @@ void gpu_optimization_problem_t<i_t, f_t>::copy_constraint_matrix_to_host(
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::copy_row_types_to_host(char* output, i_t size) const
+void optimization_problem_t<i_t, f_t>::copy_row_types_to_host(char* output, i_t size) const
 {
   RAFT_CUDA_TRY(cudaMemcpy(output, row_types_.data(), size * sizeof(char), cudaMemcpyDeviceToHost));
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::copy_constraint_bounds_to_host(f_t* output,
-                                                                          i_t size) const
+void optimization_problem_t<i_t, f_t>::copy_constraint_bounds_to_host(f_t* output, i_t size) const
 {
   RAFT_CUDA_TRY(cudaMemcpy(output, b_.data(), size * sizeof(f_t), cudaMemcpyDeviceToHost));
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::copy_constraint_lower_bounds_to_host(f_t* output,
-                                                                                i_t size) const
+void optimization_problem_t<i_t, f_t>::copy_constraint_lower_bounds_to_host(f_t* output,
+                                                                            i_t size) const
 {
   RAFT_CUDA_TRY(cudaMemcpy(
     output, constraint_lower_bounds_.data(), size * sizeof(f_t), cudaMemcpyDeviceToHost));
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::copy_constraint_upper_bounds_to_host(f_t* output,
-                                                                                i_t size) const
+void optimization_problem_t<i_t, f_t>::copy_constraint_upper_bounds_to_host(f_t* output,
+                                                                            i_t size) const
 {
   RAFT_CUDA_TRY(cudaMemcpy(
     output, constraint_upper_bounds_.data(), size * sizeof(f_t), cudaMemcpyDeviceToHost));
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::copy_variable_lower_bounds_to_host(f_t* output,
-                                                                              i_t size) const
+void optimization_problem_t<i_t, f_t>::copy_variable_lower_bounds_to_host(f_t* output,
+                                                                          i_t size) const
 {
   RAFT_CUDA_TRY(
     cudaMemcpy(output, variable_lower_bounds_.data(), size * sizeof(f_t), cudaMemcpyDeviceToHost));
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::copy_variable_upper_bounds_to_host(f_t* output,
-                                                                              i_t size) const
+void optimization_problem_t<i_t, f_t>::copy_variable_upper_bounds_to_host(f_t* output,
+                                                                          i_t size) const
 {
   RAFT_CUDA_TRY(
     cudaMemcpy(output, variable_upper_bounds_.data(), size * sizeof(f_t), cudaMemcpyDeviceToHost));
 }
 
 template <typename i_t, typename f_t>
-void gpu_optimization_problem_t<i_t, f_t>::copy_variable_types_to_host(var_t* output,
-                                                                       i_t size) const
+void optimization_problem_t<i_t, f_t>::copy_variable_types_to_host(var_t* output, i_t size) const
 {
   RAFT_CUDA_TRY(
     cudaMemcpy(output, variable_types_.data(), size * sizeof(var_t), cudaMemcpyDeviceToHost));
@@ -951,12 +1566,12 @@ void gpu_optimization_problem_t<i_t, f_t>::copy_variable_types_to_host(var_t* ou
 // ==============================================================================
 // Template instantiations
 // ==============================================================================
-// Explicit template instantiations matching optimization_problem_t
+// Explicit template instantiations matching MIP constants
 #if MIP_INSTANTIATE_FLOAT
-template class gpu_optimization_problem_t<int32_t, float>;
+template class optimization_problem_t<int32_t, float>;
 #endif
 #if MIP_INSTANTIATE_DOUBLE
-template class gpu_optimization_problem_t<int32_t, double>;
+template class optimization_problem_t<int32_t, double>;
 #endif
 
 }  // namespace cuopt::linear_programming

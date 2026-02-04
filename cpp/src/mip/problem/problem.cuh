@@ -16,8 +16,8 @@
 #include <mip/logger.hpp>
 #include <mip/relaxed_lp/lp_state.cuh>
 
+#include <cuopt/linear_programming/gpu_optimization_problem.hpp>
 #include <cuopt/linear_programming/mip/solver_settings.hpp>
-#include <cuopt/linear_programming/optimization_problem.hpp>
 #include <cuopt/linear_programming/utilities/internals.hpp>
 #include "host_helper.cuh"
 #include "problem_fixing.cuh"

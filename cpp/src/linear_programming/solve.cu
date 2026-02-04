@@ -24,9 +24,10 @@
 #include <mip/solver.cuh>
 #include <mip/utilities/sort_csr.cuh>
 
+#include <cuopt/linear_programming/cpu_optimization_problem.hpp>
 #include <cuopt/linear_programming/cpu_optimization_problem_solution.hpp>
+#include <cuopt/linear_programming/gpu_optimization_problem.hpp>
 #include <cuopt/linear_programming/gpu_optimization_problem_solution.hpp>
-#include <cuopt/linear_programming/optimization_problem_interface.hpp>
 #include <cuopt/linear_programming/pdlp/pdlp_hyper_params.cuh>
 #include <cuopt/linear_programming/pdlp/solver_settings.hpp>
 #include <cuopt/linear_programming/solve.hpp>
@@ -1327,6 +1328,42 @@ optimization_problem_solution_t<i_t, f_t> solve_lp(
 }
 
 // ============================================================================
+// CPU problem overloads (convert to GPU, solve, convert solution back)
+// ============================================================================
+
+template <typename i_t, typename f_t>
+std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp(
+  cpu_optimization_problem_t<i_t, f_t>& cpu_problem,
+  pdlp_solver_settings_t<i_t, f_t> const& settings,
+  bool problem_checking,
+  bool use_pdlp_solver_mode,
+  bool is_batch_mode)
+{
+  CUOPT_LOG_INFO("solve_lp (CPU problem) - converting to GPU for local solve");
+
+  // Create CUDA resources if not already set on the CPU problem
+  std::unique_ptr<rmm::cuda_stream> stream_owner;
+  std::unique_ptr<raft::handle_t> handle_owner;
+
+  if (cpu_problem.get_handle_ptr() == nullptr) {
+    stream_owner = std::make_unique<rmm::cuda_stream>();
+    handle_owner = std::make_unique<raft::handle_t>(*stream_owner);
+    cpu_problem.set_handle(handle_owner.get());
+  }
+
+  // Convert CPU problem to GPU problem
+  auto gpu_problem = cpu_problem.to_optimization_problem();
+
+  // Solve on GPU
+  auto gpu_solution = solve_lp<i_t, f_t>(
+    *gpu_problem, settings, problem_checking, use_pdlp_solver_mode, is_batch_mode);
+
+  // Convert GPU solution back to CPU
+  gpu_lp_solution_t<i_t, f_t> gpu_sol_interface(std::move(gpu_solution));
+  return gpu_sol_interface.to_cpu_solution();
+}
+
+// ============================================================================
 // Interface-based solve overloads with remote execution support
 // ============================================================================
 
@@ -1342,42 +1379,20 @@ std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp(
   if (is_remote_execution_enabled()) {
     CUOPT_LOG_INFO("Remote LP solve requested");
     return problem_interface->solve_lp_remote(settings);
-  } else {
-    // Local execution - convert to optimization_problem_t and call original solve_lp
-    CUOPT_LOG_INFO("Local LP solve");
-
-    // Check if this is a CPU problem (test mode: CUOPT_USE_CPU_MEM_FOR_LOCAL=true)
-    auto* cpu_prob = dynamic_cast<cpu_optimization_problem_t<i_t, f_t>*>(problem_interface);
-    if (cpu_prob != nullptr) {
-      CUOPT_LOG_INFO("Test mode: Converting CPU problem to GPU for local solve");
-
-      // Create CUDA resources for the conversion
-      rmm::cuda_stream stream;
-      raft::handle_t handle(stream);
-
-      // Set the handle on the CPU problem so it can create GPU resources
-      cpu_prob->set_handle(&handle);
-
-      // Convert CPU problem to GPU problem
-      auto op_problem = cpu_prob->to_optimization_problem();
-
-      // Solve on GPU
-      auto gpu_solution = solve_lp<i_t, f_t>(
-        op_problem, settings, problem_checking, use_pdlp_solver_mode, is_batch_mode);
-
-      // Wrap in GPU solution interface and convert to CPU solution
-      std::cerr << "Test mode: Converting GPU solution back to CPU solution" << std::endl;
-      gpu_lp_solution_t<i_t, f_t> gpu_sol_interface(std::move(gpu_solution));
-      return gpu_sol_interface.to_cpu_solution();
-    }
-
-    auto op_problem   = problem_interface->to_optimization_problem();
-    auto gpu_solution = solve_lp<i_t, f_t>(
-      op_problem, settings, problem_checking, use_pdlp_solver_mode, is_batch_mode);
-
-    // Wrap GPU solution in interface and return
-    return std::make_unique<gpu_lp_solution_t<i_t, f_t>>(std::move(gpu_solution));
   }
+
+  // Local execution - dispatch to appropriate overload based on problem type
+  auto* cpu_prob = dynamic_cast<cpu_optimization_problem_t<i_t, f_t>*>(problem_interface);
+  if (cpu_prob != nullptr) {
+    // CPU problem: use CPU overload (converts to GPU, solves, converts solution back)
+    return solve_lp(*cpu_prob, settings, problem_checking, use_pdlp_solver_mode, is_batch_mode);
+  }
+
+  // GPU problem: call GPU solver directly
+  auto& gpu_prob = static_cast<optimization_problem_t<i_t, f_t>&>(*problem_interface);
+  auto gpu_solution =
+    solve_lp<i_t, f_t>(gpu_prob, settings, problem_checking, use_pdlp_solver_mode, is_batch_mode);
+  return std::make_unique<gpu_lp_solution_t<i_t, f_t>>(std::move(gpu_solution));
 }
 
 #define INSTANTIATE(F_TYPE)                                                            \
@@ -1394,6 +1409,13 @@ std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp(
     pdlp_solver_settings_t<int, F_TYPE> const& settings,                               \
     bool problem_checking,                                                             \
     bool use_pdlp_solver_mode);                                                        \
+                                                                                       \
+  template std::unique_ptr<lp_solution_interface_t<int, F_TYPE>> solve_lp(             \
+    cpu_optimization_problem_t<int, F_TYPE>&,                                          \
+    pdlp_solver_settings_t<int, F_TYPE> const&,                                        \
+    bool,                                                                              \
+    bool,                                                                              \
+    bool);                                                                             \
                                                                                        \
   template std::unique_ptr<lp_solution_interface_t<int, F_TYPE>> solve_lp(             \
     optimization_problem_interface_t<int, F_TYPE>*,                                    \
