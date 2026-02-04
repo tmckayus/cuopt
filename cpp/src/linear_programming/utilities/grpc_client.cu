@@ -10,6 +10,7 @@
 #include <cuopt/linear_programming/utilities/grpc_service_mapper.hpp>
 #include <cuopt/linear_programming/utilities/grpc_settings_mapper.hpp>
 #include <cuopt/linear_programming/utilities/grpc_solution_mapper.hpp>
+#include <utilities/logger.hpp>
 
 #include <cuopt_remote_service.grpc.pb.h>
 #include <grpcpp/grpcpp.h>
@@ -31,12 +32,30 @@ constexpr int64_t kMinChunkSize = 4 * 1024;  // 4 KiB minimum chunk
 // Private implementation (PIMPL pattern to hide gRPC types)
 struct grpc_client_t::impl_t {
   std::shared_ptr<grpc::Channel> channel;
-  std::shared_ptr<cuopt::remote::CuOptRemoteService::Stub> stub;
+  // Use StubInterface to support both real stubs and mock stubs for testing
+  std::shared_ptr<cuopt::remote::CuOptRemoteService::StubInterface> stub;
+  bool mock_mode = false;  // Set to true when using injected mock stub
 };
+
+// =============================================================================
+// Test Helper Functions (for mock stub injection)
+// =============================================================================
+
+void grpc_test_inject_mock_stub(grpc_client_t& client, std::shared_ptr<void> stub)
+{
+  // Cast from void* to StubInterface* - caller must ensure correct type
+  client.impl_->stub =
+    std::static_pointer_cast<cuopt::remote::CuOptRemoteService::StubInterface>(stub);
+  client.impl_->mock_mode = true;
+}
+
+void grpc_test_mark_as_connected(grpc_client_t& client) { client.impl_->mock_mode = true; }
 
 grpc_client_t::grpc_client_t(const grpc_client_config_t& config)
   : impl_(std::make_unique<impl_t>()), config_(config)
 {
+  // Normalize sentinel value -1 to default timeout of 1 hour
+  if (config_.timeout_seconds == -1) { config_.timeout_seconds = 3600; }
 }
 
 grpc_client_t::grpc_client_t(const std::string& server_address) : impl_(std::make_unique<impl_t>())
@@ -68,8 +87,7 @@ bool grpc_client_t::connect()
   }
 
   impl_->channel = grpc::CreateChannel(config_.server_address, creds);
-  impl_->stub    = std::shared_ptr<cuopt::remote::CuOptRemoteService::Stub>(
-    cuopt::remote::CuOptRemoteService::NewStub(impl_->channel).release());
+  impl_->stub    = cuopt::remote::CuOptRemoteService::NewStub(impl_->channel);
 
   // Try to check connectivity with a short deadline
   auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(5);
@@ -83,6 +101,9 @@ bool grpc_client_t::connect()
 
 bool grpc_client_t::is_connected() const
 {
+  // In mock mode, we're always "connected" if a stub is present
+  if (impl_->mock_mode) { return impl_->stub != nullptr; }
+
   if (!impl_->channel) return false;
   auto state = impl_->channel->GetState(false);
   return state == GRPC_CHANNEL_READY || state == GRPC_CHANNEL_IDLE;
@@ -230,7 +251,18 @@ bool grpc_client_t::delete_job(const std::string& job_id)
   auto status = impl_->stub->DeleteResult(&context, request, &response);
 
   if (!status.ok()) {
-    last_error_ = "DeleteResult failed: " + status.error_message();
+    last_error_ = "DeleteResult RPC failed: " + status.error_message();
+    return false;
+  }
+
+  // Check response status - job must exist to be deleted
+  if (response.status() == cuopt::remote::ERROR_NOT_FOUND) {
+    last_error_ = "Job not found: " + job_id;
+    return false;
+  }
+
+  if (response.status() != cuopt::remote::SUCCESS) {
+    last_error_ = "DeleteResult failed: " + response.message();
     return false;
   }
 
@@ -865,7 +897,7 @@ remote_lp_result_t<i_t, f_t> grpc_client_t::solve_lp(
 
   if (config_.use_wait) {
     // Use blocking WaitForCompletion RPC
-    std::cerr << "[grpc_client] Using WaitForCompletion RPC for job " << job_id << "\n";
+    CUOPT_LOG_INFO("[grpc_client] Using WaitForCompletion RPC for job %s", job_id.c_str());
     auto wait_result = wait_for_completion(job_id);
     if (!wait_result.success) {
       stop_log_streaming();
@@ -883,7 +915,7 @@ remote_lp_result_t<i_t, f_t> grpc_client_t::solve_lp(
     }
   } else {
     // Poll for completion
-    std::cerr << "[grpc_client] Using polling (CheckStatus) for job " << job_id << "\n";
+    CUOPT_LOG_INFO("[grpc_client] Using polling (CheckStatus) for job %s", job_id.c_str());
     int poll_count = 0;
     int max_polls  = (config_.timeout_seconds * 1000) / config_.poll_interval_ms;
 
@@ -1035,7 +1067,7 @@ remote_mip_result_t<i_t, f_t> grpc_client_t::solve_mip(
 
   if (config_.use_wait) {
     // Use blocking WaitForCompletion RPC
-    std::cerr << "[grpc_client] Using WaitForCompletion RPC for job " << job_id << "\n";
+    CUOPT_LOG_INFO("[grpc_client] Using WaitForCompletion RPC for job %s", job_id.c_str());
     auto wait_result = wait_for_completion(job_id);
     if (!wait_result.success) {
       stop_incumbents.store(true);
@@ -1065,7 +1097,7 @@ remote_mip_result_t<i_t, f_t> grpc_client_t::solve_mip(
     }
   } else {
     // Poll for completion
-    std::cerr << "[grpc_client] Using polling (CheckStatus) for job " << job_id << "\n";
+    CUOPT_LOG_INFO("[grpc_client] Using polling (CheckStatus) for job %s", job_id.c_str());
     int poll_count = 0;
     int max_polls  = (config_.timeout_seconds * 1000) / config_.poll_interval_ms;
 
