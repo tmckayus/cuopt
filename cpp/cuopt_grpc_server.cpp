@@ -639,7 +639,7 @@ void worker_process(int worker_id)
 
           // Solve on GPU
           std::cout << "[Worker] Calling solve_mip...\n" << std::flush;
-          auto gpu_solution = solve_mip(gpu_problem, settings);
+          auto gpu_solution = solve_mip(*gpu_problem, settings);
           std::cout << "[Worker] solve_mip done\n" << std::flush;
 
           // Convert GPU solution to CPU solution
@@ -696,7 +696,7 @@ void worker_process(int worker_id)
 
           // Solve on GPU
           std::cout << "[Worker] Calling solve_lp...\n" << std::flush;
-          auto gpu_solution = solve_lp(gpu_problem, settings);
+          auto gpu_solution = solve_lp(*gpu_problem, settings);
           std::cout << "[Worker] solve_lp done\n" << std::flush;
 
           // Convert GPU solution to CPU solution

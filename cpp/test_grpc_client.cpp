@@ -21,6 +21,7 @@
  *   incumbent - Get incumbent solutions for a MIP job
  */
 
+#include <cuopt/linear_programming/cpu_optimization_problem.hpp>
 #include <cuopt/linear_programming/optimization_problem_interface.hpp>
 #include <cuopt/linear_programming/optimization_problem_utils.hpp>
 #include <cuopt/linear_programming/solver_settings.hpp>

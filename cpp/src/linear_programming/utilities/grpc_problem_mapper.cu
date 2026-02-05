@@ -7,6 +7,7 @@
 
 #include <cuopt/linear_programming/constants.h>
 #include <cuopt_remote.pb.h>
+#include <cuopt/linear_programming/cpu_optimization_problem.hpp>
 #include <cuopt/linear_programming/optimization_problem_interface.hpp>
 
 #include <limits>
