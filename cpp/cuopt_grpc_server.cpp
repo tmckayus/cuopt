@@ -397,42 +397,36 @@ constexpr int64_t kGiB = 1024LL * 1024 * 1024;
 
 class IncumbentPipeCallback : public cuopt::internals::get_solution_callback_t {
  public:
-  IncumbentPipeCallback(std::string job_id, int fd) : job_id_(std::move(job_id)), fd_(fd) {}
+  IncumbentPipeCallback(std::string job_id, int fd, size_t num_vars, bool is_float)
+    : job_id_(std::move(job_id)), fd_(fd)
+  {
+    // Use inherited members from base class
+    n_variables = num_vars;
+    isFloat     = is_float;
+  }
 
-  void get_solution(void* data, void* objective_value) override
+  void get_solution(void* data,
+                    void* objective_value,
+                    void* /*solution_bound*/,
+                    void* /*user_data*/) override
   {
     if (fd_ < 0 || n_variables == 0) { return; }
 
+    // Note: The MIP solver passes HOST pointers (data is already copied to host)
     double objective = 0.0;
     std::vector<double> assignment;
     assignment.resize(n_variables);
 
     if (isFloat) {
-      std::vector<float> tmp(n_variables);
-      if (cudaMemcpy(tmp.data(), data, n_variables * sizeof(float), cudaMemcpyDeviceToHost) !=
-          cudaSuccess) {
-        return;
-      }
+      const float* float_data = static_cast<const float*>(data);
       for (size_t i = 0; i < n_variables; ++i) {
-        assignment[i] = static_cast<double>(tmp[i]);
+        assignment[i] = static_cast<double>(float_data[i]);
       }
-      float obj = 0.0f;
-      if (cudaMemcpy(&obj, objective_value, sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
-        return;
-      }
-      objective = static_cast<double>(obj);
+      objective = static_cast<double>(*static_cast<const float*>(objective_value));
     } else {
-      if (cudaMemcpy(
-            assignment.data(), data, n_variables * sizeof(double), cudaMemcpyDeviceToHost) !=
-          cudaSuccess) {
-        return;
-      }
-      double obj = 0.0;
-      if (cudaMemcpy(&obj, objective_value, sizeof(double), cudaMemcpyDeviceToHost) !=
-          cudaSuccess) {
-        return;
-      }
-      objective = obj;
+      const double* double_data = static_cast<const double*>(data);
+      std::copy(double_data, double_data + n_variables, assignment.begin());
+      objective = *static_cast<const double*>(objective_value);
     }
 
     cuopt::remote::Incumbent msg;
@@ -627,9 +621,13 @@ void worker_process(int worker_id)
             mip_request.has_enable_incumbents() ? mip_request.enable_incumbents() : true;
           if (enable_incumbents) {
             incumbent_cb = std::make_unique<IncumbentPipeCallback>(
-              job_id, worker_pipes[worker_id].worker_incumbent_write_fd);
+              job_id,
+              worker_pipes[worker_id].worker_incumbent_write_fd,
+              cpu_problem.get_n_variables(),
+              false);  // isFloat = false for double precision
             settings.set_mip_callback(incumbent_cb.get());
-            std::cout << "[Worker] Registered incumbent callback for job_id=" << job_id << "\n";
+            std::cout << "[Worker] Registered incumbent callback for job_id=" << job_id
+                      << " n_vars=" << cpu_problem.get_n_variables() << "\n";
             std::cout.flush();
           }
 

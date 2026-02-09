@@ -1597,66 +1597,21 @@ remote_mip_result_t<i_t, f_t> grpc_client_t::solve_mip(
   // 3. Start log streaming (if configured)
   start_log_streaming(job_id);
 
-  // 4. Start incumbent polling thread (if callback configured)
-  std::atomic<bool> stop_incumbents{false};
-  std::atomic<bool> cancel_requested{false};
-  std::unique_ptr<std::thread> incumbent_thread;
+  // Track if incumbent callback requested cancellation
+  bool cancel_requested = false;
 
-  if (config_.incumbent_callback) {
-    // In wait mode, incumbent thread calls cancel_job directly if callback returns false
-    // In poll mode, it sets cancel_requested for main thread to handle
-    incumbent_thread =
-      std::make_unique<std::thread>([this, &job_id, &stop_incumbents, &cancel_requested]() {
-        int64_t next_index = 0;
-        while (!stop_incumbents.load()) {
-          std::this_thread::sleep_for(
-            std::chrono::milliseconds(config_.incumbent_poll_interval_ms));
-          if (stop_incumbents.load()) break;
-
-          auto inc_result = get_incumbents(job_id, next_index, 0);
-          if (!inc_result.success) continue;
-
-          for (const auto& inc : inc_result.incumbents) {
-            bool should_continue =
-              config_.incumbent_callback(inc.index, inc.objective, inc.assignment);
-            if (!should_continue) {
-              cancel_requested.store(true);
-              if (config_.use_wait) {
-                // Cancel directly so WaitForCompletion returns
-                cancel_job(job_id);
-              }
-              return;
-            }
-          }
-          next_index = inc_result.next_index;
-
-          if (inc_result.job_complete) break;
-        }
-      });
-  }
-
-  // 5. Wait for completion (using wait RPC or polling)
+  // 4. Wait for completion (using wait RPC or polling)
   bool completed = false;
   std::string completion_error;
 
   if (config_.use_wait) {
     // Use blocking WaitForCompletion RPC
+    // Note: Incumbent callbacks are not supported in wait mode; use polling mode instead
     CUOPT_LOG_INFO("[grpc_client] Using WaitForCompletion RPC for job %s", job_id.c_str());
     auto wait_result = wait_for_completion(job_id);
     if (!wait_result.success) {
-      stop_incumbents.store(true);
-      if (incumbent_thread && incumbent_thread->joinable()) incumbent_thread->join();
       stop_log_streaming();
       result.error_message = wait_result.error_message;
-      return result;
-    }
-
-    // Check if cancelled by incumbent callback
-    if (cancel_requested.load() && wait_result.status == job_status_t::CANCELLED) {
-      stop_incumbents.store(true);
-      if (incumbent_thread && incumbent_thread->joinable()) incumbent_thread->join();
-      stop_log_streaming();
-      result.error_message = "Cancelled by incumbent callback";
       return result;
     }
 
@@ -1675,18 +1630,41 @@ remote_mip_result_t<i_t, f_t> grpc_client_t::solve_mip(
     int poll_count = 0;
     int max_polls  = (config_.timeout_seconds * 1000) / config_.poll_interval_ms;
 
+    // Track next incumbent index for polling
+    int64_t incumbent_next_index = 0;
+    auto last_incumbent_poll     = std::chrono::steady_clock::now();
+
     while (!completed && poll_count < max_polls) {
       std::this_thread::sleep_for(std::chrono::milliseconds(config_.poll_interval_ms));
 
       // Check if incumbent callback requested cancellation
-      if (cancel_requested.load()) {
+      if (cancel_requested) {
         cancel_job(job_id);
-        stop_logs_.store(true);
-        stop_incumbents.store(true);
-        if (incumbent_thread && incumbent_thread->joinable()) incumbent_thread->join();
         stop_log_streaming();
         result.error_message = "Cancelled by incumbent callback";
         return result;
+      }
+
+      // Poll for incumbents and invoke callbacks on main thread
+      if (config_.incumbent_callback) {
+        auto now = std::chrono::steady_clock::now();
+        auto ms_since_last =
+          std::chrono::duration_cast<std::chrono::milliseconds>(now - last_incumbent_poll).count();
+        if (ms_since_last >= config_.incumbent_poll_interval_ms) {
+          auto inc_result = get_incumbents(job_id, incumbent_next_index, 0);
+          if (inc_result.success) {
+            for (const auto& inc : inc_result.incumbents) {
+              bool should_continue =
+                config_.incumbent_callback(inc.index, inc.objective, inc.assignment);
+              if (!should_continue) {
+                cancel_requested = true;
+                break;
+              }
+            }
+            incumbent_next_index = inc_result.next_index;
+          }
+          last_incumbent_poll = now;
+        }
       }
 
       grpc::ClientContext status_context;
@@ -1696,8 +1674,6 @@ remote_mip_result_t<i_t, f_t> grpc_client_t::solve_mip(
         impl_->stub->CheckStatus(&status_context, status_request, &status_response);
 
       if (!status_status.ok()) {
-        stop_incumbents.store(true);
-        if (incumbent_thread && incumbent_thread->joinable()) incumbent_thread->join();
         stop_log_streaming();
         result.error_message = "CheckStatus failed: " + status_status.error_message();
         return result;
@@ -1721,14 +1697,21 @@ remote_mip_result_t<i_t, f_t> grpc_client_t::solve_mip(
       poll_count++;
     }
 
+    // Final incumbent poll to catch any remaining incumbents before completion
+    if (config_.incumbent_callback && completed) {
+      auto inc_result = get_incumbents(job_id, incumbent_next_index, 0);
+      if (inc_result.success) {
+        for (const auto& inc : inc_result.incumbents) {
+          config_.incumbent_callback(inc.index, inc.objective, inc.assignment);
+        }
+      }
+    }
+
     if (!completed && completion_error.empty()) {
       completion_error = "Timeout waiting for job completion";
     }
   }
 
-  // Stop background threads
-  stop_incumbents.store(true);
-  if (incumbent_thread && incumbent_thread->joinable()) incumbent_thread->join();
   stop_log_streaming();
 
   if (!completed) {
