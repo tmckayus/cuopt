@@ -107,28 +107,40 @@ std::unique_ptr<mip_solution_interface_t<i_t, f_t>> solve_mip_remote(
   bool has_incumbents  = !mip_callbacks.empty();
   bool enable_tracking = has_incumbents;
 
-  // Set up incumbent callback forwarding if user has callbacks
+  // Initialize callbacks with problem size (needed for Python callbacks to work correctly)
+  // The local MIP solver does this in solve.cu, but for remote solves we need to do it here
   if (has_incumbents) {
+    size_t n_vars = cpu_problem.get_n_variables();
+    for (auto* callback : mip_callbacks) {
+      if (callback != nullptr) { callback->template setup<f_t>(n_vars); }
+    }
+  }
+
+  // Incumbent callbacks require polling mode (use_wait=false) because callbacks are invoked
+  // on the main thread during the polling loop. This is required for Python callbacks which
+  // need the GIL that only the main thread holds.
+  if (has_incumbents) { config.use_wait = false; }
+
+  // Set up incumbent callback forwarding
+  if (has_incumbents) {
+    CUOPT_LOG_INFO("solve_mip_remote - setting up inline incumbent callback forwarding");
     config.incumbent_callback = [&mip_callbacks](int64_t index,
                                                  double objective,
                                                  const std::vector<double>& solution) -> bool {
-      // Forward incumbent to all user callbacks
+      // Forward incumbent to all user callbacks (invoked from main thread with GIL)
       for (auto* callback : mip_callbacks) {
-        if (callback != nullptr) {
-          // Only SET_SOLUTION callbacks are relevant for incumbents - these receive
-          // solutions from the solver. GET_SOLUTION callbacks are for providing
-          // initial solutions to the solver, not for receiving incumbents.
-          if (callback->get_type() == internals::base_solution_callback_type::SET_SOLUTION) {
-            auto* set_callback = static_cast<internals::set_solution_callback_t*>(callback);
-            // Copy solution to non-const buffer for callback interface
-            std::vector<double> solution_copy = solution;
-            double obj_copy                   = objective;
-            set_callback->set_solution(solution_copy.data(), &obj_copy);
-          }
+        if (callback != nullptr &&
+            callback->get_type() == internals::base_solution_callback_type::GET_SOLUTION) {
+          auto* get_callback = static_cast<internals::get_solution_callback_t*>(callback);
+          // Copy solution to non-const buffer for callback interface
+          std::vector<double> solution_copy = solution;
+          double obj_copy                   = objective;
+          double bound_copy                 = objective;  // Use objective as bound for incumbent
+          get_callback->get_solution(
+            solution_copy.data(), &obj_copy, &bound_copy, callback->get_user_data());
         }
       }
-      // Return true to continue solving (don't cancel)
-      return true;
+      return true;  // Continue solving
     };
   }
 

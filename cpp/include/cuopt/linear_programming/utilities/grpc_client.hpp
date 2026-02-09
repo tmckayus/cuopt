@@ -57,6 +57,8 @@ struct grpc_client_config_t {
   // Incumbent callback for MIP solves (called when new incumbent found)
   // Parameters: index, objective value, solution vector
   // Return false to cancel the solve
+  // Note: Incumbent callbacks are only supported in polling mode (use_wait=false).
+  // Callbacks are invoked on the main thread during the polling loop.
   std::function<bool(int64_t index, double objective, const std::vector<double>& solution)>
     incumbent_callback           = nullptr;
   int incumbent_poll_interval_ms = 1000;  // How often to poll for new incumbents
