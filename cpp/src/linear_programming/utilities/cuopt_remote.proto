@@ -114,7 +114,7 @@ message PDLPSolverSettings {
   bool strict_infeasibility = 22;
   PDLPSolverMode pdlp_solver_mode = 23;
   LPMethod method = 24;
-  bool presolve = 25;
+  int32 presolver = 25;
   bool dual_postsolve = 26;
   bool crossover = 27;
   int32 num_gpus = 28;
@@ -174,7 +174,7 @@ message MIPSolverSettings {
   bool heuristics_only = 11;
   int32 num_cpu_threads = 12;
   int32 num_gpus = 13;
-  bool presolve = 14;
+  int32 presolver = 14;
   bool mip_scaling = 15;
 }
 

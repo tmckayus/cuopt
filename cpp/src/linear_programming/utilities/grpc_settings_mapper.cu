@@ -99,7 +99,7 @@ void map_pdlp_settings_to_proto(const pdlp_solver_settings_t<i_t, f_t>& settings
   pb_settings->set_strict_infeasibility(settings.strict_infeasibility);
   pb_settings->set_pdlp_solver_mode(to_proto_pdlp_mode(settings.pdlp_solver_mode));
   pb_settings->set_method(to_proto_method(settings.method));
-  pb_settings->set_presolve(settings.presolve);
+  pb_settings->set_presolver(static_cast<int32_t>(settings.presolver));
   pb_settings->set_dual_postsolve(settings.dual_postsolve);
   pb_settings->set_crossover(settings.crossover);
   pb_settings->set_num_gpus(settings.num_gpus);
@@ -151,7 +151,7 @@ void map_proto_to_pdlp_settings(const cuopt::remote::PDLPSolverSettings& pb_sett
   settings.strict_infeasibility = pb_settings.strict_infeasibility();
   settings.pdlp_solver_mode     = from_proto_pdlp_mode(pb_settings.pdlp_solver_mode());
   settings.method               = from_proto_method(pb_settings.method());
-  settings.presolve             = pb_settings.presolve();
+  settings.presolver            = static_cast<presolver_t>(pb_settings.presolver());
   settings.dual_postsolve       = pb_settings.dual_postsolve();
   settings.crossover            = pb_settings.crossover();
   settings.num_gpus             = pb_settings.num_gpus();
@@ -194,7 +194,7 @@ void map_mip_settings_to_proto(const mip_solver_settings_t<i_t, f_t>& settings,
   pb_settings->set_heuristics_only(settings.heuristics_only);
   pb_settings->set_num_cpu_threads(settings.num_cpu_threads);
   pb_settings->set_num_gpus(settings.num_gpus);
-  pb_settings->set_presolve(settings.presolve);
+  pb_settings->set_presolver(static_cast<int32_t>(settings.presolver));
   pb_settings->set_mip_scaling(settings.mip_scaling);
 }
 
@@ -218,7 +218,7 @@ void map_proto_to_mip_settings(const cuopt::remote::MIPSolverSettings& pb_settin
   settings.heuristics_only = pb_settings.heuristics_only();
   settings.num_cpu_threads = pb_settings.num_cpu_threads();
   settings.num_gpus        = pb_settings.num_gpus();
-  settings.presolve        = pb_settings.presolve();
+  settings.presolver       = static_cast<presolver_t>(pb_settings.presolver());
   settings.mip_scaling     = pb_settings.mip_scaling();
 }
 
