@@ -26,6 +26,7 @@
 
 #include <rmm/device_buffer.hpp>
 
+#include <chrono>
 #include <utility>
 #include <vector>
 
@@ -33,6 +34,20 @@
 
 namespace cuopt {
 namespace cython {
+
+namespace {
+thread_local solve_timings_t g_last_solve_timings;
+using clock_t = std::chrono::steady_clock;
+inline double to_sec(clock_t::time_point start, clock_t::time_point t)
+{
+  return std::chrono::duration<double>(t - start).count();
+}
+}  // namespace
+
+void get_last_solve_timings(solve_timings_t* out)
+{
+  if (out != nullptr) { *out = g_last_solve_timings; }
+}
 
 /**
  * @brief Wrapper for linear_programming to expose the API to cython
@@ -95,6 +110,10 @@ std::unique_ptr<solver_ret_t> call_solve(
   unsigned int flags,
   bool is_batch_mode)
 {
+  g_last_solve_timings             = solve_timings_t{};
+  const auto t_enter               = clock_t::now();
+  g_last_solve_timings.t_enter_sec = 0.0;
+
   raft::common::nvtx::range fun_scope("Call Solve");
 
   // Determine memory backend based on execution mode
@@ -111,15 +130,20 @@ std::unique_ptr<solver_ret_t> call_solve(
     auto problem = cuopt::linear_programming::optimization_problem_t<int, double>(&handle_);
     cuopt::linear_programming::populate_from_data_model_view(
       &problem, data_model, solver_settings, &handle_);
+    g_last_solve_timings.t_after_problem_creation_sec = to_sec(t_enter, clock_t::now());
 
     // Call appropriate solve function and convert to ret struct
     if (problem.get_problem_category() == linear_programming::problem_category_t::LP) {
+      g_last_solve_timings.t_before_solve_sec = to_sec(t_enter, clock_t::now());
       // Solve and get solution interface pointer
       auto lp_solution_ptr =
         std::unique_ptr<linear_programming::lp_solution_interface_t<int, double>>(
           call_solve_lp(&problem, solver_settings->get_pdlp_settings(), is_batch_mode));
+      g_last_solve_timings.t_after_solve_sec = to_sec(t_enter, clock_t::now());
 
-      response.lp_ret       = std::move(*lp_solution_ptr).to_python_lp_ret();
+      g_last_solve_timings.t_before_solution_creation_sec = to_sec(t_enter, clock_t::now());
+      response.lp_ret = std::move(*lp_solution_ptr).to_python_lp_ret();
+      g_last_solve_timings.t_after_solution_creation_sec = to_sec(t_enter, clock_t::now());
       response.problem_type = linear_programming::problem_category_t::LP;
 
       // Reset stream to per-thread default as non-blocking stream is out of scope after the
@@ -140,12 +164,16 @@ std::unique_ptr<solver_ret_t> call_solve(
       lp.last_restart_duality_gap_dual_solution_->set_stream(rmm::cuda_stream_per_thread);
 
     } else {
+      g_last_solve_timings.t_before_solve_sec = to_sec(t_enter, clock_t::now());
       // MIP solve
       auto mip_solution_ptr =
         std::unique_ptr<linear_programming::mip_solution_interface_t<int, double>>(
           call_solve_mip(&problem, solver_settings->get_mip_settings()));
+      g_last_solve_timings.t_after_solve_sec = to_sec(t_enter, clock_t::now());
 
-      response.mip_ret      = std::move(*mip_solution_ptr).to_python_mip_ret();
+      g_last_solve_timings.t_before_solution_creation_sec = to_sec(t_enter, clock_t::now());
+      response.mip_ret = std::move(*mip_solution_ptr).to_python_mip_ret();
+      g_last_solve_timings.t_after_solution_creation_sec = to_sec(t_enter, clock_t::now());
       response.problem_type = linear_programming::problem_category_t::MIP;
 
       // Reset stream to per-thread default as non-blocking stream is out of scope after the
@@ -176,26 +204,38 @@ std::unique_ptr<solver_ret_t> call_solve(
     auto cpu_problem = cuopt::linear_programming::cpu_optimization_problem_t<int, double>(nullptr);
     cuopt::linear_programming::populate_from_data_model_view(
       &cpu_problem, data_model, solver_settings, nullptr);
+    g_last_solve_timings.t_after_problem_creation_sec = to_sec(t_enter, clock_t::now());
 
     // Call appropriate solve function and convert to CPU ret struct
     if (cpu_problem.get_problem_category() == linear_programming::problem_category_t::LP) {
+      g_last_solve_timings.t_before_solve_sec = to_sec(t_enter, clock_t::now());
       auto lp_solution_ptr =
         std::unique_ptr<linear_programming::lp_solution_interface_t<int, double>>(
           call_solve_lp(&cpu_problem, solver_settings->get_pdlp_settings(), is_batch_mode));
+      g_last_solve_timings.t_after_solve_sec = to_sec(t_enter, clock_t::now());
 
-      response.lp_ret       = std::move(*lp_solution_ptr).to_python_lp_ret();
+      g_last_solve_timings.t_before_solution_creation_sec = to_sec(t_enter, clock_t::now());
+      response.lp_ret = std::move(*lp_solution_ptr).to_python_lp_ret();
+      g_last_solve_timings.t_after_solution_creation_sec = to_sec(t_enter, clock_t::now());
       response.problem_type = linear_programming::problem_category_t::LP;
 
     } else {
+      g_last_solve_timings.t_before_solve_sec = to_sec(t_enter, clock_t::now());
       auto mip_solution_ptr =
         std::unique_ptr<linear_programming::mip_solution_interface_t<int, double>>(
           call_solve_mip(&cpu_problem, solver_settings->get_mip_settings()));
+      g_last_solve_timings.t_after_solve_sec = to_sec(t_enter, clock_t::now());
 
-      response.mip_ret      = std::move(*mip_solution_ptr).to_python_mip_ret();
+      g_last_solve_timings.t_before_solution_creation_sec = to_sec(t_enter, clock_t::now());
+      response.mip_ret = std::move(*mip_solution_ptr).to_python_mip_ret();
+      g_last_solve_timings.t_after_solution_creation_sec = to_sec(t_enter, clock_t::now());
       response.problem_type = linear_programming::problem_category_t::MIP;
     }
   }
 
+  g_last_solve_timings.t_after_set_stream_sec = to_sec(t_enter, clock_t::now());
+  g_last_solve_timings.t_exit_sec             = to_sec(t_enter, clock_t::now());
+  g_last_solve_timings.valid                  = 1;
   return std::make_unique<solver_ret_t>(std::move(response));
 }
 

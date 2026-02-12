@@ -59,5 +59,19 @@ std::pair<std::vector<std::unique_ptr<solver_ret_t>>, double> call_batch_solve(
   std::vector<cuopt::mps_parser::data_model_view_t<int, double>*>,
   linear_programming::solver_settings_t<int, double>*);
 
+// Debug timings: seconds from enter of call_solve (for overhead analysis)
+struct solve_timings_t {
+  double t_enter_sec{0};
+  double t_after_problem_creation_sec{0};
+  double t_before_solve_sec{0};
+  double t_after_solve_sec{0};
+  double t_before_solution_creation_sec{0};
+  double t_after_solution_creation_sec{0};
+  double t_after_set_stream_sec{0};  // after all set_stream calls, before return
+  double t_exit_sec{0};
+  int valid{0};  // 1 if timings were recorded
+};
+void get_last_solve_timings(solve_timings_t* out);
+
 }  // namespace cython
 }  // namespace cuopt

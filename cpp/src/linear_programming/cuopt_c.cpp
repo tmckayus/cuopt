@@ -82,6 +82,19 @@ solver_settings_handle_t* get_settings_handle(cuOptSolverSettings settings)
   return static_cast<solver_settings_handle_t*>(settings);
 }
 
+// Last-solve timings (C path): problem_creation, solve, solution_creation, total (no MPS parse).
+// Set by cuOptSolve; read by cuOptGetLastSolveTimings.
+namespace {
+struct last_solve_timings_t {
+  double problem_creation_sec  = 0.0;
+  double solve_sec             = 0.0;
+  double solution_creation_sec = 0.0;
+  double total_sec             = 0.0;
+  bool valid                   = false;
+};
+thread_local last_solve_timings_t g_last_solve_timings;
+}  // namespace
+
 int8_t cuOptGetFloatSize() { return sizeof(cuopt_float_t); }
 
 int8_t cuOptGetIntSize() { return sizeof(cuopt_int_t); }
@@ -851,10 +864,13 @@ cuopt_int_t cuOptSolve(cuOptOptimizationProblem problem,
                        cuOptSolution* solution_ptr)
 {
   cuopt::utilities::printTimestamp("CUOPT_SOLVE_START");
+  g_last_solve_timings.valid = false;
 
   if (problem == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   if (settings == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   if (solution_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
+
+  const double t_enter = cuopt::utilities::getCurrentTimestamp();
 
   problem_and_stream_view_t* problem_and_stream_view =
     static_cast<problem_and_stream_view_t*>(problem);
@@ -862,6 +878,8 @@ cuopt_int_t cuOptSolve(cuOptOptimizationProblem problem,
   // Get the problem interface (GPU or CPU backed)
   optimization_problem_interface_t<cuopt_int_t, cuopt_float_t>* problem_interface =
     problem_and_stream_view->get_problem();
+
+  const double t_before_solve = cuopt::utilities::getCurrentTimestamp();
 
   try {
     if (problem_interface->get_problem_category() == problem_category_t::MIP ||
@@ -875,11 +893,21 @@ cuopt_int_t cuOptSolve(cuOptOptimizationProblem problem,
       auto solution_interface =
         solve_mip<cuopt_int_t, cuopt_float_t>(problem_interface, mip_settings);
 
+      const double t_after_solve = cuopt::utilities::getCurrentTimestamp();
+
       // Store interface pointer directly (works on both GPU and CPU-only hosts)
       solution_and_stream_view_t* solution_and_stream_view =
         new solution_and_stream_view_t(true, problem_and_stream_view->memory_backend);
       solution_and_stream_view->mip_solution_interface_ptr = solution_interface.release();
       *solution_ptr = static_cast<cuOptSolution>(solution_and_stream_view);
+
+      const double t_after_solution = cuopt::utilities::getCurrentTimestamp();
+
+      g_last_solve_timings.problem_creation_sec  = t_before_solve - t_enter;
+      g_last_solve_timings.solve_sec             = t_after_solve - t_before_solve;
+      g_last_solve_timings.solution_creation_sec = t_after_solution - t_after_solve;
+      g_last_solve_timings.total_sec             = t_after_solution - t_enter;
+      g_last_solve_timings.valid                 = true;
 
       cuopt::utilities::printTimestamp("CUOPT_SOLVE_RETURN");
 
@@ -895,11 +923,21 @@ cuopt_int_t cuOptSolve(cuOptOptimizationProblem problem,
       auto solution_interface =
         solve_lp<cuopt_int_t, cuopt_float_t>(problem_interface, pdlp_settings);
 
+      const double t_after_solve = cuopt::utilities::getCurrentTimestamp();
+
       // Store interface pointer directly (works on both GPU and CPU-only hosts)
       solution_and_stream_view_t* solution_and_stream_view =
         new solution_and_stream_view_t(false, problem_and_stream_view->memory_backend);
       solution_and_stream_view->lp_solution_interface_ptr = solution_interface.release();
       *solution_ptr = static_cast<cuOptSolution>(solution_and_stream_view);
+
+      const double t_after_solution = cuopt::utilities::getCurrentTimestamp();
+
+      g_last_solve_timings.problem_creation_sec  = t_before_solve - t_enter;
+      g_last_solve_timings.solve_sec             = t_after_solve - t_before_solve;
+      g_last_solve_timings.solution_creation_sec = t_after_solution - t_after_solve;
+      g_last_solve_timings.total_sec             = t_after_solution - t_enter;
+      g_last_solve_timings.valid                 = true;
 
       cuopt::utilities::printTimestamp("CUOPT_SOLVE_RETURN");
 
@@ -992,6 +1030,27 @@ cuopt_int_t cuOptGetSolveTime(cuOptSolution solution, cuopt_float_t* solve_time_
   solution_and_stream_view_t* solution_and_stream_view =
     static_cast<solution_and_stream_view_t*>(solution);
   *solve_time_ptr = solution_and_stream_view->get_solution()->get_solve_time();
+  return CUOPT_SUCCESS;
+}
+
+cuopt_int_t cuOptGetLastSolveTimings(cuopt_float_t* problem_creation_sec,
+                                     cuopt_float_t* solve_sec,
+                                     cuopt_float_t* solution_creation_sec,
+                                     cuopt_float_t* total_sec)
+{
+  if (!g_last_solve_timings.valid) { return CUOPT_INVALID_ARGUMENT; }
+  if (problem_creation_sec != nullptr) {
+    *problem_creation_sec = static_cast<cuopt_float_t>(g_last_solve_timings.problem_creation_sec);
+  }
+  if (solve_sec != nullptr) {
+    *solve_sec = static_cast<cuopt_float_t>(g_last_solve_timings.solve_sec);
+  }
+  if (solution_creation_sec != nullptr) {
+    *solution_creation_sec = static_cast<cuopt_float_t>(g_last_solve_timings.solution_creation_sec);
+  }
+  if (total_sec != nullptr) {
+    *total_sec = static_cast<cuopt_float_t>(g_last_solve_timings.total_sec);
+  }
   return CUOPT_SUCCESS;
 }
 

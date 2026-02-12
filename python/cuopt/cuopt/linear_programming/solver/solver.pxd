@@ -255,6 +255,20 @@ cdef extern from "cuopt/linear_programming/utilities/cython_solve.hpp" namespace
         solver_settings_t[int, double]* solver_settings,
     ) except +
 
+    # Debug timings (seconds from enter of call_solve)
+    cdef struct solve_timings_t:
+        double t_enter_sec
+        double t_after_problem_creation_sec
+        double t_before_solve_sec
+        double t_after_solve_sec
+        double t_before_solution_creation_sec
+        double t_after_solution_creation_sec
+        double t_after_set_stream_sec
+        double t_exit_sec
+        int valid
+
+    void get_last_solve_timings(solve_timings_t* out)
+
 # Variant helper functions - Cython doesn't directly support variant access
 # so we need C++ helper functions
 cdef extern from *:
