@@ -21,6 +21,7 @@
 
 #include <rmm/device_buffer.hpp>
 
+#include <chrono>
 #include <utility>
 #include <vector>
 
@@ -28,6 +29,20 @@
 
 namespace cuopt {
 namespace cython {
+
+namespace {
+thread_local solve_timings_t g_last_solve_timings;
+using clock_t = std::chrono::steady_clock;
+inline double to_sec(clock_t::time_point start, clock_t::time_point t)
+{
+  return std::chrono::duration<double>(t - start).count();
+}
+}  // namespace
+
+void get_last_solve_timings(solve_timings_t* out)
+{
+  if (out != nullptr) { *out = g_last_solve_timings; }
+}
 
 using cuopt::linear_programming::var_t;
 
@@ -228,6 +243,10 @@ std::unique_ptr<solver_ret_t> call_solve(
   unsigned int flags,
   bool is_batch_mode)
 {
+  g_last_solve_timings             = solve_timings_t{};
+  const auto t_enter               = clock_t::now();
+  g_last_solve_timings.t_enter_sec = 0.0;
+
   raft::common::nvtx::range fun_scope("Call Solve");
   rmm::cuda_stream stream(static_cast<rmm::cuda_stream::flags>(flags));
   const raft::handle_t handle_{stream};
@@ -235,9 +254,15 @@ std::unique_ptr<solver_ret_t> call_solve(
   solver_ret_t response;
 
   auto op_problem = data_model_to_optimization_problem(data_model, solver_settings, &handle_);
+  g_last_solve_timings.t_after_problem_creation_sec = to_sec(t_enter, clock_t::now());
+
   if (op_problem.get_problem_category() == linear_programming::problem_category_t::LP) {
+    g_last_solve_timings.t_before_solve_sec = to_sec(t_enter, clock_t::now());
     response.lp_ret =
       call_solve_lp(op_problem, solver_settings->get_pdlp_settings(), is_batch_mode);
+    g_last_solve_timings.t_after_solve_sec              = to_sec(t_enter, clock_t::now());
+    g_last_solve_timings.t_before_solution_creation_sec = g_last_solve_timings.t_after_solve_sec;
+    g_last_solve_timings.t_after_solution_creation_sec  = g_last_solve_timings.t_after_solve_sec;
     response.problem_type = linear_programming::problem_category_t::LP;
     // Reset stream to per-thread default as non-blocking stream is out of scope after the
     // function returns.
@@ -256,7 +281,11 @@ std::unique_ptr<solver_ret_t> call_solve(
     response.lp_ret.last_restart_duality_gap_dual_solution_->set_stream(
       rmm::cuda_stream_per_thread);
   } else {
-    response.mip_ret      = call_solve_mip(op_problem, solver_settings->get_mip_settings());
+    g_last_solve_timings.t_before_solve_sec = to_sec(t_enter, clock_t::now());
+    response.mip_ret = call_solve_mip(op_problem, solver_settings->get_mip_settings());
+    g_last_solve_timings.t_after_solve_sec              = to_sec(t_enter, clock_t::now());
+    g_last_solve_timings.t_before_solution_creation_sec = g_last_solve_timings.t_after_solve_sec;
+    g_last_solve_timings.t_after_solution_creation_sec  = g_last_solve_timings.t_after_solve_sec;
     response.problem_type = linear_programming::problem_category_t::MIP;
     // Reset stream to per-thread default as non-blocking stream is out of scope after the
     // function returns.
@@ -280,6 +309,9 @@ std::unique_ptr<solver_ret_t> call_solve(
     warmstart_data.last_restart_duality_gap_dual_solution_.set_stream(rmm::cuda_stream_per_thread);
   }
 
+  g_last_solve_timings.t_after_set_stream_sec = to_sec(t_enter, clock_t::now());
+  g_last_solve_timings.t_exit_sec             = to_sec(t_enter, clock_t::now());
+  g_last_solve_timings.valid                  = 1;
   return std::make_unique<solver_ret_t>(std::move(response));
 }
 

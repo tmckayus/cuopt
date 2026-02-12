@@ -187,3 +187,17 @@ cdef extern from "cuopt/linear_programming/utilities/cython_solve.hpp" namespace
         vector[data_model_view_t[int, double] *] data_models,
         solver_settings_t[int, double]* solver_settings,
     ) except +
+
+    # Debug timings (seconds from enter of call_solve)
+    cdef struct solve_timings_t:
+        double t_enter_sec
+        double t_after_problem_creation_sec
+        double t_before_solve_sec
+        double t_after_solve_sec
+        double t_before_solution_creation_sec
+        double t_after_solution_creation_sec
+        double t_after_set_stream_sec
+        double t_exit_sec
+        int valid
+
+    void get_last_solve_timings(solve_timings_t* out)

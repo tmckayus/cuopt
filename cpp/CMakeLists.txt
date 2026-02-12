@@ -527,6 +527,38 @@ install(TARGETS cuopt_cli
   COMPONENT runtime
   RUNTIME DESTINATION ${_BIN_DEST}
 )
+
+# C API MPS benchmark (same workflow as run_mps_benchmarks.py, CSV output for compare_benchmark_results.py)
+add_executable(c_api_mps_benchmark ../benchmarks/linear_programming/c_api_benchmark/c_api_mps_benchmark.cpp)
+set_target_properties(c_api_mps_benchmark
+  PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  CXX_SCAN_FOR_MODULES OFF
+)
+target_compile_options(c_api_mps_benchmark
+  PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUOPT_CXX_FLAGS}>"
+)
+target_include_directories(c_api_mps_benchmark
+  PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  PUBLIC
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>"
+)
+target_link_libraries(c_api_mps_benchmark
+  PUBLIC
+  cuopt
+  PRIVATE
+)
+if(NOT DEFINED INSTALL_TARGET OR "${INSTALL_TARGET}" STREQUAL "")
+  target_link_options(c_api_mps_benchmark PRIVATE -Wl,--enable-new-dtags)
+endif()
+set_property(TARGET c_api_mps_benchmark PROPERTY INSTALL_RPATH "$ORIGIN/../${lib_dir}")
+install(TARGETS c_api_mps_benchmark
+  COMPONENT runtime
+  RUNTIME DESTINATION ${_BIN_DEST}
+)
 endif()
 
 

@@ -921,6 +921,23 @@ cuopt_int_t cuOptGetObjectiveValue(cuOptSolution solution, cuopt_float_t* object
  */
 cuopt_int_t cuOptGetSolveTime(cuOptSolution solution, cuopt_float_t* solve_time_ptr);
 
+/** @brief Get timings from the last cuOptSolve call (C path only; no MPS parse time).
+ *
+ * Analogous to Cython stage timings: problem_creation (enter to before solve),
+ * solve (solver invocation), solution_creation (wrapping solution), total.
+ * Each output pointer may be null; only non-null pointers are written.
+ *
+ * @param[out] problem_creation_sec - Time from solve enter to before solver call (seconds).
+ * @param[out] solve_sec - Time inside solver (seconds).
+ * @param[out] solution_creation_sec - Time to wrap solution after solve (seconds).
+ * @param[out] total_sec - Total time from enter to solution ready (seconds).
+ * @return CUOPT_SUCCESS if last solve timings are valid; CUOPT_INVALID_ARGUMENT otherwise.
+ */
+cuopt_int_t cuOptGetLastSolveTimings(cuopt_float_t* problem_creation_sec,
+                                     cuopt_float_t* solve_sec,
+                                     cuopt_float_t* solution_creation_sec,
+                                     cuopt_float_t* total_sec);
+
 /** @brief Get the relative MIP gap of an optimization problem.
  *
  * @param[in] solution - The solution object.

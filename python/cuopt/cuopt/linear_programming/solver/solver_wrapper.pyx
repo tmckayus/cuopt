@@ -33,10 +33,12 @@ from cuopt.linear_programming.solver.solver cimport (
     call_batch_solve,
     call_solve,
     error_type_t,
+    get_last_solve_timings as c_get_last_solve_timings,
     mip_termination_status_t,
     pdlp_solver_mode_t,
     pdlp_termination_status_t,
     problem_category_t,
+    solve_timings_t,
     solver_ret_t,
     solver_settings_t,
 )
@@ -555,3 +557,33 @@ def BatchSolve(py_data_model_list, settings):
         )
 
     return solutions, solve_time
+
+
+def get_last_solve_timings():
+    """
+    Return timings (seconds) from the last call_solve in this thread.
+    For debugging overhead: problem_creation, solve, solution_creation inside Cython/C++.
+    Returns None if no solve was run or timings are disabled.
+    """
+    cdef solve_timings_t t
+    c_get_last_solve_timings(&t)
+    if not t.valid:
+        return None
+    return {
+        "t_enter_sec": t.t_enter_sec,
+        "t_after_problem_creation_sec": t.t_after_problem_creation_sec,
+        "t_before_solve_sec": t.t_before_solve_sec,
+        "t_after_solve_sec": t.t_after_solve_sec,
+        "t_before_solution_creation_sec": t.t_before_solution_creation_sec,
+        "t_after_solution_creation_sec": t.t_after_solution_creation_sec,
+        "t_after_set_stream_sec": t.t_after_set_stream_sec,
+        "t_exit_sec": t.t_exit_sec,
+        "stage_problem_creation_sec": t.t_after_problem_creation_sec - t.t_enter_sec,
+        "stage_solve_sec": t.t_after_solve_sec - t.t_before_solve_sec,
+        "stage_solution_creation_sec": t.t_after_solution_creation_sec - t.t_before_solution_creation_sec,
+        "stage_gap_post_solve_sec": t.t_before_solution_creation_sec - t.t_after_solve_sec,
+        "stage_gap_post_solution_sec": t.t_exit_sec - t.t_after_solution_creation_sec,
+        "stage_gap_set_stream_sec": t.t_after_set_stream_sec - t.t_after_solution_creation_sec,
+        "stage_gap_move_sec": t.t_exit_sec - t.t_after_set_stream_sec,
+        "total_cython_sec": t.t_exit_sec,
+    }
