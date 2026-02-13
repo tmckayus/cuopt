@@ -69,7 +69,8 @@ struct solve_timings_t {
   double t_after_solver_return_sec{0};  // inside solve bracket: just after solver returns
   double t_before_solution_creation_sec{0};
   double t_after_solution_creation_sec{0};
-  double t_after_set_stream_sec{0};  // after all set_stream calls, before return
+  double t_after_set_stream_sec{0};     // after all set_stream calls, before return
+  double t_before_backend_exit_sec{0};  // right before GPU/CPU block closes (problem dtor next)
   double t_exit_sec{0};
   int valid{0};  // 1 if timings were recorded
 };

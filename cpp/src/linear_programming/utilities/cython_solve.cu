@@ -27,6 +27,7 @@
 #include <rmm/device_buffer.hpp>
 
 #include <chrono>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -128,9 +129,8 @@ std::unique_ptr<solver_ret_t> call_solve(
 
   solver_ret_t response;
 
-  // Create problem instance and CUDA resources based on memory backend
   if (memory_backend == cuopt::linear_programming::memory_backend_t::GPU) {
-    // GPU memory backend: Create CUDA resources and GPU problem
+    // GPU memory backend: Create CUDA resources
     rmm::cuda_stream stream(static_cast<rmm::cuda_stream::flags>(flags));
     const raft::handle_t handle_{stream};
 
@@ -156,8 +156,8 @@ std::unique_ptr<solver_ret_t> call_solve(
       g_last_solve_timings.t_after_solution_creation_sec = to_sec(t_enter, clock_t::now());
       response.problem_type = linear_programming::problem_category_t::LP;
 
-      // Reset stream to per-thread default as non-blocking stream is out of scope after the
-      // function returns. (Profiled: gap_set_stream_sec can be ~400ms on grpc vs µs on release.)
+      // Reset stream to per-thread default so buffers are freed on per-thread stream
+      // (the stream will be destroyed when the GPU block exits).
       auto& lp = std::get<linear_programming_ret_t>(response.lp_ret);
       {
         raft::common::nvtx::range lp_buf_scope("Cython: LP buffers set_stream");
@@ -188,9 +188,7 @@ std::unique_ptr<solver_ret_t> call_solve(
       g_last_solve_timings.t_after_solution_creation_sec = to_sec(t_enter, clock_t::now());
       response.problem_type = linear_programming::problem_category_t::MIP;
 
-      // Reset stream to per-thread default as non-blocking stream is out of scope after the
-      // function returns.
-      // Note: GPU backend returns mip_ret_t variant
+      // Reset stream to per-thread default
       auto& mip = std::get<mip_ret_t>(response.mip_ret);
       {
         raft::common::nvtx::range mip_buf_scope("Cython: MIP buffer set_stream");
@@ -215,6 +213,10 @@ std::unique_ptr<solver_ret_t> call_solve(
           rmm::cuda_stream_per_thread);
       }
     }
+
+    // Timestamp right before GPU block closes.
+    // 'problem' destructor runs at the closing brace; this lets us measure that cost.
+    g_last_solve_timings.t_before_backend_exit_sec = to_sec(t_enter, clock_t::now());
 
   } else {
     // CPU memory backend: No CUDA resources, create CPU problem for remote execution
@@ -248,6 +250,9 @@ std::unique_ptr<solver_ret_t> call_solve(
       g_last_solve_timings.t_after_solution_creation_sec = to_sec(t_enter, clock_t::now());
       response.problem_type = linear_programming::problem_category_t::MIP;
     }
+
+    // Timestamp right before CPU block closes (cpu_problem destructor).
+    g_last_solve_timings.t_before_backend_exit_sec = to_sec(t_enter, clock_t::now());
   }
 
   g_last_solve_timings.t_after_set_stream_sec = to_sec(t_enter, clock_t::now());

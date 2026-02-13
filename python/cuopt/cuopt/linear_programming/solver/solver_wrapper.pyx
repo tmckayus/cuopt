@@ -55,6 +55,7 @@ from cuopt.linear_programming.solver.solver cimport (
 
 import math
 import sys
+import time
 import warnings
 from enum import IntEnum
 
@@ -63,6 +64,11 @@ import numpy as np
 from numba import cuda
 
 import cudf
+
+# Outer timing around the C++ call_solve() call (includes object destruction).
+# Set in Solve(), read in get_last_solve_timings().
+_last_outer_call_solve_sec = None
+_last_create_solution_sec = None
 
 from cuopt.linear_programming.solver_settings.solver_settings import (
     PDLPSolverMode,
@@ -635,10 +641,18 @@ def Solve(py_data_model_obj, settings, mip=False):
     )
     data_model_obj.set_data_model_view()
 
-    return create_solution(move(call_solve(
+    global _last_outer_call_solve_sec, _last_create_solution_sec
+    _t0 = time.perf_counter()
+    cdef unique_ptr[solver_ret_t] solve_result = move(call_solve(
         data_model_obj.c_data_model_view.get(),
         unique_solver_settings.get(),
-    )), data_model_obj)
+    ))
+    _last_outer_call_solve_sec = time.perf_counter() - _t0
+
+    _t1 = time.perf_counter()
+    result = create_solution(move(solve_result), data_model_obj)
+    _last_create_solution_sec = time.perf_counter() - _t1
+    return result
 
 
 cdef set_and_insert_vector(
@@ -705,6 +719,7 @@ def get_last_solve_timings():
         "t_before_solution_creation_sec": t.t_before_solution_creation_sec,
         "t_after_solution_creation_sec": t.t_after_solution_creation_sec,
         "t_after_set_stream_sec": t.t_after_set_stream_sec,
+        "t_before_backend_exit_sec": t.t_before_backend_exit_sec,
         "t_exit_sec": t.t_exit_sec,
         "stage_problem_creation_sec": t.t_after_problem_creation_sec - t.t_enter_sec,
         "stage_solve_sec": t.t_after_solve_sec - t.t_before_solve_sec,
@@ -714,6 +729,9 @@ def get_last_solve_timings():
         "stage_gap_post_solve_sec": t.t_before_solution_creation_sec - t.t_after_solve_sec,
         "stage_gap_post_solution_sec": t.t_exit_sec - t.t_after_solution_creation_sec,
         "stage_gap_set_stream_sec": t.t_after_set_stream_sec - t.t_after_solution_creation_sec,
+        "stage_problem_dtor_sec": t.t_after_set_stream_sec - t.t_before_backend_exit_sec,
         "stage_gap_move_sec": t.t_exit_sec - t.t_after_set_stream_sec,
         "total_cython_sec": t.t_exit_sec,
+        "outer_call_solve_sec": _last_outer_call_solve_sec,
+        "create_solution_sec": _last_create_solution_sec,
     }
