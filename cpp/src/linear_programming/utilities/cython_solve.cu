@@ -31,8 +31,10 @@ namespace cuopt {
 namespace cython {
 
 namespace {
-thread_local solve_timings_t g_last_solve_timings;
 using clock_t = std::chrono::steady_clock;
+thread_local solve_timings_t g_last_solve_timings;
+thread_local clock_t::time_point
+  g_t_enter;  // set at start of call_solve for use in call_solve_lp/mip
 inline double to_sec(clock_t::time_point start, clock_t::time_point t)
 {
   return std::chrono::duration<double>(t - start).count();
@@ -153,10 +155,12 @@ linear_programming_ret_t call_solve_lp(
     op_problem.get_problem_category() == cuopt::linear_programming::problem_category_t::LP,
     error_type_t::ValidationError,
     "LP solve cannot be called on a MIP problem!");
-  const bool problem_checking     = true;
-  const bool use_pdlp_solver_mode = true;
-  auto solution                   = cuopt::linear_programming::solve_lp(
+  const bool problem_checking                   = true;
+  const bool use_pdlp_solver_mode               = true;
+  g_last_solve_timings.t_before_solver_call_sec = to_sec(g_t_enter, clock_t::now());
+  auto solution                                 = cuopt::linear_programming::solve_lp(
     op_problem, solver_settings, problem_checking, use_pdlp_solver_mode, is_batch_mode);
+  g_last_solve_timings.t_after_solver_return_sec = to_sec(g_t_enter, clock_t::now());
   linear_programming_ret_t lp_ret{
     std::make_unique<rmm::device_buffer>(solution.get_primal_solution().release()),
     std::make_unique<rmm::device_buffer>(solution.get_dual_solution().release()),
@@ -219,7 +223,9 @@ mip_ret_t call_solve_mip(
       (op_problem.get_problem_category() == cuopt::linear_programming::problem_category_t::IP),
     error_type_t::ValidationError,
     "MIP solve cannot be called on an LP problem!");
+  g_last_solve_timings.t_before_solver_call_sec = to_sec(g_t_enter, clock_t::now());
   auto solution = cuopt::linear_programming::solve_mip(op_problem, solver_settings);
+  g_last_solve_timings.t_after_solver_return_sec = to_sec(g_t_enter, clock_t::now());
   mip_ret_t mip_ret{std::make_unique<rmm::device_buffer>(solution.get_solution().release()),
                     solution.get_termination_status(),
                     solution.get_error_status().get_error_type(),
@@ -245,6 +251,7 @@ std::unique_ptr<solver_ret_t> call_solve(
 {
   g_last_solve_timings             = solve_timings_t{};
   const auto t_enter               = clock_t::now();
+  g_t_enter                        = t_enter;
   g_last_solve_timings.t_enter_sec = 0.0;
 
   raft::common::nvtx::range fun_scope("Call Solve");
@@ -266,20 +273,23 @@ std::unique_ptr<solver_ret_t> call_solve(
     response.problem_type = linear_programming::problem_category_t::LP;
     // Reset stream to per-thread default as non-blocking stream is out of scope after the
     // function returns.
-    response.lp_ret.primal_solution_->set_stream(rmm::cuda_stream_per_thread);
-    response.lp_ret.dual_solution_->set_stream(rmm::cuda_stream_per_thread);
-    response.lp_ret.reduced_cost_->set_stream(rmm::cuda_stream_per_thread);
-    response.lp_ret.current_primal_solution_->set_stream(rmm::cuda_stream_per_thread);
-    response.lp_ret.current_dual_solution_->set_stream(rmm::cuda_stream_per_thread);
-    response.lp_ret.initial_primal_average_->set_stream(rmm::cuda_stream_per_thread);
-    response.lp_ret.initial_dual_average_->set_stream(rmm::cuda_stream_per_thread);
-    response.lp_ret.current_ATY_->set_stream(rmm::cuda_stream_per_thread);
-    response.lp_ret.sum_primal_solutions_->set_stream(rmm::cuda_stream_per_thread);
-    response.lp_ret.sum_dual_solutions_->set_stream(rmm::cuda_stream_per_thread);
-    response.lp_ret.last_restart_duality_gap_primal_solution_->set_stream(
-      rmm::cuda_stream_per_thread);
-    response.lp_ret.last_restart_duality_gap_dual_solution_->set_stream(
-      rmm::cuda_stream_per_thread);
+    {
+      raft::common::nvtx::range lp_buf_scope("Cython: LP buffers set_stream");
+      response.lp_ret.primal_solution_->set_stream(rmm::cuda_stream_per_thread);
+      response.lp_ret.dual_solution_->set_stream(rmm::cuda_stream_per_thread);
+      response.lp_ret.reduced_cost_->set_stream(rmm::cuda_stream_per_thread);
+      response.lp_ret.current_primal_solution_->set_stream(rmm::cuda_stream_per_thread);
+      response.lp_ret.current_dual_solution_->set_stream(rmm::cuda_stream_per_thread);
+      response.lp_ret.initial_primal_average_->set_stream(rmm::cuda_stream_per_thread);
+      response.lp_ret.initial_dual_average_->set_stream(rmm::cuda_stream_per_thread);
+      response.lp_ret.current_ATY_->set_stream(rmm::cuda_stream_per_thread);
+      response.lp_ret.sum_primal_solutions_->set_stream(rmm::cuda_stream_per_thread);
+      response.lp_ret.sum_dual_solutions_->set_stream(rmm::cuda_stream_per_thread);
+      response.lp_ret.last_restart_duality_gap_primal_solution_->set_stream(
+        rmm::cuda_stream_per_thread);
+      response.lp_ret.last_restart_duality_gap_dual_solution_->set_stream(
+        rmm::cuda_stream_per_thread);
+    }
   } else {
     g_last_solve_timings.t_before_solve_sec = to_sec(t_enter, clock_t::now());
     response.mip_ret = call_solve_mip(op_problem, solver_settings->get_mip_settings());
@@ -289,24 +299,28 @@ std::unique_ptr<solver_ret_t> call_solve(
     response.problem_type = linear_programming::problem_category_t::MIP;
     // Reset stream to per-thread default as non-blocking stream is out of scope after the
     // function returns.
-    response.mip_ret.solution_->set_stream(rmm::cuda_stream_per_thread);
+    {
+      raft::common::nvtx::range mip_buf_scope("Cython: MIP buffer set_stream");
+      response.mip_ret.solution_->set_stream(rmm::cuda_stream_per_thread);
+    }
   }
 
-  // Reset warmstart data streams in solver_settings to per-thread default before destroying our
-  // local stream. The warmstart data was created using our stream and its uvectors are associated
-  // with it.
-  auto& warmstart_data = solver_settings->get_pdlp_settings().get_pdlp_warm_start_data();
-  if (warmstart_data.current_primal_solution_.size() > 0) {
-    warmstart_data.current_primal_solution_.set_stream(rmm::cuda_stream_per_thread);
-    warmstart_data.current_dual_solution_.set_stream(rmm::cuda_stream_per_thread);
-    warmstart_data.initial_primal_average_.set_stream(rmm::cuda_stream_per_thread);
-    warmstart_data.initial_dual_average_.set_stream(rmm::cuda_stream_per_thread);
-    warmstart_data.current_ATY_.set_stream(rmm::cuda_stream_per_thread);
-    warmstart_data.sum_primal_solutions_.set_stream(rmm::cuda_stream_per_thread);
-    warmstart_data.sum_dual_solutions_.set_stream(rmm::cuda_stream_per_thread);
-    warmstart_data.last_restart_duality_gap_primal_solution_.set_stream(
-      rmm::cuda_stream_per_thread);
-    warmstart_data.last_restart_duality_gap_dual_solution_.set_stream(rmm::cuda_stream_per_thread);
+  {
+    raft::common::nvtx::range warmstart_scope("Cython: Warmstart set_stream");
+    auto& warmstart_data = solver_settings->get_pdlp_settings().get_pdlp_warm_start_data();
+    if (warmstart_data.current_primal_solution_.size() > 0) {
+      warmstart_data.current_primal_solution_.set_stream(rmm::cuda_stream_per_thread);
+      warmstart_data.current_dual_solution_.set_stream(rmm::cuda_stream_per_thread);
+      warmstart_data.initial_primal_average_.set_stream(rmm::cuda_stream_per_thread);
+      warmstart_data.initial_dual_average_.set_stream(rmm::cuda_stream_per_thread);
+      warmstart_data.current_ATY_.set_stream(rmm::cuda_stream_per_thread);
+      warmstart_data.sum_primal_solutions_.set_stream(rmm::cuda_stream_per_thread);
+      warmstart_data.sum_dual_solutions_.set_stream(rmm::cuda_stream_per_thread);
+      warmstart_data.last_restart_duality_gap_primal_solution_.set_stream(
+        rmm::cuda_stream_per_thread);
+      warmstart_data.last_restart_duality_gap_dual_solution_.set_stream(
+        rmm::cuda_stream_per_thread);
+    }
   }
 
   g_last_solve_timings.t_after_set_stream_sec = to_sec(t_enter, clock_t::now());

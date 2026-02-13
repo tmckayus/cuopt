@@ -194,6 +194,8 @@ cdef extern from "cuopt/linear_programming/utilities/cython_solve.hpp" namespace
         double t_after_problem_creation_sec
         double t_before_solve_sec
         double t_after_solve_sec
+        double t_before_solver_call_sec
+        double t_after_solver_return_sec
         double t_before_solution_creation_sec
         double t_after_solution_creation_sec
         double t_after_set_stream_sec
