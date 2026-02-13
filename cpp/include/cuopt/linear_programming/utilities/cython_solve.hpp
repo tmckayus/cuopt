@@ -65,6 +65,8 @@ struct solve_timings_t {
   double t_after_problem_creation_sec{0};
   double t_before_solve_sec{0};
   double t_after_solve_sec{0};
+  double t_before_solver_call_sec{0};   // inside solve bracket: just before solver entry
+  double t_after_solver_return_sec{0};  // inside solve bracket: just after solver returns
   double t_before_solution_creation_sec{0};
   double t_after_solution_creation_sec{0};
   double t_after_set_stream_sec{0};  // after all set_stream calls, before return

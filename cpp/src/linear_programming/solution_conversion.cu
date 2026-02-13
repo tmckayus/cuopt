@@ -14,6 +14,7 @@
 #include <cuopt/linear_programming/gpu_optimization_problem_solution.hpp>
 #include <cuopt/linear_programming/utilities/cython_solve.hpp>
 
+#include <raft/common/nvtx.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 
@@ -27,6 +28,7 @@ template <typename i_t, typename f_t>
 cuopt::cython::linear_programming_ret_t
 gpu_lp_solution_t<i_t, f_t>::to_linear_programming_ret_t() &&
 {
+  raft::common::nvtx::range nvtx_scope("Cython: to_linear_programming_ret_t (LP)");
   cuopt::cython::linear_programming_ret_t ret;
 
   // Move GPU solution data into device_buffer wrappers
@@ -117,6 +119,7 @@ gpu_lp_solution_t<i_t, f_t>::to_linear_programming_ret_t() &&
 template <typename i_t, typename f_t>
 cuopt::cython::mip_ret_t gpu_mip_solution_t<i_t, f_t>::to_mip_ret_t() &&
 {
+  raft::common::nvtx::range nvtx_scope("Cython: to_mip_ret_t (MIP)");
   cuopt::cython::mip_ret_t ret;
 
   // Move GPU solution data into device_buffer wrapper
