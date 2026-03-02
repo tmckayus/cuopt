@@ -345,7 +345,7 @@ class DataModel(vehicle_routing_wrapper.DataModel):
 
     @catch_cuopt_exception
     def add_vehicle_break(
-        self, vehicle_id, earliest, latest, duration, locations=cudf.Series()
+        self, vehicle_id, earliest, latest, duration, locations=None
     ):
         """
         Specify a break for a given vehicle. Use this api to specify
@@ -380,6 +380,8 @@ class DataModel(vehicle_routing_wrapper.DataModel):
         >>> d.add_vehicle_break(0, 60, 70, 5, cudf.Series([1, 4, 7]))
         >>> d.add_vehicle_break(1, 30, 40, 5)
         """
+        if locations is None:
+            locations = cudf.Series()
         validate_range(vehicle_id, "vehicle id", 0, self.get_fleet_size())
         if len(locations) > 0:
             validate_range(
