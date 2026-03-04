@@ -89,6 +89,22 @@ inline std::string hash_to_hex(uint64_t hash)
     std::cerr << _msg_str << "\n";                                              \
   } while (0)
 
+// Structured throughput log for benchmarking. Parseable format:
+//   [THROUGHPUT] phase=<name> bytes=<N> elapsed_ms=<N> throughput_mb_s=<N.N>
+#define GRPC_CLIENT_THROUGHPUT_LOG(config, phase_name, byte_count, start_time)                      \
+  do {                                                                                              \
+    auto _end = std::chrono::steady_clock::now();                                                   \
+    auto _ms  = std::chrono::duration_cast<std::chrono::microseconds>(_end - (start_time)).count(); \
+    double _sec = _ms / 1e6;                                                                        \
+    double _mb  = static_cast<double>(byte_count) / (1024.0 * 1024.0);                              \
+    double _mbs = (_sec > 0.0) ? (_mb / _sec) : 0.0;                                                \
+    GRPC_CLIENT_DEBUG_LOG(                                                                          \
+      config,                                                                                       \
+      "[THROUGHPUT] phase=" << (phase_name) << " bytes=" << (byte_count) << " elapsed_ms="          \
+                            << std::fixed << std::setprecision(1) << (_ms / 1000.0)                 \
+                            << " throughput_mb_s=" << std::setprecision(1) << _mbs);                \
+  } while (0)
+
 // Private implementation (PIMPL pattern to hide gRPC types)
 struct grpc_client_t::impl_t {
   std::shared_ptr<grpc::Channel> channel;
@@ -449,8 +465,12 @@ bool grpc_client_t::submit_unary(const std::vector<uint8_t>& serialized_data,
     return false;
   }
 
+  auto t0 = std::chrono::steady_clock::now();
+
   cuopt::remote::SubmitJobResponse response;
   auto status = impl_->stub->SubmitJob(&context, request, &response);
+
+  GRPC_CLIENT_THROUGHPUT_LOG(config_, "upload_unary", serialized_data.size(), t0);
 
   if (!status.ok()) {
     last_error_ = "SubmitJob failed: " + status.error_message();
@@ -478,6 +498,7 @@ bool grpc_client_t::upload_chunked_arrays(const cpu_optimization_problem_t<i_t, 
                                           std::string& job_id_out)
 {
   job_id_out.clear();
+  auto upload_t0 = std::chrono::steady_clock::now();
 
   // --- 1. StartChunkedUpload ---
   std::string upload_id;
@@ -517,8 +538,9 @@ bool grpc_client_t::upload_chunked_arrays(const cpu_optimization_problem_t<i_t, 
   const int64_t proto_overhead = 64;
   if (chunk_data_budget > proto_overhead) { chunk_data_budget -= proto_overhead; }
 
-  int total_chunks = 0;
-  int total_arrays = 0;
+  int total_chunks         = 0;
+  int total_arrays         = 0;
+  int64_t total_bytes_sent = 0;
 
   for (const auto& env : msg_stream) {
     if (!env.has_array_data()) continue;
@@ -572,6 +594,7 @@ bool grpc_client_t::upload_chunked_arrays(const cpu_optimization_problem_t<i_t, 
         return false;
       }
 
+      total_bytes_sent += byte_count;
       ++total_chunks;
     }
     ++total_arrays;
@@ -598,6 +621,7 @@ bool grpc_client_t::upload_chunked_arrays(const cpu_optimization_problem_t<i_t, 
     job_id_out = response.job_id();
   }
 
+  GRPC_CLIENT_THROUGHPUT_LOG(config_, "upload_chunked", total_bytes_sent, upload_t0);
   GRPC_CLIENT_DEBUG_LOG(
     config_,
     "[grpc_client] ChunkedUpload complete: " << total_chunks << " chunks, job_id=" << job_id_out);
@@ -649,6 +673,8 @@ bool grpc_client_t::get_result_or_download(const std::string& job_id,
                         "[grpc_client] Attempting unary GetResult (result_size_hint="
                           << result_size_hint << " <= effective_max=" << effective_max << ")");
 
+  auto download_t0 = std::chrono::steady_clock::now();
+
   grpc::ClientContext context;
   auto request = build_get_result_request(job_id);
   cuopt::remote::ResultResponse response;
@@ -659,6 +685,7 @@ bool grpc_client_t::get_result_or_download(const std::string& job_id,
       const auto& sol = response.lp_solution();
       result_data_out.resize(sol.ByteSizeLong());
       if (sol.SerializeToArray(result_data_out.data(), result_data_out.size())) {
+        GRPC_CLIENT_THROUGHPUT_LOG(config_, "download_unary", result_data_out.size(), download_t0);
         GRPC_CLIENT_DEBUG_LOG(config_,
                               "[grpc_client] Unary GetResult succeeded, result_size="
                                 << result_data_out.size() << " bytes");
@@ -671,6 +698,7 @@ bool grpc_client_t::get_result_or_download(const std::string& job_id,
       const auto& sol = response.mip_solution();
       result_data_out.resize(sol.ByteSizeLong());
       if (sol.SerializeToArray(result_data_out.data(), result_data_out.size())) {
+        GRPC_CLIENT_THROUGHPUT_LOG(config_, "download_unary", result_data_out.size(), download_t0);
         GRPC_CLIENT_DEBUG_LOG(config_,
                               "[grpc_client] Unary GetResult succeeded, result_size="
                                 << result_data_out.size() << " bytes");
@@ -703,6 +731,7 @@ bool grpc_client_t::download_chunked_result(const std::string& job_id,
                                             std::vector<uint8_t>& result_data_out)
 {
   result_data_out.clear();
+  auto download_t0 = std::chrono::steady_clock::now();
 
   GRPC_CLIENT_DEBUG_LOG(config_, "[grpc_client] Starting chunked download for job " << job_id);
 
@@ -748,7 +777,8 @@ bool grpc_client_t::download_chunked_result(const std::string& job_id,
   const int64_t proto_overhead = 64;
   if (chunk_data_budget > proto_overhead) { chunk_data_budget -= proto_overhead; }
 
-  int total_chunks = 0;
+  int total_chunks             = 0;
+  int64_t total_bytes_received = 0;
 
   for (const auto& arr_desc : header.arrays()) {
     auto field_id       = arr_desc.field_id();
@@ -789,6 +819,7 @@ bool grpc_client_t::download_chunked_result(const std::string& job_id,
       }
 
       std::memcpy(array_bytes.data() + elem_offset * elem_size, data.data(), data.size());
+      total_bytes_received += static_cast<int64_t>(data.size());
       ++total_chunks;
     }
 
@@ -822,6 +853,7 @@ bool grpc_client_t::download_chunked_result(const std::string& job_id,
   // --- 5. Serialize the MessageStream so get_lp_result/get_mip_result can deserialize ---
   result_data_out = serialize_stream(result_stream);
 
+  GRPC_CLIENT_THROUGHPUT_LOG(config_, "download_chunked", total_bytes_received, download_t0);
   GRPC_CLIENT_DEBUG_LOG(config_,
                         "[grpc_client] ChunkedDownload complete: "
                           << total_chunks << " chunks, result_size=" << result_data_out.size()
@@ -1018,6 +1050,7 @@ remote_lp_result_t<i_t, f_t> grpc_client_t::solve_lp(
   const pdlp_solver_settings_t<i_t, f_t>& settings)
 {
   remote_lp_result_t<i_t, f_t> result;
+  auto solve_t0 = std::chrono::steady_clock::now();
 
   if (!is_connected()) {
     result.error_message = "Not connected to server";
@@ -1027,8 +1060,9 @@ remote_lp_result_t<i_t, f_t> grpc_client_t::solve_lp(
   // 1. Submit job (chunked arrays or serialized protobuf based on size)
   std::string job_id;
   bool use_chunked = false;
+  size_t est       = 0;
   if (config_.chunked_array_threshold_bytes >= 0) {
-    size_t est  = estimate_problem_proto_size(problem);
+    est         = estimate_problem_proto_size(problem);
     use_chunked = (static_cast<int64_t>(est) > config_.chunked_array_threshold_bytes);
   }
 
@@ -1047,6 +1081,7 @@ remote_lp_result_t<i_t, f_t> grpc_client_t::solve_lp(
       result.error_message = "Failed to serialize LP request";
       return result;
     }
+    est = serialized_data.size();
     if (!submit_unary(serialized_data, true, job_id)) {
       result.error_message = last_error_;
       return result;
@@ -1146,6 +1181,9 @@ remote_lp_result_t<i_t, f_t> grpc_client_t::solve_lp(
   }
   result.success = true;
 
+  int64_t total_transfer = static_cast<int64_t>(est) + static_cast<int64_t>(result_data.size());
+  GRPC_CLIENT_THROUGHPUT_LOG(config_, "end_to_end_lp", total_transfer, solve_t0);
+
   return result;
 }
 
@@ -1157,6 +1195,7 @@ remote_mip_result_t<i_t, f_t> grpc_client_t::solve_mip(
   bool enable_incumbents)
 {
   remote_mip_result_t<i_t, f_t> result;
+  auto solve_t0 = std::chrono::steady_clock::now();
 
   if (!is_connected()) {
     result.error_message = "Not connected to server";
@@ -1169,8 +1208,9 @@ remote_mip_result_t<i_t, f_t> grpc_client_t::solve_mip(
   // 1. Submit job (chunked arrays or serialized protobuf based on size)
   std::string job_id;
   bool use_chunked = false;
+  size_t est       = 0;
   if (config_.chunked_array_threshold_bytes >= 0) {
-    size_t est  = estimate_problem_proto_size(problem);
+    est         = estimate_problem_proto_size(problem);
     use_chunked = (static_cast<int64_t>(est) > config_.chunked_array_threshold_bytes);
   }
 
@@ -1189,6 +1229,7 @@ remote_mip_result_t<i_t, f_t> grpc_client_t::solve_mip(
       result.error_message = "Failed to serialize MIP request";
       return result;
     }
+    est = serialized_data.size();
     if (!submit_unary(serialized_data, false, job_id)) {
       result.error_message = last_error_;
       return result;
@@ -1339,6 +1380,9 @@ remote_mip_result_t<i_t, f_t> grpc_client_t::solve_mip(
       map_proto_to_mip_solution<i_t, f_t>(pb_solution));
   }
   result.success = true;
+
+  int64_t total_transfer = static_cast<int64_t>(est) + static_cast<int64_t>(result_data.size());
+  GRPC_CLIENT_THROUGHPUT_LOG(config_, "end_to_end_mip", total_transfer, solve_t0);
 
   return result;
 }

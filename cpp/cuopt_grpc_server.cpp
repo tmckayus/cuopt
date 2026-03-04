@@ -517,7 +517,20 @@ void worker_process(int worker_id)
     // Read problem data from pipe (blocks until server writes data)
     std::vector<uint8_t> request_data;
     int read_fd       = worker_pipes[worker_id].worker_read_fd;
+    auto pipe_recv_t0 = std::chrono::steady_clock::now();
     bool read_success = recv_job_data_pipe(read_fd, job.data_size, request_data);
+    if (read_success && config.verbose) {
+      auto pipe_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - pipe_recv_t0)
+                       .count();
+      double pipe_sec = pipe_us / 1e6;
+      double pipe_mb  = static_cast<double>(request_data.size()) / (1024.0 * 1024.0);
+      double pipe_mbs = (pipe_sec > 0.0) ? (pipe_mb / pipe_sec) : 0.0;
+      std::cout << "[THROUGHPUT] phase=pipe_job_recv bytes=" << request_data.size()
+                << " elapsed_ms=" << std::fixed << std::setprecision(1) << (pipe_us / 1000.0)
+                << " throughput_mb_s=" << std::setprecision(1) << pipe_mbs << "\n";
+      std::cout.flush();
+    }
     if (!read_success) {
       std::cerr << "[Worker " << worker_id << "] Failed to read job data from pipe\n";
     }
@@ -748,7 +761,20 @@ void worker_process(int worker_id)
                     << " bytes of result payload to pipe for job " << job_id << "\n";
           std::cout.flush();
         }
-        bool write_success = send_result_pipe(write_fd, result_data);
+        auto pipe_result_t0 = std::chrono::steady_clock::now();
+        bool write_success  = send_result_pipe(write_fd, result_data);
+        if (write_success && config.verbose) {
+          auto pipe_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - pipe_result_t0)
+                           .count();
+          double pipe_sec = pipe_us / 1e6;
+          double pipe_mb  = static_cast<double>(result_data.size()) / (1024.0 * 1024.0);
+          double pipe_mbs = (pipe_sec > 0.0) ? (pipe_mb / pipe_sec) : 0.0;
+          std::cout << "[THROUGHPUT] phase=pipe_result_send bytes=" << result_data.size()
+                    << " elapsed_ms=" << std::fixed << std::setprecision(1) << (pipe_us / 1000.0)
+                    << " throughput_mb_s=" << std::setprecision(1) << pipe_mbs << "\n";
+          std::cout.flush();
+        }
         if (!write_success) {
           std::cerr << "[Worker " << worker_id << "] Failed to write result to pipe\n";
           std::cerr.flush();
@@ -1099,9 +1125,20 @@ void result_retrieval_thread()
 
           if (!job_data.empty()) {
             // Send data to worker's pipe
+            auto pipe_t0 = std::chrono::steady_clock::now();
             if (send_job_data_pipe(worker_idx, job_data)) {
               job_queue[i].data_sent = true;
               if (config.verbose) {
+                auto pipe_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                 std::chrono::steady_clock::now() - pipe_t0)
+                                 .count();
+                double pipe_sec = pipe_us / 1e6;
+                double pipe_mb  = static_cast<double>(job_data.size()) / (1024.0 * 1024.0);
+                double pipe_mbs = (pipe_sec > 0.0) ? (pipe_mb / pipe_sec) : 0.0;
+                std::cout << "[THROUGHPUT] phase=pipe_job_send bytes=" << job_data.size()
+                          << " elapsed_ms=" << std::fixed << std::setprecision(1)
+                          << (pipe_us / 1000.0) << " throughput_mb_s=" << std::setprecision(1)
+                          << pipe_mbs << "\n";
                 std::cout << "[Server] Sent " << job_data.size() << " bytes to worker "
                           << worker_idx << " for job " << job_id << "\n";
               }
@@ -1141,9 +1178,22 @@ void result_retrieval_thread()
                       << " bytes from worker pipe for job " << job_id << "\n";
             std::cout.flush();
           }
+          auto pipe_recv_t0 = std::chrono::steady_clock::now();
           if (!recv_result_pipe(worker_idx, result_queue[i].data_size, result_data)) {
             error_message = "Failed to read result data from pipe";
             success       = false;
+          }
+          if (success && config.verbose) {
+            auto pipe_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - pipe_recv_t0)
+                             .count();
+            double pipe_sec = pipe_us / 1e6;
+            double pipe_mb  = static_cast<double>(result_data.size()) / (1024.0 * 1024.0);
+            double pipe_mbs = (pipe_sec > 0.0) ? (pipe_mb / pipe_sec) : 0.0;
+            std::cout << "[THROUGHPUT] phase=pipe_result_recv bytes=" << result_data.size()
+                      << " elapsed_ms=" << std::fixed << std::setprecision(1) << (pipe_us / 1000.0)
+                      << " throughput_mb_s=" << std::setprecision(1) << pipe_mbs << "\n";
+            std::cout.flush();
           }
         } else if (!success) {
           error_message = result_queue[i].error_message;
