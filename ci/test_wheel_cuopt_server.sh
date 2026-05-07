@@ -7,6 +7,11 @@ set -eou pipefail
 
 source rapids-init-pip
 
+# Make sure libssl.so.3 / libcrypto.so.3 are on the linker path before any
+# 'import cuopt'. cuopt wheels link OpenSSL 3 and don't bundle it; on Rocky 8
+# the runtime needs to come from EPEL (no-op on distros that already ship it).
+bash "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/utils/install_openssl3_runtime.sh"
+
 # Download the packages built in the previous step
 RAPIDS_PY_CUDA_SUFFIX="$(rapids-wheel-ctk-name-gen "${RAPIDS_CUDA_VERSION}")"
 CUOPT_MPS_PARSER_WHEELHOUSE=$(RAPIDS_PY_WHEEL_NAME="cuopt_mps_parser" rapids-download-wheels-from-github python)
