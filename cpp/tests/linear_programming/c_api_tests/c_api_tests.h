@@ -74,6 +74,15 @@ cuopt_int_t test_pdlp_precision_mixed(const char* filename,
 cuopt_int_t test_cpu_only_execution(const char* filename);
 cuopt_int_t test_cpu_only_mip_execution(const char* filename);
 
+/* Problem storage, attributes, and per-problem remote config */
+cuopt_int_t test_problem_storage_and_attributes(const char* filename);
+cuopt_int_t test_remote_server_rejected_on_device_problem(const char* filename);
+cuopt_int_t test_remote_server_on_host_problem(const char* filename);
+
+/* Per-problem remote solve (host/port via API; no CUOPT_REMOTE_* env required) */
+cuopt_int_t test_problem_remote_lp_solve(const char* filename, const char* host, const char* port);
+cuopt_int_t test_problem_remote_mip_solve(const char* filename, const char* host, const char* port);
+
 #ifdef __cplusplus
 }
 #endif

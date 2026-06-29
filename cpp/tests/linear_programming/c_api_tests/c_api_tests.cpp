@@ -668,5 +668,172 @@ TEST_F(CpuOnlyWithServerTest, mip_solve)
   EXPECT_EQ(test_cpu_only_mip_execution(mip_file.c_str()), CUOPT_SUCCESS);
 }
 
+class PerProblemRemoteWithServerTest : public ::testing::Test {
+ protected:
+  static void SetUpTestSuite()
+  {
+    server_path_ = find_server_binary();
+    if (server_path_.empty()) {
+      skip_reason_ = "cuopt_grpc_server binary not found";
+      return;
+    }
+
+    port_                = 18500;
+    const char* env_base = std::getenv("CUOPT_TEST_PORT_BASE");
+    if (env_base) { port_ = std::atoi(env_base) + 501; }
+
+    server_pid_ = fork();
+    if (server_pid_ < 0) {
+      skip_reason_ = "fork() failed";
+      return;
+    }
+
+    if (server_pid_ == 0) {
+      std::string port_str = std::to_string(port_);
+      std::string log_file = "/tmp/cuopt_c_api_per_problem_server_" + port_str + ".log";
+      int fd               = open(log_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      if (fd >= 0) {
+        dup2(fd, STDOUT_FILENO);
+        dup2(fd, STDERR_FILENO);
+        close(fd);
+      }
+      execl(server_path_.c_str(),
+            server_path_.c_str(),
+            "--port",
+            port_str.c_str(),
+            "--workers",
+            "1",
+            nullptr);
+      _exit(127);
+    }
+
+    if (!tcp_connect_check(port_, 15000)) {
+      skip_reason_ = "cuopt_grpc_server failed to start within 15 seconds";
+      kill(server_pid_, SIGKILL);
+      waitpid(server_pid_, &status_, 0);
+      server_pid_ = -1;
+      return;
+    }
+
+    const char* cv     = getenv("CUDA_VISIBLE_DEVICES");
+    const char* rh     = getenv("CUOPT_REMOTE_HOST");
+    const char* rp     = getenv("CUOPT_REMOTE_PORT");
+    orig_cuda_visible_ = cv ? cv : "";
+    orig_remote_host_  = rh ? rh : "";
+    orig_remote_port_  = rp ? rp : "";
+    cuda_was_set_      = (cv != nullptr);
+    host_was_set_      = (rh != nullptr);
+    port_was_set_      = (rp != nullptr);
+
+    setenv("CUDA_VISIBLE_DEVICES", "", 1);
+    unsetenv("CUOPT_REMOTE_HOST");
+    unsetenv("CUOPT_REMOTE_PORT");
+  }
+
+  static void TearDownTestSuite()
+  {
+    if (cuda_was_set_) {
+      setenv("CUDA_VISIBLE_DEVICES", orig_cuda_visible_.c_str(), 1);
+    } else {
+      unsetenv("CUDA_VISIBLE_DEVICES");
+    }
+    if (host_was_set_) {
+      setenv("CUOPT_REMOTE_HOST", orig_remote_host_.c_str(), 1);
+    } else {
+      unsetenv("CUOPT_REMOTE_HOST");
+    }
+    if (port_was_set_) {
+      setenv("CUOPT_REMOTE_PORT", orig_remote_port_.c_str(), 1);
+    } else {
+      unsetenv("CUOPT_REMOTE_PORT");
+    }
+
+    if (server_pid_ > 0) {
+      kill(server_pid_, SIGTERM);
+      int status;
+      int wait_ms = 0;
+      while (wait_ms < 5000) {
+        if (waitpid(server_pid_, &status, WNOHANG) != 0) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        wait_ms += 100;
+      }
+      if (waitpid(server_pid_, &status, WNOHANG) == 0) {
+        kill(server_pid_, SIGKILL);
+        waitpid(server_pid_, &status, 0);
+      }
+      server_pid_ = -1;
+    }
+  }
+
+  void SetUp() override
+  {
+    if (!skip_reason_.empty()) { GTEST_SKIP() << skip_reason_; }
+  }
+
+  static std::string server_path_;
+  static std::string skip_reason_;
+  static pid_t server_pid_;
+  static int port_;
+  static int status_;
+
+  static std::string orig_cuda_visible_;
+  static std::string orig_remote_host_;
+  static std::string orig_remote_port_;
+  static bool cuda_was_set_;
+  static bool host_was_set_;
+  static bool port_was_set_;
+};
+
+std::string PerProblemRemoteWithServerTest::server_path_;
+std::string PerProblemRemoteWithServerTest::skip_reason_;
+pid_t PerProblemRemoteWithServerTest::server_pid_ = -1;
+int PerProblemRemoteWithServerTest::port_         = 0;
+int PerProblemRemoteWithServerTest::status_       = 0;
+std::string PerProblemRemoteWithServerTest::orig_cuda_visible_;
+std::string PerProblemRemoteWithServerTest::orig_remote_host_;
+std::string PerProblemRemoteWithServerTest::orig_remote_port_;
+bool PerProblemRemoteWithServerTest::cuda_was_set_ = false;
+bool PerProblemRemoteWithServerTest::host_was_set_ = false;
+bool PerProblemRemoteWithServerTest::port_was_set_ = false;
+
+TEST_F(PerProblemRemoteWithServerTest, lp_solve)
+{
+  const std::string& rapidsDatasetRootDir = cuopt::test::get_rapids_dataset_root_dir();
+  std::string lp_file = rapidsDatasetRootDir + "/linear_programming/afiro_original.mps";
+  std::string port    = std::to_string(port_);
+  EXPECT_EQ(test_problem_remote_lp_solve(lp_file.c_str(), "localhost", port.c_str()),
+            CUOPT_SUCCESS);
+}
+
+TEST_F(PerProblemRemoteWithServerTest, mip_solve)
+{
+  const std::string& rapidsDatasetRootDir = cuopt::test::get_rapids_dataset_root_dir();
+  std::string mip_file                    = rapidsDatasetRootDir + "/mip/bb_optimality.mps";
+  std::string port                        = std::to_string(port_);
+  EXPECT_EQ(test_problem_remote_mip_solve(mip_file.c_str(), "localhost", port.c_str()),
+            CUOPT_SUCCESS);
+}
+
+TEST(c_api, problem_storage_and_attributes)
+{
+  const std::string& rapidsDatasetRootDir = cuopt::test::get_rapids_dataset_root_dir();
+  std::string filename = rapidsDatasetRootDir + "/linear_programming/afiro_original.mps";
+  EXPECT_EQ(test_problem_storage_and_attributes(filename.c_str()), CUOPT_SUCCESS);
+}
+
+TEST(c_api, remote_server_rejected_on_device_problem)
+{
+  const std::string& rapidsDatasetRootDir = cuopt::test::get_rapids_dataset_root_dir();
+  std::string filename = rapidsDatasetRootDir + "/linear_programming/afiro_original.mps";
+  EXPECT_EQ(test_remote_server_rejected_on_device_problem(filename.c_str()), CUOPT_SUCCESS);
+}
+
+TEST(c_api, remote_server_on_host_problem)
+{
+  const std::string& rapidsDatasetRootDir = cuopt::test::get_rapids_dataset_root_dir();
+  std::string filename = rapidsDatasetRootDir + "/linear_programming/afiro_original.mps";
+  EXPECT_EQ(test_remote_server_on_host_problem(filename.c_str()), CUOPT_SUCCESS);
+}
+
 // Note: cuopt_cli subprocess tests are in Python (test_cpu_only_execution.py)
 // which provides better cross-platform subprocess handling

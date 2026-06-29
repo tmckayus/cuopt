@@ -11,6 +11,7 @@
 #include <cuopt/mathematical_optimization/optimization_problem_solution_interface.hpp>
 
 #include <memory>
+#include <string>
 
 namespace cuopt::mathematical_optimization {
 
@@ -29,7 +30,7 @@ struct mip_solver_settings_t;
 // ============================================================================
 
 /**
- * @brief Solve LP problem remotely (CPU backend)
+ * @brief Solve LP problem remotely (CPU backend) using CUOPT_REMOTE_HOST/PORT.
  */
 template <typename i_t, typename f_t>
 std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp_remote(
@@ -37,11 +38,29 @@ std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp_remote(
   pdlp_solver_settings_t<i_t, f_t> const& settings);
 
 /**
- * @brief Solve MIP problem remotely (CPU backend)
+ * @brief Solve LP problem remotely at an explicit server address (host:port).
+ */
+template <typename i_t, typename f_t>
+std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp_remote(
+  cpu_optimization_problem_t<i_t, f_t> const& cpu_problem,
+  pdlp_solver_settings_t<i_t, f_t> const& settings,
+  const std::string& server_address);
+
+/**
+ * @brief Solve MIP problem remotely (CPU backend) using CUOPT_REMOTE_HOST/PORT.
  */
 template <typename i_t, typename f_t>
 std::unique_ptr<mip_solution_interface_t<i_t, f_t>> solve_mip_remote(
   cpu_optimization_problem_t<i_t, f_t> const& cpu_problem,
   mip_solver_settings_t<i_t, f_t> const& settings);
+
+/**
+ * @brief Solve MIP problem remotely at an explicit server address (host:port).
+ */
+template <typename i_t, typename f_t>
+std::unique_ptr<mip_solution_interface_t<i_t, f_t>> solve_mip_remote(
+  cpu_optimization_problem_t<i_t, f_t> const& cpu_problem,
+  mip_solver_settings_t<i_t, f_t> const& settings,
+  const std::string& server_address);
 
 }  // namespace cuopt::mathematical_optimization

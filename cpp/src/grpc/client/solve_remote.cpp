@@ -124,9 +124,10 @@ static void apply_env_overrides(grpc_client_config_t& config)
 // ============================================================================
 
 template <typename i_t, typename f_t>
-std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp_remote(
+static std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp_remote_impl(
   cpu_optimization_problem_t<i_t, f_t> const& cpu_problem,
-  pdlp_solver_settings_t<i_t, f_t> const& settings)
+  pdlp_solver_settings_t<i_t, f_t> const& settings,
+  const std::string& server_address)
 {
   init_logger_t log(settings.log_file, settings.log_to_console);
 
@@ -134,7 +135,7 @@ std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp_remote(
 
   // Build gRPC client configuration
   grpc_client_config_t config;
-  config.server_address  = get_grpc_server_address();
+  config.server_address  = server_address;
   config.timeout_seconds = solver_timeout_seconds(settings.time_limit);
   apply_env_overrides(config);
 
@@ -179,9 +180,27 @@ std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp_remote(
 }
 
 template <typename i_t, typename f_t>
-std::unique_ptr<mip_solution_interface_t<i_t, f_t>> solve_mip_remote(
+std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp_remote(
   cpu_optimization_problem_t<i_t, f_t> const& cpu_problem,
-  mip_solver_settings_t<i_t, f_t> const& settings)
+  pdlp_solver_settings_t<i_t, f_t> const& settings)
+{
+  return solve_lp_remote_impl(cpu_problem, settings, get_grpc_server_address());
+}
+
+template <typename i_t, typename f_t>
+std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp_remote(
+  cpu_optimization_problem_t<i_t, f_t> const& cpu_problem,
+  pdlp_solver_settings_t<i_t, f_t> const& settings,
+  const std::string& server_address)
+{
+  return solve_lp_remote_impl(cpu_problem, settings, server_address);
+}
+
+template <typename i_t, typename f_t>
+static std::unique_ptr<mip_solution_interface_t<i_t, f_t>> solve_mip_remote_impl(
+  cpu_optimization_problem_t<i_t, f_t> const& cpu_problem,
+  mip_solver_settings_t<i_t, f_t> const& settings,
+  const std::string& server_address)
 {
   init_logger_t log(settings.log_file, settings.log_to_console);
 
@@ -189,7 +208,7 @@ std::unique_ptr<mip_solution_interface_t<i_t, f_t>> solve_mip_remote(
 
   // Build gRPC client configuration
   grpc_client_config_t config;
-  config.server_address  = get_grpc_server_address();
+  config.server_address  = server_address;
   config.timeout_seconds = solver_timeout_seconds(settings.time_limit);
   apply_env_overrides(config);
 
@@ -279,11 +298,38 @@ std::unique_ptr<mip_solution_interface_t<i_t, f_t>> solve_mip_remote(
   return std::move(result.solution);
 }
 
+template <typename i_t, typename f_t>
+std::unique_ptr<mip_solution_interface_t<i_t, f_t>> solve_mip_remote(
+  cpu_optimization_problem_t<i_t, f_t> const& cpu_problem,
+  mip_solver_settings_t<i_t, f_t> const& settings)
+{
+  return solve_mip_remote_impl(cpu_problem, settings, get_grpc_server_address());
+}
+
+template <typename i_t, typename f_t>
+std::unique_ptr<mip_solution_interface_t<i_t, f_t>> solve_mip_remote(
+  cpu_optimization_problem_t<i_t, f_t> const& cpu_problem,
+  mip_solver_settings_t<i_t, f_t> const& settings,
+  const std::string& server_address)
+{
+  return solve_mip_remote_impl(cpu_problem, settings, server_address);
+}
+
 // Explicit template instantiations for remote execution stubs
 template std::unique_ptr<lp_solution_interface_t<int, double>> solve_lp_remote(
   cpu_optimization_problem_t<int, double> const&, pdlp_solver_settings_t<int, double> const&);
 
+template std::unique_ptr<lp_solution_interface_t<int, double>> solve_lp_remote(
+  cpu_optimization_problem_t<int, double> const&,
+  pdlp_solver_settings_t<int, double> const&,
+  const std::string&);
+
 template std::unique_ptr<mip_solution_interface_t<int, double>> solve_mip_remote(
   cpu_optimization_problem_t<int, double> const&, mip_solver_settings_t<int, double> const&);
+
+template std::unique_ptr<mip_solution_interface_t<int, double>> solve_mip_remote(
+  cpu_optimization_problem_t<int, double> const&,
+  mip_solver_settings_t<int, double> const&,
+  const std::string&);
 
 }  // namespace cuopt::mathematical_optimization

@@ -1055,6 +1055,173 @@ cuopt_int_t cuOptGetDualObjectiveValue(cuOptSolution solution,
  */
 cuopt_int_t cuOptGetReducedCosts(cuOptSolution solution, cuopt_float_t* reduced_cost_ptr);
 
+/* -------------------------------------------------------------------------- */
+/* Problem storage defaults (process-wide)                                    */
+/* -------------------------------------------------------------------------- */
+
+typedef enum {
+  /**
+   * Legacy behavior (default at startup):
+   *   local, no override                  -> effective DEVICE for new problems
+   *   CUOPT_USE_CPU_MEM_FOR_LOCAL=1       -> effective HOST (test mode)
+   *   CUOPT_REMOTE_HOST/PORT set          -> effective HOST (remote env path)
+   */
+  CUOPT_PROBLEM_STORAGE_AUTO = 0,
+  /** All new problems use HOST storage. */
+  CUOPT_PROBLEM_STORAGE_HOST = 1,
+  /** All new problems use DEVICE storage (local GPU path). */
+  CUOPT_PROBLEM_STORAGE_DEVICE = 2,
+} cuOptProblemStorage_t;
+
+/**
+ * @brief Set process-wide default storage for newly allocated problems.
+ *
+ * Applies when create/read allocate because *problem_ptr == NULL.
+ * Does not affect handles already created.
+ */
+cuopt_int_t cuOptSetDefaultProblemStorage(cuOptProblemStorage_t storage);
+
+cuopt_int_t cuOptGetDefaultProblemStorage(cuOptProblemStorage_t* storage_out);
+
+cuopt_int_t cuOptGetProblemStorage(cuOptOptimizationProblem problem,
+                                   cuOptProblemStorage_t* storage_out);
+
+/* -------------------------------------------------------------------------- */
+/* Remote execution (per-problem)                                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * @brief Configure remote gRPC server for this problem.
+ *
+ * When host and port are set, cuOptSolve routes this problem to the remote server.
+ * Requires HOST storage; returns CUOPT_INVALID_ARGUMENT on DEVICE problems.
+ */
+cuopt_int_t cuOptSetProblemRemoteServer(cuOptOptimizationProblem problem,
+                                        const char* host,
+                                        const char* port);
+
+cuopt_int_t cuOptClearProblemRemoteServer(cuOptOptimizationProblem problem);
+
+cuopt_int_t cuOptGetProblemRemoteServer(cuOptOptimizationProblem problem,
+                                        char* host,
+                                        cuopt_int_t host_buffer_size,
+                                        char* port,
+                                        cuopt_int_t port_buffer_size,
+                                        cuopt_int_t* is_remote_ptr);
+
+/* -------------------------------------------------------------------------- */
+/* Generic problem attributes                                                 */
+/* -------------------------------------------------------------------------- */
+
+typedef enum {
+  CUOPT_PROBLEM_ATTR_NUM_VARIABLES = 0,
+  CUOPT_PROBLEM_ATTR_NUM_CONSTRAINTS,
+  CUOPT_PROBLEM_ATTR_NUM_NONZEROS,
+  CUOPT_PROBLEM_ATTR_NUM_INTEGERS,
+  CUOPT_PROBLEM_ATTR_OBJECTIVE_SENSE,
+  CUOPT_PROBLEM_ATTR_OBJECTIVE_OFFSET,
+  CUOPT_PROBLEM_ATTR_OBJECTIVE_SCALING_FACTOR,
+  CUOPT_PROBLEM_ATTR_PROBLEM_CATEGORY,
+  CUOPT_PROBLEM_ATTR_IS_MIP,
+  CUOPT_PROBLEM_ATTR_HAS_QUADRATIC_OBJECTIVE,
+  CUOPT_PROBLEM_ATTR_HAS_QUADRATIC_CONSTRAINTS,
+  CUOPT_PROBLEM_ATTR_PROBLEM_NAME,
+  CUOPT_PROBLEM_ATTR_OBJECTIVE_NAME,
+} cuOptProblemAttribute_t;
+
+typedef enum {
+  CUOPT_PROBLEM_ARRAY_ATTR_OBJECTIVE_COEFFICIENTS = 0,
+  CUOPT_PROBLEM_ARRAY_ATTR_VARIABLE_LOWER_BOUNDS,
+  CUOPT_PROBLEM_ARRAY_ATTR_VARIABLE_UPPER_BOUNDS,
+  CUOPT_PROBLEM_ARRAY_ATTR_CONSTRAINT_LOWER_BOUNDS,
+  CUOPT_PROBLEM_ARRAY_ATTR_CONSTRAINT_UPPER_BOUNDS,
+  CUOPT_PROBLEM_ARRAY_ATTR_CONSTRAINT_RHS,
+  CUOPT_PROBLEM_ARRAY_ATTR_CONSTRAINT_SENSE,
+  CUOPT_PROBLEM_ARRAY_ATTR_VARIABLE_TYPES,
+  CUOPT_PROBLEM_ARRAY_ATTR_CONSTRAINT_MATRIX_VALUES,
+  CUOPT_PROBLEM_ARRAY_ATTR_CONSTRAINT_MATRIX_INDICES,
+  CUOPT_PROBLEM_ARRAY_ATTR_CONSTRAINT_MATRIX_OFFSETS,
+} cuOptProblemArrayAttribute_t;
+
+typedef enum {
+  CUOPT_PROBLEM_STRING_ARRAY_VARIABLE_NAMES = 0,
+  CUOPT_PROBLEM_STRING_ARRAY_ROW_NAMES,
+} cuOptProblemStringArrayAttribute_t;
+
+/**
+ * @note Borrowed pointers from Get*Attribute and Get*ArrayAttribute refer to memory owned by
+ * the cuOptOptimizationProblem. Do not free them. Pointers are invalidated when the problem is
+ * destroyed, when any Set* mutates that field, or when the problem is re-read from file.
+ */
+
+cuopt_int_t cuOptGetProblemIntAttribute(cuOptOptimizationProblem problem,
+                                        cuOptProblemAttribute_t attribute,
+                                        cuopt_int_t* value_out);
+
+cuopt_int_t cuOptSetProblemIntAttribute(cuOptOptimizationProblem problem,
+                                        cuOptProblemAttribute_t attribute,
+                                        cuopt_int_t value);
+
+cuopt_int_t cuOptGetProblemFloatAttribute(cuOptOptimizationProblem problem,
+                                          cuOptProblemAttribute_t attribute,
+                                          cuopt_float_t* value_out);
+
+cuopt_int_t cuOptSetProblemFloatAttribute(cuOptOptimizationProblem problem,
+                                          cuOptProblemAttribute_t attribute,
+                                          cuopt_float_t value);
+
+cuopt_int_t cuOptGetProblemStringAttribute(cuOptOptimizationProblem problem,
+                                           cuOptProblemAttribute_t attribute,
+                                           const char** value_out);
+
+cuopt_int_t cuOptSetProblemStringAttribute(cuOptOptimizationProblem problem,
+                                           cuOptProblemAttribute_t attribute,
+                                           const char* value);
+
+cuopt_int_t cuOptGetProblemArraySize(cuOptOptimizationProblem problem,
+                                     cuOptProblemArrayAttribute_t attribute,
+                                     cuopt_int_t* size_out);
+
+cuopt_int_t cuOptGetProblemFloatArrayAttribute(cuOptOptimizationProblem problem,
+                                               cuOptProblemArrayAttribute_t attribute,
+                                               const cuopt_float_t** data_out,
+                                               cuopt_int_t* count_out);
+
+cuopt_int_t cuOptSetProblemFloatArrayAttribute(cuOptOptimizationProblem problem,
+                                               cuOptProblemArrayAttribute_t attribute,
+                                               const cuopt_float_t* data,
+                                               cuopt_int_t count);
+
+cuopt_int_t cuOptGetProblemIntArrayAttribute(cuOptOptimizationProblem problem,
+                                             cuOptProblemArrayAttribute_t attribute,
+                                             const cuopt_int_t** data_out,
+                                             cuopt_int_t* count_out);
+
+cuopt_int_t cuOptSetProblemIntArrayAttribute(cuOptOptimizationProblem problem,
+                                             cuOptProblemArrayAttribute_t attribute,
+                                             const cuopt_int_t* data,
+                                             cuopt_int_t count);
+
+cuopt_int_t cuOptGetProblemCharArrayAttribute(cuOptOptimizationProblem problem,
+                                              cuOptProblemArrayAttribute_t attribute,
+                                              const char** data_out,
+                                              cuopt_int_t* count_out);
+
+cuopt_int_t cuOptSetProblemCharArrayAttribute(cuOptOptimizationProblem problem,
+                                              cuOptProblemArrayAttribute_t attribute,
+                                              const char* data,
+                                              cuopt_int_t count);
+
+cuopt_int_t cuOptGetProblemStringArrayAttribute(cuOptOptimizationProblem problem,
+                                                cuOptProblemStringArrayAttribute_t attribute,
+                                                const char*** strings_out,
+                                                cuopt_int_t* count_out);
+
+cuopt_int_t cuOptSetProblemStringArrayAttribute(cuOptOptimizationProblem problem,
+                                                cuOptProblemStringArrayAttribute_t attribute,
+                                                const char* const* strings,
+                                                cuopt_int_t count);
+
 #ifdef __cplusplus
 }
 #endif

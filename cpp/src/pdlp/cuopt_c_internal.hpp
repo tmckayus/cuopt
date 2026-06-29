@@ -20,6 +20,8 @@
 #include <rmm/cuda_stream_view.hpp>
 
 #include <memory>
+#include <string>
+#include <vector>
 
 namespace cuopt::mathematical_optimization {
 
@@ -50,16 +52,25 @@ struct problem_and_stream_view_t {
 
   // Movable
   problem_and_stream_view_t(problem_and_stream_view_t&& other) noexcept
-    : memory_backend(other.memory_backend),
+    : float_array_cache_(std::move(other.float_array_cache_)),
+      int_array_cache_(std::move(other.int_array_cache_)),
+      char_array_cache_(std::move(other.char_array_cache_)),
+      string_array_view_cache_(std::move(other.string_array_view_cache_)),
+      scalar_string_cache_(std::move(other.scalar_string_cache_)),
+      memory_backend(other.memory_backend),
       gpu_problem(other.gpu_problem),
       cpu_problem(other.cpu_problem),
       stream_view_ptr(other.stream_view_ptr),
-      handle_ptr(other.handle_ptr)
+      handle_ptr(other.handle_ptr),
+      remote_configured_(other.remote_configured_),
+      remote_host_(std::move(other.remote_host_)),
+      remote_port_(std::move(other.remote_port_))
   {
-    other.gpu_problem     = nullptr;
-    other.cpu_problem     = nullptr;
-    other.stream_view_ptr = nullptr;
-    other.handle_ptr      = nullptr;
+    other.gpu_problem        = nullptr;
+    other.cpu_problem        = nullptr;
+    other.stream_view_ptr    = nullptr;
+    other.handle_ptr         = nullptr;
+    other.remote_configured_ = false;
   }
 
   problem_and_stream_view_t& operator=(problem_and_stream_view_t&& other) noexcept
@@ -70,16 +81,25 @@ struct problem_and_stream_view_t {
       if (handle_ptr) delete handle_ptr;
       if (stream_view_ptr) delete stream_view_ptr;
 
-      memory_backend  = other.memory_backend;
-      gpu_problem     = other.gpu_problem;
-      cpu_problem     = other.cpu_problem;
-      stream_view_ptr = other.stream_view_ptr;
-      handle_ptr      = other.handle_ptr;
+      float_array_cache_       = std::move(other.float_array_cache_);
+      int_array_cache_         = std::move(other.int_array_cache_);
+      char_array_cache_        = std::move(other.char_array_cache_);
+      string_array_view_cache_ = std::move(other.string_array_view_cache_);
+      scalar_string_cache_     = std::move(other.scalar_string_cache_);
+      memory_backend           = other.memory_backend;
+      gpu_problem              = other.gpu_problem;
+      cpu_problem              = other.cpu_problem;
+      stream_view_ptr          = other.stream_view_ptr;
+      handle_ptr               = other.handle_ptr;
+      remote_configured_       = other.remote_configured_;
+      remote_host_             = std::move(other.remote_host_);
+      remote_port_             = std::move(other.remote_port_);
 
-      other.gpu_problem     = nullptr;
-      other.cpu_problem     = nullptr;
-      other.stream_view_ptr = nullptr;
-      other.handle_ptr      = nullptr;
+      other.gpu_problem        = nullptr;
+      other.cpu_problem        = nullptr;
+      other.stream_view_ptr    = nullptr;
+      other.handle_ptr         = nullptr;
+      other.remote_configured_ = false;
     }
     return *this;
   }
@@ -112,12 +132,68 @@ struct problem_and_stream_view_t {
     }
   }
 
+  bool has_remote_server() const { return remote_configured_; }
+
+  const std::string& remote_host() const { return remote_host_; }
+
+  const std::string& remote_port() const { return remote_port_; }
+
+  std::string remote_server_address() const
+  {
+    if (!remote_configured_) { return {}; }
+    return remote_host_ + ":" + remote_port_;
+  }
+
+  void set_remote_server(const std::string& host, const std::string& port)
+  {
+    remote_host_       = host;
+    remote_port_       = port;
+    remote_configured_ = true;
+    invalidate_c_api_caches();
+  }
+
+  void clear_remote_server()
+  {
+    remote_host_.clear();
+    remote_port_.clear();
+    remote_configured_ = false;
+  }
+
+  void invalidate_c_api_caches()
+  {
+    float_array_cache_.clear();
+    int_array_cache_.clear();
+    char_array_cache_.clear();
+    string_array_view_cache_.clear();
+    scalar_string_cache_.clear();
+  }
+
+  void refresh_string_array_view(const std::vector<std::string>& names)
+  {
+    string_array_view_cache_.clear();
+    string_array_view_cache_.reserve(names.size());
+    for (const auto& name : names) {
+      string_array_view_cache_.push_back(name.c_str());
+    }
+  }
+
+  std::vector<cuopt_float_t> float_array_cache_;
+  std::vector<cuopt_int_t> int_array_cache_;
+  std::vector<char> char_array_cache_;
+  std::vector<const char*> string_array_view_cache_;
+  std::string scalar_string_cache_;
+
   memory_backend_t memory_backend;
   optimization_problem_t<cuopt_int_t, cuopt_float_t>* gpu_problem;
   cpu_optimization_problem_t<cuopt_int_t, cuopt_float_t>* cpu_problem;
   rmm::cuda_stream_view*
     stream_view_ptr;           // nullptr for CPU memory backend to avoid CUDA initialization
   raft::handle_t* handle_ptr;  // nullptr for CPU memory backend to avoid CUDA initialization
+
+ private:
+  bool remote_configured_ = false;
+  std::string remote_host_;
+  std::string remote_port_;
 };
 
 struct solution_and_stream_view_t {

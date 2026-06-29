@@ -16,6 +16,24 @@
 
 namespace cuopt::mathematical_optimization {
 
+namespace {
+
+problem_storage_default_t g_default_problem_storage = problem_storage_default_t::AUTO;
+
+problem_storage_default_t parse_problem_storage_env()
+{
+  const char* value = std::getenv("CUOPT_PROBLEM_STORAGE");
+  if (value == nullptr) { return problem_storage_default_t::AUTO; }
+
+  std::string storage(value);
+  std::transform(storage.begin(), storage.end(), storage.begin(), ::tolower);
+  if (storage == "host") { return problem_storage_default_t::HOST; }
+  if (storage == "device") { return problem_storage_default_t::DEVICE; }
+  return problem_storage_default_t::AUTO;
+}
+
+}  // namespace
+
 bool is_remote_execution_enabled()
 {
   const char* remote_host = std::getenv("CUOPT_REMOTE_HOST");
@@ -45,6 +63,22 @@ memory_backend_t get_memory_backend_type()
   if (get_execution_mode() == execution_mode_t::REMOTE) { return memory_backend_t::CPU; }
   // Local execution: GPU memory by default, CPU if CUOPT_USE_CPU_MEM_FOR_LOCAL is set
   return use_cpu_memory_for_local() ? memory_backend_t::CPU : memory_backend_t::GPU;
+}
+
+void set_default_problem_storage(problem_storage_default_t storage)
+{
+  g_default_problem_storage = storage;
+}
+
+problem_storage_default_t get_default_problem_storage() { return g_default_problem_storage; }
+
+memory_backend_t resolve_memory_backend_for_new_problem()
+{
+  auto storage = g_default_problem_storage;
+  if (storage == problem_storage_default_t::AUTO) { storage = parse_problem_storage_env(); }
+  if (storage == problem_storage_default_t::HOST) { return memory_backend_t::CPU; }
+  if (storage == problem_storage_default_t::DEVICE) { return memory_backend_t::GPU; }
+  return get_memory_backend_type();
 }
 
 }  // namespace cuopt::mathematical_optimization

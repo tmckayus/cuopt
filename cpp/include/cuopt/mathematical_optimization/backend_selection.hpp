@@ -26,6 +26,17 @@ enum class memory_backend_t {
 };
 
 /**
+ * @brief Process-wide default storage for newly allocated problems (C API).
+ *
+ * Values match cuOptProblemStorage_t in cuopt_c.h.
+ */
+enum class problem_storage_default_t {
+  AUTO   = 0,
+  HOST   = 1,
+  DEVICE = 2,
+};
+
+/**
  * @brief Check if remote execution is enabled via environment variables
  * @return true if both CUOPT_REMOTE_HOST and CUOPT_REMOTE_PORT are set
  */
@@ -60,5 +71,22 @@ bool use_cpu_memory_for_local();
  * @return memory_backend_t::GPU or memory_backend_t::CPU
  */
 memory_backend_t get_memory_backend_type();
+
+/**
+ * @brief Set process-wide default storage for newly allocated problems.
+ */
+void set_default_problem_storage(problem_storage_default_t storage);
+
+/**
+ * @brief Get process-wide default storage for newly allocated problems.
+ */
+problem_storage_default_t get_default_problem_storage();
+
+/**
+ * @brief Resolve memory backend for a newly allocated problem handle.
+ *
+ * Uses the process default when HOST or DEVICE; AUTO delegates to get_memory_backend_type().
+ */
+memory_backend_t resolve_memory_backend_for_new_problem();
 
 }  // namespace cuopt::mathematical_optimization

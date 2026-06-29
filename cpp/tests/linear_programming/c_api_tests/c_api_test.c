@@ -2617,3 +2617,418 @@ DONE:
   cuOptDestroySolution(&solution);
   return status;
 }
+
+cuopt_int_t test_problem_storage_and_attributes(const char* filename)
+{
+  cuOptOptimizationProblem problem = NULL;
+  cuopt_int_t status;
+  cuOptProblemStorage_t storage;
+  cuopt_int_t num_variables = 0;
+  cuopt_int_t attr_variables = 0;
+  const char** variable_names = NULL;
+  cuopt_int_t name_count = 0;
+
+  status = cuOptSetDefaultProblemStorage(CUOPT_PROBLEM_STORAGE_HOST);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error setting default problem storage to HOST\n");
+    goto DONE;
+  }
+
+  status = cuOptReadProblem(filename, &problem);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error reading problem for attribute test\n");
+    goto DONE;
+  }
+
+  status = cuOptGetProblemStorage(problem, &storage);
+  if (status != CUOPT_SUCCESS || storage != CUOPT_PROBLEM_STORAGE_HOST) {
+    printf("Expected HOST storage after default HOST read\n");
+    status = CUOPT_VALIDATION_ERROR;
+    goto DONE;
+  }
+
+  status = cuOptGetNumVariables(problem, &num_variables);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error getting num variables\n");
+    goto DONE;
+  }
+
+  status = cuOptGetProblemIntAttribute(
+    problem, CUOPT_PROBLEM_ATTR_NUM_VARIABLES, &attr_variables);
+  if (status != CUOPT_SUCCESS || attr_variables != num_variables) {
+    printf("Generic int attribute mismatch for num variables\n");
+    status = CUOPT_VALIDATION_ERROR;
+    goto DONE;
+  }
+
+  status = cuOptGetProblemStringArrayAttribute(
+    problem, CUOPT_PROBLEM_STRING_ARRAY_VARIABLE_NAMES, &variable_names, &name_count);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error getting variable names via string array attribute\n");
+    goto DONE;
+  }
+  if (name_count != num_variables) {
+    printf("Variable name count mismatch\n");
+    status = CUOPT_VALIDATION_ERROR;
+    goto DONE;
+  }
+
+  if (name_count > 0 && (variable_names == NULL || variable_names[0] == NULL)) {
+    printf("Expected non-null variable name pointers\n");
+    status = CUOPT_VALIDATION_ERROR;
+    goto DONE;
+  }
+
+  status = cuOptSetDefaultProblemStorage(CUOPT_PROBLEM_STORAGE_AUTO);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error resetting default problem storage\n");
+    goto DONE;
+  }
+
+DONE:
+  cuOptDestroyProblem(&problem);
+  return status;
+}
+
+cuopt_int_t test_remote_server_on_host_problem(const char* filename)
+{
+  cuOptOptimizationProblem problem = NULL;
+  cuopt_int_t status;
+  cuopt_int_t is_remote = 0;
+  char host[64];
+  char port[16];
+
+  status = cuOptSetDefaultProblemStorage(CUOPT_PROBLEM_STORAGE_HOST);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error setting default problem storage to HOST\n");
+    goto DONE;
+  }
+
+  status = cuOptReadProblem(filename, &problem);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error reading problem for host remote config test\n");
+    goto DONE;
+  }
+
+  status = cuOptSetProblemRemoteServer(problem, "solver.example.com", "50051");
+  if (status != CUOPT_SUCCESS) {
+    printf("Error setting remote server on HOST problem\n");
+    goto DONE;
+  }
+
+  status = cuOptGetProblemRemoteServer(problem, host, 64, port, 16, &is_remote);
+  if (status != CUOPT_SUCCESS || is_remote != 1) {
+    printf("Expected remote server to be configured\n");
+    status = CUOPT_VALIDATION_ERROR;
+    goto DONE;
+  }
+  if (strcmp(host, "solver.example.com") != 0 || strcmp(port, "50051") != 0) {
+    printf("Remote server host/port mismatch\n");
+    status = CUOPT_VALIDATION_ERROR;
+    goto DONE;
+  }
+
+  status = cuOptClearProblemRemoteServer(problem);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error clearing remote server\n");
+    goto DONE;
+  }
+
+  status = cuOptGetProblemRemoteServer(problem, host, 64, port, 16, &is_remote);
+  if (status != CUOPT_SUCCESS || is_remote != 0) {
+    printf("Expected remote server to be cleared\n");
+    status = CUOPT_VALIDATION_ERROR;
+    goto DONE;
+  }
+
+  status = cuOptSetDefaultProblemStorage(CUOPT_PROBLEM_STORAGE_AUTO);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error resetting default problem storage\n");
+    goto DONE;
+  }
+
+DONE:
+  cuOptDestroyProblem(&problem);
+  return status;
+}
+
+cuopt_int_t test_remote_server_rejected_on_device_problem(const char* filename)
+{
+  cuOptOptimizationProblem problem = NULL;
+  cuopt_int_t status;
+  cuopt_int_t is_remote = 0;
+
+  status = cuOptSetDefaultProblemStorage(CUOPT_PROBLEM_STORAGE_DEVICE);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error setting default problem storage to DEVICE\n");
+    goto DONE;
+  }
+
+  status = cuOptReadProblem(filename, &problem);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error reading problem for remote rejection test\n");
+    goto DONE;
+  }
+
+  status = cuOptSetProblemRemoteServer(problem, "127.0.0.1", "50051");
+  if (status != CUOPT_INVALID_ARGUMENT) {
+    printf("Expected remote server set to fail on DEVICE problem\n");
+    status = CUOPT_VALIDATION_ERROR;
+    goto DONE;
+  }
+
+  status = cuOptGetProblemRemoteServer(problem, NULL, 0, NULL, 0, &is_remote);
+  if (status != CUOPT_SUCCESS || is_remote != 0) {
+    printf("Expected remote server to remain unset on DEVICE problem\n");
+    status = CUOPT_VALIDATION_ERROR;
+    goto DONE;
+  }
+
+  status = cuOptSetDefaultProblemStorage(CUOPT_PROBLEM_STORAGE_AUTO);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error resetting default problem storage\n");
+    goto DONE;
+  }
+
+DONE:
+  cuOptDestroyProblem(&problem);
+  return status;
+}
+
+cuopt_int_t test_problem_remote_lp_solve(const char* filename, const char* host, const char* port)
+{
+  cuOptOptimizationProblem problem = NULL;
+  cuOptSolverSettings settings     = NULL;
+  cuOptSolution solution           = NULL;
+  cuopt_int_t status;
+  cuopt_int_t termination_status;
+  cuopt_float_t objective_value;
+  cuopt_float_t solve_time;
+  cuopt_int_t num_variables;
+  cuopt_float_t* primal_solution = NULL;
+
+  printf("Testing per-problem remote LP solve...\n");
+  printf("  Remote target: %s:%s\n", host, port);
+  printf("  CUOPT_REMOTE_HOST=%s\n",
+         getenv("CUOPT_REMOTE_HOST") ? getenv("CUOPT_REMOTE_HOST") : "(not set)");
+  printf("  CUOPT_REMOTE_PORT=%s\n",
+         getenv("CUOPT_REMOTE_PORT") ? getenv("CUOPT_REMOTE_PORT") : "(not set)");
+
+  status = cuOptSetDefaultProblemStorage(CUOPT_PROBLEM_STORAGE_HOST);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error setting default problem storage to HOST\n");
+    goto DONE;
+  }
+
+  status = cuOptReadProblem(filename, &problem);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error reading problem: %d\n", status);
+    goto DONE;
+  }
+
+  status = cuOptSetProblemRemoteServer(problem, host, port);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error setting per-problem remote server: %d\n", status);
+    goto DONE;
+  }
+
+  status = cuOptGetNumVariables(problem, &num_variables);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error getting num variables: %d\n", status);
+    goto DONE;
+  }
+
+  if (num_variables > 0) {
+    primal_solution = (cuopt_float_t*)malloc(num_variables * sizeof(cuopt_float_t));
+    if (primal_solution == NULL) {
+      printf("Error allocating primal solution\n");
+      status = CUOPT_OUT_OF_MEMORY;
+      goto DONE;
+    }
+  }
+
+  status = cuOptCreateSolverSettings(&settings);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error creating solver settings: %d\n", status);
+    goto DONE;
+  }
+
+  status = cuOptSetIntegerParameter(settings, CUOPT_METHOD, CUOPT_METHOD_PDLP);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error setting method: %d\n", status);
+    goto DONE;
+  }
+
+  status = cuOptSolve(problem, settings, &solution);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error solving problem remotely: %d\n", status);
+    goto DONE;
+  }
+
+  status = cuOptGetTerminationStatus(solution, &termination_status);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error getting termination status: %d\n", status);
+    goto DONE;
+  }
+
+  status = cuOptGetObjectiveValue(solution, &objective_value);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error getting objective value: %d\n", status);
+    goto DONE;
+  }
+
+  status = cuOptGetSolveTime(solution, &solve_time);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error getting solve time: %d\n", status);
+    goto DONE;
+  }
+
+  status = cuOptGetPrimalSolution(solution, primal_solution);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error getting primal solution: %d\n", status);
+    goto DONE;
+  }
+
+  if (termination_status != CUOPT_TERMINATION_STATUS_OPTIMAL) {
+    printf("Expected optimal termination, got %s\n",
+           termination_status_to_string(termination_status));
+    status = CUOPT_VALIDATION_ERROR;
+    goto DONE;
+  }
+
+  printf("Per-problem remote LP solve test passed\n");
+  printf("  Termination status: %s\n", termination_status_to_string(termination_status));
+  printf("  Objective value: %f\n", objective_value);
+  printf("  Solve time: %f\n", solve_time);
+
+  status = CUOPT_SUCCESS;
+
+DONE:
+  free(primal_solution);
+  cuOptDestroyProblem(&problem);
+  cuOptDestroySolverSettings(&settings);
+  cuOptDestroySolution(&solution);
+  cuOptSetDefaultProblemStorage(CUOPT_PROBLEM_STORAGE_AUTO);
+  return status;
+}
+
+cuopt_int_t test_problem_remote_mip_solve(const char* filename, const char* host, const char* port)
+{
+  cuOptOptimizationProblem problem = NULL;
+  cuOptSolverSettings settings     = NULL;
+  cuOptSolution solution           = NULL;
+  cuopt_int_t status;
+  cuopt_int_t termination_status;
+  cuopt_float_t objective_value;
+  cuopt_float_t solve_time;
+  cuopt_float_t mip_gap;
+  cuopt_int_t num_variables;
+  cuopt_float_t* primal_solution = NULL;
+
+  printf("Testing per-problem remote MIP solve...\n");
+  printf("  Remote target: %s:%s\n", host, port);
+
+  status = cuOptSetDefaultProblemStorage(CUOPT_PROBLEM_STORAGE_HOST);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error setting default problem storage to HOST\n");
+    goto DONE;
+  }
+
+  status = cuOptReadProblem(filename, &problem);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error reading MIP problem: %d\n", status);
+    goto DONE;
+  }
+
+  status = cuOptSetProblemRemoteServer(problem, host, port);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error setting per-problem remote server: %d\n", status);
+    goto DONE;
+  }
+
+  status = cuOptGetNumVariables(problem, &num_variables);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error getting num variables: %d\n", status);
+    goto DONE;
+  }
+
+  if (num_variables > 0) {
+    primal_solution = (cuopt_float_t*)malloc(num_variables * sizeof(cuopt_float_t));
+    if (primal_solution == NULL) {
+      printf("Error allocating primal solution\n");
+      status = CUOPT_OUT_OF_MEMORY;
+      goto DONE;
+    }
+  }
+
+  status = cuOptCreateSolverSettings(&settings);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error creating solver settings: %d\n", status);
+    goto DONE;
+  }
+
+  status = cuOptSetFloatParameter(settings, CUOPT_TIME_LIMIT, 60.0);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error setting time limit: %d\n", status);
+    goto DONE;
+  }
+
+  status = cuOptSolve(problem, settings, &solution);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error solving MIP remotely: %d\n", status);
+    goto DONE;
+  }
+
+  status = cuOptGetTerminationStatus(solution, &termination_status);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error getting termination status: %d\n", status);
+    goto DONE;
+  }
+
+  status = cuOptGetObjectiveValue(solution, &objective_value);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error getting objective value: %d\n", status);
+    goto DONE;
+  }
+
+  status = cuOptGetSolveTime(solution, &solve_time);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error getting solve time: %d\n", status);
+    goto DONE;
+  }
+
+  status = cuOptGetMIPGap(solution, &mip_gap);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error getting MIP gap: %d\n", status);
+    goto DONE;
+  }
+
+  status = cuOptGetPrimalSolution(solution, primal_solution);
+  if (status != CUOPT_SUCCESS) {
+    printf("Error getting primal solution: %d\n", status);
+    goto DONE;
+  }
+
+  if (termination_status != CUOPT_TERMINATION_STATUS_OPTIMAL) {
+    printf("Expected optimal termination, got %s\n",
+           termination_status_to_string(termination_status));
+    status = CUOPT_VALIDATION_ERROR;
+    goto DONE;
+  }
+
+  printf("Per-problem remote MIP solve test passed\n");
+  printf("  Termination status: %s\n", termination_status_to_string(termination_status));
+  printf("  Objective value: %f\n", objective_value);
+  printf("  MIP gap: %f\n", mip_gap);
+  printf("  Solve time: %f\n", solve_time);
+
+  status = CUOPT_SUCCESS;
+
+DONE:
+  free(primal_solution);
+  cuOptDestroyProblem(&problem);
+  cuOptDestroySolverSettings(&settings);
+  cuOptDestroySolution(&solution);
+  cuOptSetDefaultProblemStorage(CUOPT_PROBLEM_STORAGE_AUTO);
+  return status;
+}

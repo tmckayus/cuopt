@@ -13,6 +13,9 @@
 #include <cuopt/mathematical_optimization/optimization_problem_utils.hpp>
 #include <cuopt/mathematical_optimization/solve.hpp>
 #include <cuopt/mathematical_optimization/solver_settings.hpp>
+#ifdef CUOPT_ENABLE_GRPC
+#include <cuopt/mathematical_optimization/solve_remote.hpp>
+#endif
 #include <cuopt/utilities/timestamp_utils.hpp>
 #include <pdlp/cuopt_c_internal.hpp>
 #include <utilities/logger.hpp>
@@ -32,9 +35,11 @@ using cuopt::mathematical_optimization::get_memory_backend_type;
 using cuopt::mathematical_optimization::is_valid_public_var_type_code;
 using cuopt::mathematical_optimization::problem_and_stream_view_t;
 using cuopt::mathematical_optimization::problem_category_t;
+using cuopt::mathematical_optimization::resolve_memory_backend_for_new_problem;
 using cuopt::mathematical_optimization::solution_and_stream_view_t;
 using cuopt::mathematical_optimization::solver_settings_t;
 using cuopt::mathematical_optimization::var_t;
+using cuopt::mathematical_optimization::var_type_to_char;
 using cuopt::mathematical_optimization::io::mps_data_model_t;
 
 class c_get_solution_callback_t : public cuopt::internals::get_solution_callback_t {
@@ -198,7 +203,7 @@ cuopt_int_t cuOptReadProblem(const char* filename, cuOptOptimizationProblem* pro
   }
 
   problem_and_stream_view_t* problem_and_stream =
-    new problem_and_stream_view_t(get_memory_backend_type());
+    new problem_and_stream_view_t(resolve_memory_backend_for_new_problem());
   std::string filename_str(filename);
   std::unique_ptr<mps_data_model_t<cuopt_int_t, cuopt_float_t>> mps_data_model_ptr;
   try {
@@ -275,7 +280,7 @@ cuopt_int_t cuOptCreateProblem(cuopt_int_t num_constraints,
   }
 
   problem_and_stream_view_t* problem_and_stream =
-    new problem_and_stream_view_t(get_memory_backend_type());
+    new problem_and_stream_view_t(resolve_memory_backend_for_new_problem());
   try {
     auto* problem = problem_and_stream->get_problem();
     problem->set_maximize(objective_sense == CUOPT_MAXIMIZE);
@@ -339,7 +344,7 @@ cuopt_int_t cuOptCreateRangedProblem(cuopt_int_t num_constraints,
   }
 
   problem_and_stream_view_t* problem_and_stream =
-    new problem_and_stream_view_t(get_memory_backend_type());
+    new problem_and_stream_view_t(resolve_memory_backend_for_new_problem());
   try {
     auto* problem = problem_and_stream->get_problem();
     problem->set_maximize(objective_sense == CUOPT_MAXIMIZE);
@@ -413,7 +418,7 @@ cuopt_int_t cuOptCreateQuadraticProblem(
   CUOPT_LOG_WARN("%s", k_deprecated_quadratic_problem_msg);
 
   problem_and_stream_view_t* problem_and_stream =
-    new problem_and_stream_view_t(get_memory_backend_type());
+    new problem_and_stream_view_t(resolve_memory_backend_for_new_problem());
   try {
     auto* problem = problem_and_stream->get_problem();
     problem->set_maximize(objective_sense == CUOPT_MAXIMIZE);
@@ -482,7 +487,7 @@ cuopt_int_t cuOptCreateQuadraticRangedProblem(
   CUOPT_LOG_WARN("%s", k_deprecated_quadratic_ranged_problem_msg);
 
   problem_and_stream_view_t* problem_and_stream =
-    new problem_and_stream_view_t(get_memory_backend_type());
+    new problem_and_stream_view_t(resolve_memory_backend_for_new_problem());
   try {
     auto* problem = problem_and_stream->get_problem();
     problem->set_maximize(objective_sense == CUOPT_MAXIMIZE);
@@ -1087,6 +1092,8 @@ cuopt_int_t cuOptSolve(cuOptOptimizationProblem problem,
   cuopt::mathematical_optimization::optimization_problem_interface_t<cuopt_int_t, cuopt_float_t>*
     problem_interface = problem_and_stream_view->get_problem();
 
+  const bool use_problem_remote = problem_and_stream_view->has_remote_server();
+
   try {
     if (problem_interface->get_problem_category() == problem_category_t::MIP ||
         problem_interface->get_problem_category() == problem_category_t::IP) {
@@ -1095,10 +1102,29 @@ cuopt_int_t cuOptSolve(cuOptOptimizationProblem problem,
       cuopt::mathematical_optimization::mip_solver_settings_t<cuopt_int_t, cuopt_float_t>&
         mip_settings = solver_settings->get_mip_settings();
 
-      // Solve returns unique_ptr<mip_solution_interface_t>
-      auto solution_interface =
-        cuopt::mathematical_optimization::solve_mip<cuopt_int_t, cuopt_float_t>(problem_interface,
-                                                                                mip_settings);
+      std::unique_ptr<cuopt::mathematical_optimization::mip_solution_interface_t<cuopt_int_t,
+                                                                                 cuopt_float_t>>
+        solution_interface;
+      if (use_problem_remote) {
+#ifdef CUOPT_ENABLE_GRPC
+        if (problem_and_stream_view->memory_backend != memory_backend_t::CPU ||
+            problem_and_stream_view->cpu_problem == nullptr) {
+          return CUOPT_INVALID_ARGUMENT;
+        }
+        solution_interface =
+          cuopt::mathematical_optimization::solve_mip_remote(*problem_and_stream_view->cpu_problem,
+                                                             mip_settings,
+                                                             problem_and_stream_view
+                                                               ->remote_server_address());
+#else
+        CUOPT_LOG_ERROR("Per-problem remote solve requires a gRPC-enabled build");
+        return CUOPT_RUNTIME_ERROR;
+#endif
+      } else {
+        solution_interface =
+          cuopt::mathematical_optimization::solve_mip<cuopt_int_t, cuopt_float_t>(problem_interface,
+                                                                                  mip_settings);
+      }
 
       auto solution_holder =
         std::make_unique<solution_and_stream_view_t>(true, problem_and_stream_view->memory_backend);
@@ -1116,10 +1142,29 @@ cuopt_int_t cuOptSolve(cuOptOptimizationProblem problem,
       cuopt::mathematical_optimization::pdlp_solver_settings_t<cuopt_int_t, cuopt_float_t>&
         pdlp_settings = solver_settings->get_pdlp_settings();
 
-      // Solve returns unique_ptr<lp_solution_interface_t>
-      auto solution_interface =
-        cuopt::mathematical_optimization::solve_lp<cuopt_int_t, cuopt_float_t>(problem_interface,
-                                                                               pdlp_settings);
+      std::unique_ptr<cuopt::mathematical_optimization::lp_solution_interface_t<cuopt_int_t,
+                                                                              cuopt_float_t>>
+        solution_interface;
+      if (use_problem_remote) {
+#ifdef CUOPT_ENABLE_GRPC
+        if (problem_and_stream_view->memory_backend != memory_backend_t::CPU ||
+            problem_and_stream_view->cpu_problem == nullptr) {
+          return CUOPT_INVALID_ARGUMENT;
+        }
+        solution_interface =
+          cuopt::mathematical_optimization::solve_lp_remote(*problem_and_stream_view->cpu_problem,
+                                                            pdlp_settings,
+                                                            problem_and_stream_view
+                                                              ->remote_server_address());
+#else
+        CUOPT_LOG_ERROR("Per-problem remote solve requires a gRPC-enabled build");
+        return CUOPT_RUNTIME_ERROR;
+#endif
+      } else {
+        solution_interface =
+          cuopt::mathematical_optimization::solve_lp<cuopt_int_t, cuopt_float_t>(problem_interface,
+                                                                                 pdlp_settings);
+      }
 
       auto solution_holder = std::make_unique<solution_and_stream_view_t>(
         false, problem_and_stream_view->memory_backend);
