@@ -56,7 +56,10 @@ void adapted_modifier_t<i_t, f_t, REQUEST>::improve(
   bool time_limit_enabled  = true;
 
   resource.ls.set_active_weights(gpu_weight);
-  resource.ls.start_timer(time_limit);
+  auto* cancel = adapted_solution.sol.problem_ptr->solver_settings_ptr != nullptr
+                   ? adapted_solution.sol.problem_ptr->solver_settings_ptr->cancel_requested
+                   : nullptr;
+  resource.ls.start_timer(time_limit, cancel);
   resource.ls.run_best_local_search(
     adapted_solution.sol, consider_unserviced, time_limit_enabled, run_cycle_finder);
   adapted_solution.populate_host_data();

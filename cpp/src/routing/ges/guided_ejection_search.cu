@@ -126,6 +126,11 @@ f_t guided_ejection_search_t<i_t, f_t, REQUEST>::remaining_time() const
 template <typename i_t, typename f_t, request_t REQUEST>
 bool guided_ejection_search_t<i_t, f_t, REQUEST>::time_stop_condition_reached()
 {
+  if (solution_ptr != nullptr && solution_ptr->problem_ptr != nullptr &&
+      solution_ptr->problem_ptr->solver_settings_ptr != nullptr) {
+    auto* cancel = solution_ptr->problem_ptr->solver_settings_ptr->cancel_requested;
+    if (cancel != nullptr && cancel->load(std::memory_order_acquire)) { return true; }
+  }
   f_t seconds_elapsed =
     std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
       .count() /
@@ -137,16 +142,6 @@ bool guided_ejection_search_t<i_t, f_t, REQUEST>::time_stop_condition_reached()
     intermediate_file->flush();
     dump_iter++;
   }
-  // static bool profiler_started = false;
-  // if (seconds_elapsed > 180.f && !profiler_started && seconds_elapsed < 209.f) {
-  //   cudaProfilerStart();
-  //   profiler_started = true;
-  // }
-  // if (seconds_elapsed > 210.f && profiler_started) {
-  //   cudaProfilerStop();
-  //   profiler_started = false;
-  // }
-
   return finished;
 }
 
@@ -426,6 +421,7 @@ bool guided_ejection_search_t<i_t, f_t, REQUEST>::construct_feasible_solution()
   size_t avg_route_size     = 50;
   // try to have at least 50 requests per route
   while (!EP.empty() && remaining_vehicles > 0) {
+    if (time_stop_condition_reached()) { break; }
     size_t num_new_vehicles = (EP.size() + avg_route_size - 1) / avg_route_size;
     num_new_vehicles        = std::min(remaining_vehicles, num_new_vehicles);
     if (remaining_vehicles == total_vehicles) {

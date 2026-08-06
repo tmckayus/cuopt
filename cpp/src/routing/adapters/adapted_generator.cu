@@ -96,6 +96,7 @@ void adapted_generator_t<i_t, f_t, REQUEST>::generate_solution(
   }
 
   f_t ges_time_limit       = timer.clamp_remaining_time(time_limit);
+  if (timer.cancel_requested() || ges_time_limit <= 0.) { return; }
   auto [resource, index]   = pool_allocator.resource_pool->acquire();
   const auto start_time    = std::chrono::steady_clock::now();
   auto gpu_weight          = get_cuopt_cost(weight);
@@ -112,7 +113,7 @@ void adapted_generator_t<i_t, f_t, REQUEST>::generate_solution(
 
   if (run_route_minimizer) {
     resource.ges.construct_feasible_solution();
-    resource.ges.route_minimizer_loop();
+    if (!timer.cancel_requested()) { resource.ges.route_minimizer_loop(); }
   } else {
     // FIXME:: We can do better
     sol.clear_solution(desired_vehicle_ids);

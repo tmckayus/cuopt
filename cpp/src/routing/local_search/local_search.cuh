@@ -16,6 +16,7 @@
 
 #include <rmm/device_uvector.hpp>
 
+#include <atomic>
 #include <deque>
 
 namespace cuopt {
@@ -134,11 +135,12 @@ class local_search_t {
 
   void set_active_weights(const infeasible_cost_t weights, bool include_objective = true);
 
-  static inline void start_timer(f_t time_limit_)
+  static inline void start_timer(f_t time_limit_, std::atomic<bool>* cancel = nullptr)
   {
     time_limit         = time_limit_;
     start              = std::chrono::steady_clock::now();
     time_limit_reached = false;
+    cancel_requested    = cancel;
   }
 
   static inline bool get_time_limit_reached()
@@ -157,6 +159,10 @@ class local_search_t {
 
   static inline bool check_time_limit()
   {
+    if (cancel_requested != nullptr && cancel_requested->load(std::memory_order_acquire)) {
+      set_time_limit_reached();
+      return true;
+    }
     if (get_time_limit_reached()) return true;
     bool this_thread_finished =
       std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start)
@@ -193,6 +199,7 @@ class local_search_t {
   static inline f_t time_limit;
   static inline std::chrono::time_point<std::chrono::steady_clock> start;
   static inline bool time_limit_reached;
+  static inline std::atomic<bool>* cancel_requested{nullptr};
   ExactCycleFinder<i_t, f_t, 128> cycle_finder_small;
   ExactCycleFinder<i_t, f_t, 1024> cycle_finder_big;
   rmm::device_uvector<found_sliding_solution_t<i_t>> found_sliding_solution_data_;

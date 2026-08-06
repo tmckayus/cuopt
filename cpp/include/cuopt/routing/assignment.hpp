@@ -26,6 +26,7 @@ class solution_string_t {
   // found."
   const static std::string infeasible;
   const static std::string timeout;
+  const static std::string cancelled;
   const static std::string empty;
   const static std::string error;
 };
@@ -35,6 +36,7 @@ enum class solution_status_t {
   SUCCESS = 0, /*!< A feasible solution was found.*/
   INFEASIBLE,  /*!< No feasible solution found for the problem.*/
   TIMEOUT,     /*!< Time limit reached before finding a solution.*/
+  CANCELLED,   /*!< Solve cancelled via cooperative cancel flag.*/
   EMPTY,       /*!< Solver did not run.*/
   ERROR        /*!< An error occured while running the cuOpt solver.*/
 };

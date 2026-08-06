@@ -243,7 +243,11 @@ bool guided_ejection_search_t<i_t, f_t, REQUEST>::squeeze_all_and_save()
   double total_excess = solution_ptr->get_total_excess(ls_weights_after_squeeze);
   local_search_ptr_->set_active_weights(ls_weights_after_squeeze, include_objective);
 
-  local_search_ptr_->start_timer(remaining_time());
+  local_search_ptr_->start_timer(
+    remaining_time(),
+    solution_ptr->problem_ptr->solver_settings_ptr != nullptr
+      ? solution_ptr->problem_ptr->solver_settings_ptr->cancel_requested
+      : nullptr);
 
   solution_ptr->global_runtime_checks(true, false, "squeeze_all_and_save_before_ls");
   const bool consider_unserviced = false;
@@ -337,7 +341,11 @@ bool guided_ejection_search_t<i_t, f_t, REQUEST>::try_squeeze_feasible(
   local_search_ptr_->set_active_weights(local_search_ptr_->move_candidates.weights,
                                         include_objective);
 
-  local_search_ptr_->start_timer(remaining_time());
+  local_search_ptr_->start_timer(
+    remaining_time(),
+    solution_ptr->problem_ptr->solver_settings_ptr != nullptr
+      ? solution_ptr->problem_ptr->solver_settings_ptr->cancel_requested
+      : nullptr);
 
   const bool consider_unserviced = false;
   const bool enable_time_limit   = true;
@@ -398,7 +406,11 @@ bool guided_ejection_search_t<i_t, f_t, REQUEST>::try_squeeze_breaks_feasible()
 
   if (solution_ptr->is_feasible()) { return true; }
 
-  local_search_ptr_->start_timer(remaining_time());
+  local_search_ptr_->start_timer(
+    remaining_time(),
+    solution_ptr->problem_ptr->solver_settings_ptr != nullptr
+      ? solution_ptr->problem_ptr->solver_settings_ptr->cancel_requested
+      : nullptr);
 
   auto original_incl_objective = local_search_ptr_->move_candidates.include_objective;
   local_search_ptr_->set_active_weights(local_search_ptr_->move_candidates.weights, false);

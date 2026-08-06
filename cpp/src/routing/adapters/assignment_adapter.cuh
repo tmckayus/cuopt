@@ -49,7 +49,16 @@ assignment_t<i_t> ges_solver_t<i_t, f_t, REQUEST>::get_ges_assignment(
   auto sol_status = solution_status_t::EMPTY;
   std::string sol_string{solution_string_t::empty};
   sol.sol_found = (sol.get_n_routes() <= sol.problem_ptr->data_view_ptr->get_fleet_size());
-  if (sol.is_feasible()) {
+  const bool cancelled =
+    problem.solver_settings_ptr != nullptr &&
+    problem.solver_settings_ptr->cancel_requested != nullptr &&
+    problem.solver_settings_ptr->cancel_requested->load(std::memory_order_acquire);
+  // Cancel wins over SUCCESS/INFEASIBLE so a cooperative cancel is visible even if a
+  // feasible incumbent was already found during the interrupted search.
+  if (cancelled) {
+    sol_status = solution_status_t::CANCELLED;
+    sol_string = solution_string_t::cancelled;
+  } else if (sol.is_feasible()) {
     sol_status = solution_status_t::SUCCESS;
     sol_string = solution_string_t::success;
   } else if (sol.sol_found) {

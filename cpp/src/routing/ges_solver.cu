@@ -25,7 +25,7 @@ ges_solver_t<i_t, f_t, REQUEST>::ges_solver_t(const data_model_view_t<i_t, f_t>&
                                               double time_limit_,
                                               i_t expected_route_count_,
                                               std::ofstream* intermediate_file_)
-  : timer(time_limit_),
+  : timer(time_limit_, solver_settings.cancel_requested),
     problem(data_model, solver_settings),
     // override for now
     pool_allocator(problem,

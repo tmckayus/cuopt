@@ -16,6 +16,7 @@ const std::string solution_string_t::success    = "cuOpt solver success.";
 const std::string solution_string_t::infeasible = "cuOpt solver infeasible solution found.";
 const std::string solution_string_t::timeout =
   "cuOpt solver time limit was reached before finding a feasible solution.";
+const std::string solution_string_t::cancelled = "cuOpt solver cancelled.";
 const std::string solution_string_t::empty = "cuOpt solver did not run.";
 const std::string solution_string_t::error = "An error occured while running the cuOpt solver.";
 

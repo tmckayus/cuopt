@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cuopt/routing/routing_structures.hpp>
+#include <atomic>
 #include <fstream>
 #include <limits>
 #include <ostream>
@@ -68,6 +69,14 @@ class solver_settings_t {
    * @return Solving time set in seconds
    */
   f_t get_time_limit() const noexcept;
+
+  /**
+   * @brief Optional cooperative-cancel flag polled like the time limit.
+   *
+   * Non-owning. When non-null and set to true, the solver exits early and
+   * surfaces `solution_status_t::CANCELLED`.
+   */
+  std::atomic<bool>* cancel_requested{nullptr};
 
   /**
    * @brief Return true if verbose mode is enabled
