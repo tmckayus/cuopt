@@ -2,7 +2,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Start legacy HTTP + gRPC + HTTP→gRPC shim, run timed loop, write CSVs, tear down.
+# Run timed e2e loop for legacy / shim / client paths and write CSVs.
+#
+# On a single GPU with large instances, legacy HTTP and gRPC cannot both
+# hold a large RMM pool at once. This script therefore runs each path in
+# ORDER sequentially: start only the servers that path needs, run all
+# iterations for that path, tear down, free GPU, then move on.
 #
 # Required:
 #   MSGPACK_FILE   path to numpy-msgpack LP (e.g. L2CTA3D.numpy.msgpack)
@@ -19,6 +24,8 @@
 #   POLL_TIMEOUT=600
 
 set -euo pipefail
+
+export PYTHONUNBUFFERED=1
 
 MSGPACK_FILE="${MSGPACK_FILE:?Set MSGPACK_FILE to the numpy msgpack LP path}"
 ITERATIONS="${ITERATIONS:-5}"
@@ -43,30 +50,29 @@ SUMMARY="${OUT_DIR}/e2e_avg_${STAMP}.csv"
 LOG_DIR="${OUT_DIR}/logs_${STAMP}"
 mkdir -p "${LOG_DIR}"
 
-need_legacy=0
-need_shim=0
-need_grpc=0
-IFS=',' read -ra _ORDER_PARTS <<< "${ORDER}"
-for p in "${_ORDER_PARTS[@]}"; do
-  p="$(echo "$p" | tr -d '[:space:]')"
-  case "$p" in
-    legacy) need_legacy=1 ;;
-    shim) need_shim=1; need_grpc=1 ;;
-    client) need_grpc=1 ;;
-  esac
-done
-
 PIDS=()
-cleanup() {
-  echo "Cleaning up servers..."
+
+free_gpu() {
+  echo "Stopping servers / freeing GPU..."
   for pid in "${PIDS[@]:-}"; do
     kill "${pid}" 2>/dev/null || true
   done
-  # workers may outlive parent briefly
+  PIDS=()
   fuser -k "${LEGACY_PORT}/tcp" 2>/dev/null || true
   fuser -k "${GRPC_PORT}/tcp" 2>/dev/null || true
   fuser -k "${SHIM_PORT}/tcp" 2>/dev/null || true
-  sleep 2
+  # leftover workers / solvers
+  pkill -9 -f "cuopt_grpc_server --port ${GRPC_PORT}" 2>/dev/null || true
+  pkill -9 -f "cuopt_service --port ${LEGACY_PORT}" 2>/dev/null || true
+  pkill -9 -f "compat.shim .*--http-port ${SHIM_PORT}" 2>/dev/null || true
+  sleep 3
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=memory.used,memory.free --format=csv,noheader || true
+  fi
+}
+
+cleanup() {
+  free_gpu
 }
 trap cleanup EXIT
 
@@ -96,21 +102,15 @@ wait_http() {
   return 1
 }
 
-echo "MSGPACK_FILE=${MSGPACK_FILE}"
-echo "ITERATIONS=${ITERATIONS} TIME_LIMIT=${TIME_LIMIT} ORDER=${ORDER}"
-echo "CUOPT_GIGABYTES_PER_PROC=${CUOPT_GIGABYTES_PER_PROC}"
-echo "CSV=${CSV}"
-echo "SUMMARY=${SUMMARY}"
-
-if [[ "${need_legacy}" -eq 1 ]]; then
+start_legacy() {
   echo "Starting legacy HTTP server on ${LEGACY_PORT}..."
   nohup python -m cuopt_server.cuopt_service --port "${LEGACY_PORT}" \
     >"${LOG_DIR}/legacy.log" 2>&1 &
   PIDS+=($!)
   wait_http "${LEGACY_URL}/cuopt/health" "legacy"
-fi
+}
 
-if [[ "${need_grpc}" -eq 1 ]]; then
+start_grpc() {
   echo "Starting gRPC server on ${GRPC_PORT}..."
   nohup env CUOPT_GIGABYTES_PER_PROC="${CUOPT_GIGABYTES_PER_PROC}" \
     cuopt_grpc_server --port "${GRPC_PORT}" --workers 1 \
@@ -118,9 +118,9 @@ if [[ "${need_grpc}" -eq 1 ]]; then
     >"${LOG_DIR}/grpc.log" 2>&1 &
   PIDS+=($!)
   wait_tcp 127.0.0.1 "${GRPC_PORT}" "grpc"
-fi
+}
 
-if [[ "${need_shim}" -eq 1 ]]; then
+start_shim() {
   echo "Starting HTTP→gRPC shim on ${SHIM_PORT}..."
   nohup python -m cuopt_server.compat.shim \
     --http-host 127.0.0.1 --http-port "${SHIM_PORT}" \
@@ -128,33 +128,140 @@ if [[ "${need_shim}" -eq 1 ]]; then
     >"${LOG_DIR}/shim.log" 2>&1 &
   PIDS+=($!)
   wait_http "${SHIM_URL}/health" "shim"
-fi
+}
 
-ARGS=(
-  --msgpack-file "${MSGPACK_FILE}"
-  --time-limit "${TIME_LIMIT}"
-  --iterations "${ITERATIONS}"
-  --cooldown "${COOLDOWN}"
-  --poll-timeout "${POLL_TIMEOUT}"
-  --order "${ORDER}"
-  --csv "${CSV}"
-  --csv-summary "${SUMMARY}"
-)
-if [[ "${need_legacy}" -eq 1 ]]; then
-  ARGS+=(--legacy-url "${LEGACY_URL}")
-fi
-if [[ "${need_shim}" -eq 1 ]]; then
-  ARGS+=(--shim-url "${SHIM_URL}")
-fi
-if [[ "${need_grpc}" -eq 1 ]]; then
-  ARGS+=(--grpc-host 127.0.0.1 --grpc-port "${GRPC_PORT}")
-fi
+run_path_loop() {
+  local path="$1"
+  local tmp_csv="${LOG_DIR}/runs_${path}.csv"
+  local tmp_sum="${LOG_DIR}/avg_${path}.csv"
+  local args=(
+    --msgpack-file "${MSGPACK_FILE}"
+    --time-limit "${TIME_LIMIT}"
+    --iterations "${ITERATIONS}"
+    --cooldown "${COOLDOWN}"
+    --poll-timeout "${POLL_TIMEOUT}"
+    --order "${path}"
+    --csv "${tmp_csv}"
+    --csv-summary "${tmp_sum}"
+  )
+  case "${path}" in
+    legacy)
+      args+=(--legacy-url "${LEGACY_URL}")
+      ;;
+    shim)
+      args+=(--shim-url "${SHIM_URL}" --grpc-host 127.0.0.1 --grpc-port "${GRPC_PORT}")
+      ;;
+    client)
+      args+=(--grpc-host 127.0.0.1 --grpc-port "${GRPC_PORT}")
+      ;;
+    *)
+      echo "ERROR: unknown path '${path}'" >&2
+      return 1
+      ;;
+  esac
+  echo "===== path=${path} iterations=${ITERATIONS} ====="
+  python -m cuopt_server.compat.compare_e2e_solve "${args[@]}" \
+    | tee -a "${LOG_DIR}/compare.log"
+}
 
-echo "Running compare loop..."
-python -m cuopt_server.compat.compare_e2e_solve "${ARGS[@]}" | tee "${LOG_DIR}/compare.log"
+merge_csvs() {
+  python - "${CSV}" "${SUMMARY}" "${LOG_DIR}" <<'PY'
+import csv, sys
+from pathlib import Path
+
+out_runs, out_avg, log_dir = sys.argv[1], sys.argv[2], Path(sys.argv[3])
+run_files = sorted(log_dir.glob("runs_*.csv"))
+if not run_files:
+    raise SystemExit("no per-path run CSVs to merge")
+
+rows = []
+fields = None
+for f in run_files:
+    with f.open() as fh:
+        r = csv.DictReader(fh)
+        fields = r.fieldnames
+        rows.extend(list(r))
+
+with open(out_runs, "w", newline="") as fh:
+    w = csv.DictWriter(fh, fieldnames=fields)
+    w.writeheader()
+    w.writerows(rows)
+
+# Recompute summary via the compare module helpers
+from cuopt_server.compat.compare_e2e_solve import write_summary_csv
+
+# coerce types for averaging
+typed = []
+for row in rows:
+    t = dict(row)
+    t["ok"] = str(row.get("ok", "")).lower() in ("1", "true", "yes")
+    for k in (
+        "convert_ms",
+        "decode_ms",
+        "validate_ms",
+        "post_ms",
+        "submit_ms",
+        "wait_ms",
+        "result_ms",
+        "poll_ms",
+        "total_wall_ms",
+        "primal_objective",
+    ):
+        v = row.get(k)
+        if v is None or v == "":
+            t[k] = None
+        else:
+            try:
+                t[k] = float(v)
+            except ValueError:
+                t[k] = None
+    typed.append(t)
+
+write_summary_csv(out_avg, typed)
+print(f"merged {len(rows)} rows -> {out_runs}")
+print(f"summary -> {out_avg}")
+PY
+}
+
+echo "MSGPACK_FILE=${MSGPACK_FILE}"
+echo "ITERATIONS=${ITERATIONS} TIME_LIMIT=${TIME_LIMIT} ORDER=${ORDER}"
+echo "CUOPT_GIGABYTES_PER_PROC=${CUOPT_GIGABYTES_PER_PROC}"
+echo "CSV=${CSV}"
+echo "SUMMARY=${SUMMARY}"
+echo "(paths run sequentially with GPU freed between them)"
+
+IFS=',' read -ra _ORDER_PARTS <<< "${ORDER}"
+for raw in "${_ORDER_PARTS[@]}"; do
+  path="$(echo "${raw}" | tr -d '[:space:]')"
+  [[ -z "${path}" ]] && continue
+  free_gpu
+  case "${path}" in
+    legacy)
+      start_legacy
+      run_path_loop legacy
+      ;;
+    shim)
+      start_grpc
+      start_shim
+      run_path_loop shim
+      ;;
+    client)
+      start_grpc
+      run_path_loop client
+      ;;
+    *)
+      echo "ERROR: unknown ORDER entry '${path}'" >&2
+      exit 1
+      ;;
+  esac
+done
+
+free_gpu
+merge_csvs
 
 echo
 echo "Done."
 echo "  per-run CSV : ${CSV}"
 echo "  averages CSV: ${SUMMARY}"
 echo "  logs        : ${LOG_DIR}"
+cat "${SUMMARY}"

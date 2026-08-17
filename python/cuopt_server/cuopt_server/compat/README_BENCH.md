@@ -3,7 +3,14 @@
 Experimental `cuopt_server.compat` package: legacy JSON validation/convert,
 thin HTTP→gRPC shim, and timed e2e compare (legacy / shim / client-direct).
 
-**Not intended for upstream PR.** Keep on a personal fork branch
+**Not intended for upstream PR.**
+
+On a single GPU with large instances, the harness runs each path in
+`ORDER` **sequentially** (start servers → N iterations → tear down / free
+GPU → next path). Legacy HTTP and gRPC both need a large RMM pool and
+cannot share an ~8 GiB GPU concurrently.
+
+ Keep on a personal fork branch
 (`feature/http-grpc-shim` on `github.com/tmckayus/cuopt`).
 
 ## Prerequisites
