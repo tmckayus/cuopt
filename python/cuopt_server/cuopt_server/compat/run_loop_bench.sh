@@ -22,6 +22,9 @@
 #   OUT_DIR=./bench_out
 #   COOLDOWN=2
 #   POLL_TIMEOUT=600
+#   WARMUP=1                 # untimed successful run before timed loop
+#   WARMUP_MAX_ATTEMPTS=10
+#   MAX_FAIL_RETRIES=10      # extra failed timed attempts before giving up
 
 set -euo pipefail
 
@@ -39,6 +42,9 @@ SHIM_PORT="${SHIM_PORT:-18602}"
 OUT_DIR="${OUT_DIR:-./bench_out}"
 COOLDOWN="${COOLDOWN:-2}"
 POLL_TIMEOUT="${POLL_TIMEOUT:-600}"
+WARMUP="${WARMUP:-1}"
+WARMUP_MAX_ATTEMPTS="${WARMUP_MAX_ATTEMPTS:-10}"
+MAX_FAIL_RETRIES="${MAX_FAIL_RETRIES:-10}"
 
 LEGACY_URL="http://127.0.0.1:${LEGACY_PORT}"
 SHIM_URL="http://127.0.0.1:${SHIM_PORT}"
@@ -140,10 +146,17 @@ run_path_loop() {
     --iterations "${ITERATIONS}"
     --cooldown "${COOLDOWN}"
     --poll-timeout "${POLL_TIMEOUT}"
+    --warmup-max-attempts "${WARMUP_MAX_ATTEMPTS}"
+    --max-fail-retries "${MAX_FAIL_RETRIES}"
     --order "${path}"
     --csv "${tmp_csv}"
     --csv-summary "${tmp_sum}"
   )
+  if [[ "${WARMUP}" == "0" || "${WARMUP}" == "false" || "${WARMUP}" == "no" ]]; then
+    args+=(--no-warmup)
+  else
+    args+=(--warmup)
+  fi
   case "${path}" in
     legacy)
       args+=(--legacy-url "${LEGACY_URL}")
@@ -159,11 +172,10 @@ run_path_loop() {
       return 1
       ;;
   esac
-  echo "===== path=${path} iterations=${ITERATIONS} ====="
+  echo "===== path=${path} iterations=${ITERATIONS} warmup=${WARMUP} ====="
   python -m cuopt_server.compat.compare_e2e_solve "${args[@]}" \
     | tee -a "${LOG_DIR}/compare.log"
 }
-
 merge_csvs() {
   python - "${CSV}" "${SUMMARY}" "${LOG_DIR}" <<'PY'
 import csv, sys

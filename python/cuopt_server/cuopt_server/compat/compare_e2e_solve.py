@@ -22,12 +22,16 @@ Example (loop + CSV)::
 
   python -m cuopt_server.compat.compare_e2e_solve \\
     --msgpack-file /path/to/L2CTA3D.numpy.msgpack \\
-    --time-limit 30 --iterations 5 \\
+    --time-limit 30 --iterations 5 --warmup \\
     --legacy-url http://127.0.0.1:18600 \\
     --shim-url http://127.0.0.1:18602 \\
     --grpc-host 127.0.0.1 --grpc-port 18601 \\
     --order legacy,shim,client \\
     --csv /tmp/e2e_runs.csv --csv-summary /tmp/e2e_avg.csv
+
+Warmup (default on) runs until the first successful solve per path and is
+not recorded. Timed iterations then collect ``--iterations`` successful
+runs; failures are retried and omitted from the CSV.
 """
 
 from __future__ import annotations
@@ -141,6 +145,14 @@ def _poll_shim(
         if status == 200 and "solution" in last:
             break
         if status >= 400 and status != 202:
+            # FastAPI errors use {"detail": "..."}; normalize for ok checks.
+            if (
+                isinstance(last, dict)
+                and "error" not in last
+                and "detail" in last
+            ):
+                last = dict(last)
+                last["error"] = last["detail"]
             break
         time.sleep(0.25)
     return last, (time.perf_counter() - t0) * 1000.0
@@ -168,7 +180,19 @@ def _extract_shim_summary(result: Dict[str, Any]) -> Dict[str, Any]:
     out["primal_objective"] = sol.get("primal_objective")
     if "error" in result:
         out["error"] = result["error"]
+    elif "detail" in result and out.get("primal_objective") is None:
+        out["error"] = result["detail"]
     return out
+
+
+def is_success(result: Dict[str, Any]) -> bool:
+    """True only when the run produced a usable primal objective."""
+    if not result.get("ok"):
+        return False
+    summary = result.get("summary") or {}
+    if summary.get("error") or summary.get("parse_error"):
+        return False
+    return summary.get("primal_objective") is not None
 
 
 def run_path(
@@ -237,9 +261,15 @@ def run_path(
         except Exception as exc:
             print(f"  delete warning: {exc}")
 
+    ok = (
+        status < 400
+        and "error" not in summary
+        and "parse_error" not in summary
+        and summary.get("primal_objective") is not None
+    )
     return {
         "name": name,
-        "ok": "error" not in summary and status < 400,
+        "ok": ok,
         "req_id": req_id,
         "post_ms": post_ms,
         "poll_ms": poll_ms,
@@ -312,7 +342,10 @@ def run_grpc_client_direct(
 
     return {
         "name": "client-direct",
-        "ok": "error" not in summary,
+        "ok": (
+            "error" not in summary
+            and summary.get("primal_objective") is not None
+        ),
         "req_id": job_id,
         "post_ms": timings.get("convert_ms", 0.0)
         + timings.get("submit_ms", 0.0),
@@ -397,7 +430,8 @@ def write_summary_csv(path: str, rows: List[Dict[str, Any]]) -> None:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for pname, prows in by_path.items():
-            ok_rows = [r for r in prows if r.get("ok")]
+            # CSV only contains successful runs; keep ok_n for compatibility.
+            ok_rows = [r for r in prows if r.get("ok", True)]
             totals = [
                 float(r["total_wall_ms"]) / 1000.0
                 for r in ok_rows
@@ -425,7 +459,7 @@ def write_summary_csv(path: str, rows: List[Dict[str, Any]]) -> None:
             w.writerow(
                 {
                     "path": pname,
-                    "n": len(prows),
+                    "n": len(ok_rows),
                     "ok_n": len(ok_rows),
                     "mean_total_s": _mean(totals),
                     "stdev_total_s": _stdev(totals),
@@ -588,7 +622,26 @@ def main(argv: Optional[list] = None) -> int:
         "--iterations",
         type=int,
         default=1,
-        help="Repeat the full --order sequence this many times",
+        help="Number of successful timed runs to record per path in --order",
+    )
+    p.add_argument(
+        "--warmup",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run untimed warmup until first success before timed iterations "
+        "(default: on)",
+    )
+    p.add_argument(
+        "--warmup-max-attempts",
+        type=int,
+        default=10,
+        help="Max attempts to obtain a successful warmup run",
+    )
+    p.add_argument(
+        "--max-fail-retries",
+        type=int,
+        default=10,
+        help="Extra failed timed attempts allowed before giving up on a path",
     )
     p.add_argument(
         "--cooldown",
@@ -640,14 +693,74 @@ def main(argv: Optional[list] = None) -> int:
         )
 
     all_rows: List[Dict[str, Any]] = []
-    for it in range(1, args.iterations + 1):
-        print(f"\n########## iteration {it}/{args.iterations} ##########")
-        results = _run_one_order(order, data=data, body=body, args=args)
-        _print_comparison(results)
-        for r in results:
-            all_rows.append(flatten_result(r, it))
+    for path_name in order:
+        print(f"\n########## path={path_name} ##########")
+        if args.warmup:
+            warmed = False
+            for w_attempt in range(1, args.warmup_max_attempts + 1):
+                print(
+                    f"\n--- warmup {path_name} "
+                    f"attempt {w_attempt}/{args.warmup_max_attempts} "
+                    f"(not timed) ---"
+                )
+                results = _run_one_order(
+                    [path_name], data=data, body=body, args=args
+                )
+                _print_comparison(results)
+                if results and is_success(results[0]):
+                    print(
+                        f"  warmup OK for {path_name} — "
+                        "discarding timings, starting timed loop"
+                    )
+                    warmed = True
+                    if args.cooldown > 0:
+                        time.sleep(args.cooldown)
+                    break
+                print(f"  warmup FAILED for {path_name} — retrying")
+                if args.cooldown > 0:
+                    time.sleep(args.cooldown)
+            if not warmed:
+                print(
+                    f"ERROR: warmup never succeeded for {path_name} "
+                    f"after {args.warmup_max_attempts} attempts; skipping"
+                )
+                continue
+
+        recorded = 0
+        failures = 0
+        attempt = 0
+        max_attempts = args.iterations + args.max_fail_retries
+        while recorded < args.iterations and attempt < max_attempts:
+            attempt += 1
+            print(
+                f"\n########## timed {path_name} "
+                f"{recorded + 1}/{args.iterations} "
+                f"(attempt {attempt}) ##########"
+            )
+            results = _run_one_order(
+                [path_name], data=data, body=body, args=args
+            )
+            _print_comparison(results)
+            if not results:
+                failures += 1
+                continue
+            r = results[0]
+            if is_success(r):
+                recorded += 1
+                all_rows.append(flatten_result(r, recorded))
+                print(f"  recorded timed run {recorded}/{args.iterations}")
+            else:
+                failures += 1
+                print("  FAILED — not recorded")
             if args.cooldown > 0:
                 time.sleep(args.cooldown)
+
+        if recorded < args.iterations:
+            print(
+                f"WARNING: only recorded {recorded}/{args.iterations} "
+                f"successful timed runs for {path_name} "
+                f"({failures} failures)"
+            )
 
     _print_averages(all_rows)
 
