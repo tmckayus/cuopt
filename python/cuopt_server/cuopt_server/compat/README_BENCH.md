@@ -10,6 +10,10 @@ On a single GPU with large instances, the harness runs each path in
 GPU → next path). Legacy HTTP and gRPC both need a large RMM pool and
 cannot share an ~8 GiB GPU concurrently.
 
+Each path does an **untimed warmup** until the first successful solve, then
+records only successful timed iterations (failures are retried / skipped,
+not written to CSV).
+
  Keep on a personal fork branch
 (`feature/http-grpc-shim` on `github.com/tmckayus/cuopt`).
 
@@ -52,6 +56,7 @@ export CUOPT_GIGABYTES_PER_PROC=6
 export MAX_MESSAGE_MB=1024
 export OUT_DIR="$(pwd)/bench_out"
 export COOLDOWN=2
+export WARMUP=1   # untimed successful run first; set 0 to disable
 
 # --- run (starts servers, loops, writes CSV, tears down) ---
 chmod +x python/cuopt_server/cuopt_server/compat/run_loop_bench.sh
@@ -60,8 +65,8 @@ python/cuopt_server/cuopt_server/compat/run_loop_bench.sh
 
 Outputs under `OUT_DIR`:
 
-- `e2e_runs_<stamp>.csv` — one row per path per iteration
-- `e2e_avg_<stamp>.csv` — mean/stdev per path (successful runs only)
+- `e2e_runs_<stamp>.csv` — one row per **successful** timed iteration
+- `e2e_avg_<stamp>.csv` — mean/stdev per path
 - `logs_<stamp>/` — legacy / grpc / shim / compare logs
 
 ## Client-only (no HTTP servers)
