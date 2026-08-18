@@ -26,13 +26,15 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
 from cuopt.grpc.linear_programming import Client, GrpcError, JobStatus
 
 from cuopt_server.compat.codec import (
     decode_request_body,
+    encode_payload,
+    normalize_content_type,
     unwrap_managed_envelope,
 )
 from cuopt_server.compat.convert import lp_data_to_datamodel, parse_lp_data
@@ -41,7 +43,12 @@ from cuopt_server.compat.validate import (
     LegacyJsonValidationError,
     validate_lp_data,
 )
-from cuopt_server.utils.job_queue import check_client_version
+from cuopt_server.utils.job_queue import (
+    check_client_version,
+    mime_json,
+    mime_msgpack,
+    mime_zlib,
+)
 
 _MAX_TRACKED_JOBS = 4096
 
@@ -191,13 +198,59 @@ def create_app(
             raise HTTPException(404, f"job {job_id} does not exist")
         return _LEGACY_STATUS.get(status, status.name.lower())
 
+    def _response_content_type(accept: Optional[str]) -> str:
+        """Pick JSON or msgpack from Accept (legacy-style preference)."""
+        if not accept:
+            return mime_json
+        # First matching type wins; ignore q-values for the bench/shim.
+        for part in accept.split(","):
+            ctype = normalize_content_type(part.strip().split(";", 1)[0])
+            if ctype in (mime_msgpack, mime_json, mime_zlib):
+                return ctype
+            if ctype in ("*/*", "application/*"):
+                return mime_json
+        return mime_json
+
+    def _encode_body(
+        data: dict,
+        *,
+        accept: Optional[str],
+        timings: bool,
+        stage_ms: Optional[dict[str, float]] = None,
+        t0: Optional[float] = None,
+    ) -> Response | dict:
+        """Encode ``data`` per Accept; optional timings stay in a header."""
+        ctype = _response_content_type(accept)
+        # Fast path: let FastAPI JSON-encode when the client wants JSON and
+        # we are not measuring encode cost / size.
+        if not timings and ctype == mime_json:
+            return data
+
+        t_enc = time.perf_counter()
+        raw, media = encode_payload(data, ctype)
+        enc_ms = (time.perf_counter() - t_enc) * 1000.0
+        headers: dict[str, str] = {}
+        if timings and stage_ms is not None:
+            stage_ms["encode_ms"] = enc_ms
+            # Alias kept for older CSV consumers.
+            stage_ms["json_encode_ms"] = enc_ms
+            stage_ms["response_bytes"] = float(len(raw))
+            if t0 is not None:
+                stage_ms["total_ms"] = (time.perf_counter() - t0) * 1000.0
+            headers["X-Cuopt-Timings"] = json.dumps(stage_ms)
+        return Response(content=raw, media_type=media, headers=headers)
+
     @app.get("/cuopt/solution/{job_id}")
-    def get_solution(job_id: str, timings: bool = False):
+    def get_solution(
+        job_id: str,
+        timings: bool = False,
+        accept: Optional[str] = Header(default=None, alias="Accept"),
+    ):
         """Full legacy solution envelope (or ``{"reqId"}`` while pending).
 
-        Pass ``?timings=1`` to get stage timings in the ``X-Cuopt-Timings``
-        header (JSON). Timings are kept out of the body so the response
-        stays legacy-shaped and we avoid a second encode of a large payload.
+        Honors ``Accept: application/vnd.msgpack`` (or JSON). Pass
+        ``?timings=1`` for stage timings in ``X-Cuopt-Timings`` (JSON header);
+        timings stay out of the body so encode is a single pass.
         """
         stage_ms: dict[str, float] = {}
         t0 = time.perf_counter()
@@ -207,7 +260,9 @@ def create_app(
             stage_ms["status_ms"] = (time.perf_counter() - t_status) * 1000.0
             if status in (JobStatus.QUEUED, JobStatus.PROCESSING):
                 # Legacy polls with HTTP 200 and body {"reqId": ...} only.
-                return {"reqId": job_id}
+                return _encode_body(
+                    {"reqId": job_id}, accept=accept, timings=False
+                )
             if status == JobStatus.NOT_FOUND:
                 raise HTTPException(404, f"job {job_id} does not exist")
             if status in (JobStatus.FAILED, JobStatus.CANCELLED):
@@ -223,7 +278,9 @@ def create_app(
             raise HTTPException(502, str(exc)) from exc
 
         if sol is None:
-            return {"reqId": job_id}
+            return _encode_body(
+                {"reqId": job_id}, accept=accept, timings=False
+            )
 
         try:
             total_solve_time = float(sol.get_solve_time())
@@ -239,19 +296,12 @@ def create_app(
         )
         stage_ms["map_ms"] = (time.perf_counter() - t_map) * 1000.0
 
-        if not timings:
-            return envelope
-
-        # Encode once so we can report both wall time and payload size.
-        t_enc = time.perf_counter()
-        raw = json.dumps(envelope).encode("utf-8")
-        stage_ms["json_encode_ms"] = (time.perf_counter() - t_enc) * 1000.0
-        stage_ms["response_bytes"] = float(len(raw))
-        stage_ms["total_ms"] = (time.perf_counter() - t0) * 1000.0
-        return Response(
-            content=raw,
-            media_type="application/json",
-            headers={"X-Cuopt-Timings": json.dumps(stage_ms)},
+        return _encode_body(
+            envelope,
+            accept=accept,
+            timings=timings,
+            stage_ms=stage_ms,
+            t0=t0,
         )
 
     def _delete_job(job_id: str):
