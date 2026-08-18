@@ -1,22 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-r"""End-to-end solve comparison: legacy HTTP vs HTTP shim+gRPC vs direct gRPC client.
+r"""End-to-end solve comparison: legacy HTTP vs HTTP shim+gRPC vs direct gRPC.
 
 Measures wall time until a solution (or error) is available. Supports a timed
 loop with per-run and average CSVs.
 
 Paths:
-  legacy  — POST msgpack to cuopt_server, poll /cuopt/solution
-  shim    — POST msgpack to thin HTTP shim → gRPC, poll /cuopt/solution
-  client  — in-process msgpack/dict → DataModel → Client.submit/wait/result
-            (no HTTP)
+  legacy       — POST msgpack to cuopt_server, poll /cuopt/solution
+  shim         — POST msgpack to thin HTTP shim → gRPC, poll /cuopt/solution
+  client /
+  client-native — msgpack/dict → DataModel → Client.submit/wait/result
+                  (native gRPC; no problem JSON, no result JSON)
+  client-json  — JSON text → parse → DataModel → gRPC → legacy JSON result
+                  (approximates a cuopt_sh-style JSON in / JSON out client)
 
 Example (single pass)::
 
   python -m cuopt_server.compat.compare_e2e_solve \\
     --msgpack-file /path/to/L2CTA3D.numpy.msgpack \\
-    --time-limit 30 --order client --grpc-port 18601
+    --time-limit 30 --order client-native --grpc-port 18601
 
 Example (loop + CSV)::
 
@@ -26,7 +29,7 @@ Example (loop + CSV)::
     --legacy-url http://127.0.0.1:18600 \\
     --shim-url http://127.0.0.1:18602 \\
     --grpc-host 127.0.0.1 --grpc-port 18601 \\
-    --order legacy,shim,client \\
+    --order legacy,shim,client-native,client-json \\
     --csv /tmp/e2e_runs.csv --csv-summary /tmp/e2e_avg.csv
 
 Warmup (default on) runs until the first successful solve per path and is
@@ -351,6 +354,36 @@ def run_path(
     }
 
 
+def _jsonable(obj: Any) -> Any:
+    """Convert numpy arrays (and nested structures) into JSON-serializable form."""
+    if hasattr(obj, "tolist"):
+        return obj.tolist()
+    if isinstance(obj, dict):
+        return {k: _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(x) for x in obj]
+    return obj
+
+
+def _encode_problem_json(payload: Dict[str, Any]) -> bytes:
+    return json.dumps(_jsonable(payload)).encode("utf-8")
+
+
+def _estimate_problem_json_bytes(payload: Dict[str, Any]) -> int:
+    """Rough upper bound for JSON text size (avoids OOMing huge LPs)."""
+    try:
+        nnz = len(payload["csr_constraint_matrix"]["values"])
+        ncols = len(payload["objective_data"]["coefficients"])
+        nrows = len(payload["csr_constraint_matrix"]["offsets"]) - 1
+    except Exception:
+        return 0
+    # ~20 ASCII bytes per numeric token is typical for float JSON text.
+    return int((nnz * 3 + ncols + nrows) * 20)
+
+
+_MAX_PROBLEM_JSON_BYTES = 1_500_000_000  # ~1.5 GiB; skip encode past this
+
+
 def run_grpc_client_direct(
     payload: Dict[str, Any],
     *,
@@ -359,12 +392,17 @@ def run_grpc_client_direct(
     poll_timeout_s: float,
     delete: bool,
     validate: bool = False,
+    name: str = "client-native",
 ) -> Dict[str, Any]:
-    """Client-side convert → gRPC Client.submit/wait/result (no HTTP)."""
+    """Native gRPC path: in-memory dict → DataModel → submit/wait/result.
+
+    Does **not** encode the problem or solution as JSON. Use
+    :func:`run_grpc_client_json` for a cuopt_sh-style JSON round-trip.
+    """
     from cuopt.grpc.linear_programming import Client, JobStatus
     from cuopt_server.compat.convert import json_to_datamodel
 
-    print(f"\n=== client-direct (gRPC {grpc_host}:{grpc_port}) ===")
+    print(f"\n=== {name} (gRPC {grpc_host}:{grpc_port}) ===")
     try:
         client = Client(grpc_host, grpc_port, tls=False)
     except TypeError:
@@ -413,7 +451,7 @@ def run_grpc_client_direct(
             print(f"  delete warning: {exc}")
 
     return {
-        "name": "client-direct",
+        "name": name,
         "ok": (
             "error" not in summary
             and summary.get("primal_objective") is not None
@@ -424,6 +462,163 @@ def run_grpc_client_direct(
         "poll_ms": timings.get("wait_ms", 0.0) + timings.get("result_ms", 0.0),
         "total_wall_ms": total_ms,
         "server_timings_ms": timings,
+        "get_timings_ms": {},
+        "summary": summary,
+    }
+
+
+def run_grpc_client_json(
+    payload: Dict[str, Any],
+    *,
+    json_body: Optional[bytes],
+    grpc_host: str,
+    grpc_port: int,
+    poll_timeout_s: float,
+    delete: bool,
+    validate: bool = False,
+) -> Dict[str, Any]:
+    """JSON→gRPC→JSON path approximating a cuopt_sh-style client.
+
+    If ``json_body`` is provided, each iteration times ``json.loads`` then
+    convert. Otherwise starts from the in-memory dict (problem JSON skipped
+    because it would be huge) and still times result map + ``json.dumps``.
+
+    Stages timed into ``total_wall_ms``:
+      [decode JSON] → convert → submit → wait → result → map → json.dumps
+    """
+    from cuopt.grpc.linear_programming import Client, JobStatus
+    from cuopt_server.compat.convert import json_to_datamodel
+    from cuopt_server.compat.response import solution_to_legacy_response
+
+    name = "client-json"
+    print(f"\n=== {name} (gRPC {grpc_host}:{grpc_port}) ===")
+    if json_body is not None:
+        print(
+            f"  problem JSON size={len(json_body) / (1024 * 1024):.1f} MiB "
+            "(pre-encoded once; decode timed per iteration)"
+        )
+    else:
+        print(
+            "  problem JSON skipped (too large); starting from in-memory "
+            "dict after msgpack load — result still mapped+encoded to JSON"
+        )
+    try:
+        client = Client(grpc_host, grpc_port, tls=False)
+    except TypeError:
+        client = Client(grpc_host, grpc_port)
+
+    timings: Dict[str, float] = {}
+    t_all = time.perf_counter()
+
+    if json_body is not None:
+        t_dec = time.perf_counter()
+        problem = json.loads(json_body.decode("utf-8"))
+        timings["decode_ms"] = (time.perf_counter() - t_dec) * 1000.0
+        print(f"  decode_ms={timings['decode_ms']:.1f}")
+    else:
+        problem = payload
+        timings["decode_ms"] = 0.0
+
+    t0 = time.perf_counter()
+    data_model, settings = json_to_datamodel(problem, validate=validate)
+    timings["convert_ms"] = (time.perf_counter() - t0) * 1000.0
+    print(f"  convert_ms={timings['convert_ms']:.1f} (validate={validate})")
+
+    t1 = time.perf_counter()
+    job_id = client.submit(data_model, settings)
+    timings["submit_ms"] = (time.perf_counter() - t1) * 1000.0
+    print(f"  submit_ms={timings['submit_ms']:.1f}  job_id={job_id}")
+
+    t2 = time.perf_counter()
+    status = client.wait(job_id, timeout=poll_timeout_s)
+    timings["wait_ms"] = (time.perf_counter() - t2) * 1000.0
+    print(f"  wait_ms={timings['wait_ms']:.1f}  status={status}")
+
+    summary: Dict[str, Any] = {"status": getattr(status, "name", str(status))}
+    if status == JobStatus.COMPLETED:
+        t3 = time.perf_counter()
+        sol = client.result(job_id)
+        timings["result_ms"] = (time.perf_counter() - t3) * 1000.0
+        print(f"  result_ms={timings['result_ms']:.1f}")
+
+        try:
+            total_solve_time = float(sol.get_solve_time())
+        except Exception:
+            total_solve_time = 0.0
+
+        t_map = time.perf_counter()
+        envelope = solution_to_legacy_response(
+            sol, req_id=job_id, total_solve_time=total_solve_time
+        )
+        timings["map_ms"] = (time.perf_counter() - t_map) * 1000.0
+
+        t_enc = time.perf_counter()
+        raw_out = json.dumps(envelope).encode("utf-8")
+        timings["json_encode_ms"] = (time.perf_counter() - t_enc) * 1000.0
+        timings["response_bytes"] = float(len(raw_out))
+
+        try:
+            summary["primal_objective"] = envelope["response"][
+                "solver_response"
+            ]["solution"].get("primal_objective")
+            summary["status"] = envelope["response"]["solver_response"].get(
+                "status", summary["status"]
+            )
+            summary["solver_time"] = envelope["response"]["solver_response"][
+                "solution"
+            ].get("solver_time")
+        except Exception:
+            try:
+                summary["primal_objective"] = float(sol.get_primal_objective())
+            except Exception:
+                summary["primal_objective"] = None
+
+        print(
+            f"  map_ms={timings['map_ms']:.1f}  "
+            f"json_encode_ms={timings['json_encode_ms']:.1f}  "
+            f"response_bytes="
+            f"{timings['response_bytes'] / (1024 * 1024):.1f} MiB"
+        )
+    elif status in (JobStatus.FAILED, JobStatus.CANCELLED):
+        summary["error"] = f"job ended with {status.name}"
+
+    total_ms = (time.perf_counter() - t_all) * 1000.0
+    print(f"  total_wall_ms={total_ms:.0f}")
+    print(f"  summary={summary}")
+    print(f"  timings={timings}")
+
+    if delete:
+        try:
+            client.delete(job_id)
+        except Exception as exc:
+            print(f"  delete warning: {exc}")
+
+    return {
+        "name": name,
+        "ok": (
+            "error" not in summary
+            and summary.get("primal_objective") is not None
+        ),
+        "req_id": job_id,
+        "post_ms": (
+            timings.get("decode_ms", 0.0)
+            + timings.get("convert_ms", 0.0)
+            + timings.get("submit_ms", 0.0)
+        ),
+        "poll_ms": (
+            timings.get("wait_ms", 0.0)
+            + timings.get("result_ms", 0.0)
+            + timings.get("map_ms", 0.0)
+            + timings.get("json_encode_ms", 0.0)
+        ),
+        "total_wall_ms": total_ms,
+        "server_timings_ms": timings,
+        "get_timings_ms": {
+            "map_ms": timings.get("map_ms"),
+            "json_encode_ms": timings.get("json_encode_ms"),
+            "response_bytes": timings.get("response_bytes"),
+            "result_ms": timings.get("result_ms"),
+        },
         "summary": summary,
     }
 
@@ -442,10 +637,20 @@ def flatten_result(result: Dict[str, Any], iteration: int) -> Dict[str, Any]:
     if wait_ms is None:
         wait_ms = result.get("poll_ms")
 
-    # Prefer client-direct result_ms; fall back to shim GET grpc result.
+    # Prefer client result_ms; fall back to shim GET grpc result.
     result_ms = st.get("result_ms")
     if result_ms is None:
         result_ms = gt.get("result_ms")
+
+    map_ms = gt.get("map_ms")
+    if map_ms is None:
+        map_ms = st.get("map_ms")
+    json_encode_ms = gt.get("json_encode_ms")
+    if json_encode_ms is None:
+        json_encode_ms = st.get("json_encode_ms")
+    response_bytes = gt.get("response_bytes")
+    if response_bytes is None:
+        response_bytes = st.get("response_bytes")
 
     return {
         "iteration": iteration,
@@ -462,9 +667,9 @@ def flatten_result(result: Dict[str, Any], iteration: int) -> Dict[str, Any]:
         "get_wall_ms": gt.get("get_wall_ms"),
         "grpc_status_ms": gt.get("status_ms"),
         "grpc_result_ms": gt.get("result_ms"),
-        "map_ms": gt.get("map_ms"),
-        "json_encode_ms": gt.get("json_encode_ms"),
-        "response_bytes": gt.get("response_bytes"),
+        "map_ms": map_ms,
+        "json_encode_ms": json_encode_ms,
+        "response_bytes": response_bytes,
         "total_wall_ms": result.get("total_wall_ms"),
         "primal_objective": summary.get("primal_objective"),
         "status": summary.get("status"),
@@ -582,6 +787,8 @@ def _print_comparison(results: List[Dict[str, Any]]) -> None:
         notes = ""
         st = r.get("server_timings_ms") or {}
         gt = r.get("get_timings_ms") or {}
+        if "decode_ms" in st:
+            notes += f" decode_ms={st['decode_ms']:.0f}"
         if "convert_ms" in st:
             notes += f" convert_ms={st['convert_ms']:.0f}"
         if "submit_ms" in st:
@@ -590,16 +797,17 @@ def _print_comparison(results: List[Dict[str, Any]]) -> None:
             notes += f" wait_ms={st['wait_ms']:.0f}"
         if "result_ms" in st:
             notes += f" result_ms={st['result_ms']:.0f}"
-        if gt.get("result_ms") is not None:
+        if gt.get("result_ms") is not None and "result_ms" not in st:
             notes += f" grpc_result_ms={gt['result_ms']:.0f}"
-        if gt.get("map_ms") is not None:
-            notes += f" map_ms={gt['map_ms']:.0f}"
-        if gt.get("json_encode_ms") is not None:
-            notes += f" json_encode_ms={gt['json_encode_ms']:.0f}"
-        if gt.get("response_bytes") is not None:
-            notes += (
-                f" resp_MiB={float(gt['response_bytes']) / (1024 * 1024):.1f}"
-            )
+        map_ms = gt.get("map_ms", st.get("map_ms"))
+        if map_ms is not None:
+            notes += f" map_ms={map_ms:.0f}"
+        json_encode_ms = gt.get("json_encode_ms", st.get("json_encode_ms"))
+        if json_encode_ms is not None:
+            notes += f" json_encode_ms={json_encode_ms:.0f}"
+        response_bytes = gt.get("response_bytes", st.get("response_bytes"))
+        if response_bytes is not None:
+            notes += f" resp_MiB={float(response_bytes) / (1024 * 1024):.1f}"
         s = r.get("summary") or {}
         if s.get("solver_time") is not None:
             notes += f" solver_time={s['solver_time']}"
@@ -651,6 +859,7 @@ def _run_one_order(
     *,
     data: Dict[str, Any],
     body: bytes,
+    json_body: bytes,
     args: argparse.Namespace,
 ) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
@@ -683,13 +892,29 @@ def _run_one_order(
                     delete=not args.no_delete,
                 )
             )
-        elif name == "client":
+        elif name in ("client", "client-native", "client-direct"):
             if not args.grpc_port:
-                print("skip client (no --grpc-port)")
+                print(f"skip {name} (no --grpc-port)")
                 continue
             results.append(
                 run_grpc_client_direct(
                     data,
+                    grpc_host=args.grpc_host,
+                    grpc_port=args.grpc_port,
+                    poll_timeout_s=args.poll_timeout,
+                    delete=not args.no_delete,
+                    validate=args.validate_client,
+                    name="client-native",
+                )
+            )
+        elif name == "client-json":
+            if not args.grpc_port:
+                print("skip client-json (no --grpc-port)")
+                continue
+            results.append(
+                run_grpc_client_json(
+                    data,
+                    json_body=json_body if json_body else None,
                     grpc_host=args.grpc_host,
                     grpc_port=args.grpc_port,
                     poll_timeout_s=args.poll_timeout,
@@ -718,12 +943,15 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument(
         "--validate-client",
         action="store_true",
-        help="Run semantic validation on client-direct path (off by default)",
+        help="Run semantic validation on gRPC client paths (off by default)",
     )
     p.add_argument(
         "--order",
-        default="legacy,shim,client",
-        help="Comma list: legacy,shim,client",
+        default="legacy,shim,client-native",
+        help=(
+            "Comma list: legacy,shim,client-native|client,client-json "
+            "(client and client-direct are aliases of client-native)"
+        ),
     )
     p.add_argument(
         "--iterations",
@@ -789,7 +1017,9 @@ def main(argv: Optional[list] = None) -> int:
 
     order = [x.strip() for x in args.order.split(",") if x.strip()]
     need_http_body = any(x in ("legacy", "shim") for x in order)
+    need_json_body = any(x == "client-json" for x in order)
     body = b""
+    json_body = b""
     if need_http_body:
         print(f"Re-encoding msgpack with time_limit={args.time_limit}s ...")
         t0 = time.perf_counter()
@@ -798,6 +1028,25 @@ def main(argv: Optional[list] = None) -> int:
             f"  encoded {len(body) / (1024**2):.1f} MiB in "
             f"{(time.perf_counter() - t0) * 1000:.0f} ms"
         )
+    if need_json_body:
+        est = _estimate_problem_json_bytes(data)
+        print(f"client-json problem JSON estimate ≈ {est / (1024**2):.1f} MiB")
+        if est > _MAX_PROBLEM_JSON_BYTES:
+            print(
+                "  skipping problem JSON encode/decode "
+                f"(estimate exceeds {_MAX_PROBLEM_JSON_BYTES / (1024**2):.0f} MiB); "
+                "result→JSON still timed"
+            )
+            json_body = b""
+        else:
+            print("Encoding problem JSON for client-json path ...")
+            t0 = time.perf_counter()
+            json_body = _encode_problem_json(data)
+            print(
+                f"  encoded {len(json_body) / (1024**2):.1f} MiB in "
+                f"{(time.perf_counter() - t0) * 1000:.0f} ms "
+                "(encode cost excluded from timed iterations)"
+            )
 
     all_rows: List[Dict[str, Any]] = []
     for path_name in order:
@@ -811,7 +1060,11 @@ def main(argv: Optional[list] = None) -> int:
                     f"(not timed) ---"
                 )
                 results = _run_one_order(
-                    [path_name], data=data, body=body, args=args
+                    [path_name],
+                    data=data,
+                    body=body,
+                    json_body=json_body,
+                    args=args,
                 )
                 _print_comparison(results)
                 if results and is_success(results[0]):
@@ -845,7 +1098,11 @@ def main(argv: Optional[list] = None) -> int:
                 f"(attempt {attempt}) ##########"
             )
             results = _run_one_order(
-                [path_name], data=data, body=body, args=args
+                [path_name],
+                data=data,
+                body=body,
+                json_body=json_body,
+                args=args,
             )
             _print_comparison(results)
             if not results:

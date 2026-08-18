@@ -15,7 +15,8 @@
 # Optional env (defaults shown):
 #   ITERATIONS=5
 #   TIME_LIMIT=30
-#   ORDER=legacy,shim,client
+#   ORDER=legacy,shim,client-native
+#     also: client (=client-native), client-json (JSON in/out via gRPC)
 #   CUOPT_GIGABYTES_PER_PROC=6
 #   MAX_MESSAGE_MB=1024
 #   LEGACY_PORT=18600 GRPC_PORT=18601 SHIM_PORT=18602
@@ -33,7 +34,7 @@ export PYTHONUNBUFFERED=1
 MSGPACK_FILE="${MSGPACK_FILE:?Set MSGPACK_FILE to the numpy msgpack LP path}"
 ITERATIONS="${ITERATIONS:-5}"
 TIME_LIMIT="${TIME_LIMIT:-30}"
-ORDER="${ORDER:-legacy,shim,client}"
+ORDER="${ORDER:-legacy,shim,client-native}"
 CUOPT_GIGABYTES_PER_PROC="${CUOPT_GIGABYTES_PER_PROC:-6}"
 MAX_MESSAGE_MB="${MAX_MESSAGE_MB:-1024}"
 LEGACY_PORT="${LEGACY_PORT:-18600}"
@@ -138,6 +139,9 @@ start_shim() {
 
 run_path_loop() {
   local path="$1"
+  case "${path}" in
+    client|client-direct) path="client-native" ;;
+  esac
   local tmp_csv="${LOG_DIR}/runs_${path}.csv"
   local tmp_sum="${LOG_DIR}/avg_${path}.csv"
   local args=(
@@ -164,7 +168,7 @@ run_path_loop() {
     shim)
       args+=(--shim-url "${SHIM_URL}" --grpc-host 127.0.0.1 --grpc-port "${GRPC_PORT}")
       ;;
-    client)
+    client-native|client-json)
       args+=(--grpc-host 127.0.0.1 --grpc-port "${GRPC_PORT}")
       ;;
     *)
@@ -263,9 +267,13 @@ for raw in "${_ORDER_PARTS[@]}"; do
       start_shim
       run_path_loop shim
       ;;
-    client)
+    client|client-native|client-direct)
       start_grpc
-      run_path_loop client
+      run_path_loop client-native
+      ;;
+    client-json)
+      start_grpc
+      run_path_loop client-json
       ;;
     *)
       echo "ERROR: unknown ORDER entry '${path}'" >&2
