@@ -127,7 +127,16 @@ def _poll_legacy(
         status, last, _ = _http("GET", url, timeout=60)
         if status >= 400:
             break
+        # Done: full envelope, or FastAPI error detail.
         if "response" in last or "error" in last:
+            break
+        if (
+            isinstance(last, dict)
+            and "detail" in last
+            and "response" not in last
+        ):
+            last = dict(last)
+            last["error"] = last["detail"]
             break
         time.sleep(0.25)
     return last, (time.perf_counter() - t0) * 1000.0
@@ -136,32 +145,17 @@ def _poll_legacy(
 def _poll_shim(
     base: str, req_id: str, timeout_s: float
 ) -> Tuple[Dict[str, Any], float]:
-    url = f"{base.rstrip('/')}/cuopt/solution/{req_id}"
-    t0 = time.perf_counter()
-    deadline = t0 + timeout_s
-    last: Dict[str, Any] = {}
-    while time.perf_counter() < deadline:
-        status, last, _ = _http("GET", url, timeout=60)
-        if status == 200 and "solution" in last:
-            break
-        if status >= 400 and status != 202:
-            # FastAPI errors use {"detail": "..."}; normalize for ok checks.
-            if (
-                isinstance(last, dict)
-                and "error" not in last
-                and "detail" in last
-            ):
-                last = dict(last)
-                last["error"] = last["detail"]
-            break
-        time.sleep(0.25)
-    return last, (time.perf_counter() - t0) * 1000.0
+    # Shim now returns the same legacy envelope as cuopt_server.
+    return _poll_legacy(base, req_id, timeout_s)
 
 
 def _extract_legacy_summary(result: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     if "error" in result:
         out["error"] = result["error"]
+        return out
+    if "detail" in result and "response" not in result:
+        out["error"] = result["detail"]
         return out
     try:
         sol = result["response"]["solver_response"]["solution"]
@@ -175,14 +169,7 @@ def _extract_legacy_summary(result: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _extract_shim_summary(result: Dict[str, Any]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {"status": result.get("status")}
-    sol = result.get("solution") or {}
-    out["primal_objective"] = sol.get("primal_objective")
-    if "error" in result:
-        out["error"] = result["error"]
-    elif "detail" in result and out.get("primal_objective") is None:
-        out["error"] = result["detail"]
-    return out
+    return _extract_legacy_summary(result)
 
 
 def is_success(result: Dict[str, Any]) -> bool:
@@ -206,6 +193,10 @@ def run_path(
 ) -> Dict[str, Any]:
     print(f"\n=== {name} ({base_url}) ===")
     post_url = f"{base_url.rstrip('/')}/cuopt/request"
+    if mode == "shim":
+        # Shim omits stage timings by default to stay byte-compatible with
+        # clients that treat a lone reqId as "pending".
+        post_url += "?timings=1"
     t_all = time.perf_counter()
     status, post_resp, post_ms = _http(
         "POST",
@@ -249,7 +240,7 @@ def run_path(
     else:
         result, poll_ms = _poll_shim(base_url, req_id, poll_timeout_s)
         summary = _extract_shim_summary(result)
-        del_url = f"{base_url.rstrip('/')}/cuopt/request/{req_id}"
+        del_url = f"{base_url.rstrip('/')}/cuopt/solution/{req_id}"
 
     total_ms = (time.perf_counter() - t_all) * 1000.0
     print(f"  poll_ms={poll_ms:.0f}  total_wall_ms={total_ms:.0f}")
