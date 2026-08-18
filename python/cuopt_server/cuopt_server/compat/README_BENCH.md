@@ -5,6 +5,13 @@ thin HTTP→gRPC shim, and timed e2e compare (legacy / shim / client-direct).
 
 **Not intended for upstream PR.**
 
+The shim speaks the legacy REST shape, so `cuopt_sh` / `CuOptServiceSelfHostClient`
+work against it unchanged: `POST /cuopt/request` returns `{"reqId": ...}`,
+`GET /cuopt/solution/{id}` returns the full `response.solver_response` envelope
+(and a bare `{"reqId"}` while the job is pending). Add `?timings=1` to the POST
+to get server-side stage timings; it is off by default because clients treat a
+single-key `reqId` body as "still pending".
+
 On a single GPU with large instances, the harness runs each path in
 `ORDER` **sequentially** (start servers → N iterations → tear down / free
 GPU → next path). Legacy HTTP and gRPC both need a large RMM pool and

@@ -73,11 +73,19 @@ def lp_data_to_datamodel(
     lp_data: LPData,
     *,
     warmstart_data=None,
-) -> Tuple[DataModel, SolverSettings]:
-    """Convert a normalized :class:`LPData` to ``(DataModel, SolverSettings)``."""
-    _, data_model = create_data_model(lp_data)
-    _, solver_settings = create_solver(lp_data, warmstart_data)
-    return data_model, _coerce_settings_for_grpc(solver_settings)
+    return_warnings: bool = False,
+):
+    """Convert a normalized :class:`LPData` to ``(DataModel, SolverSettings)``.
+
+    With ``return_warnings``, also returns the warning list the legacy server
+    collects while building the data model and solver settings.
+    """
+    dm_warnings, data_model = create_data_model(lp_data)
+    cs_warnings, solver_settings = create_solver(lp_data, warmstart_data)
+    settings = _coerce_settings_for_grpc(solver_settings)
+    if return_warnings:
+        return data_model, settings, [*dm_warnings, *cs_warnings]
+    return data_model, settings
 
 
 def json_to_datamodel(
