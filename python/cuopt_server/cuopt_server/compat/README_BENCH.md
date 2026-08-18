@@ -64,6 +64,8 @@ export ITERATIONS=5
 export TIME_LIMIT=30
 # Paths: legacy | shim | client-native (alias: client) | client-json
 export ORDER=legacy,shim,client-native,client-json
+# Existing legacy problem JSON; client-json runs json.load on every iteration.
+export JSON_FILE=/path/to/L2CTA3D.json
 export CUOPT_GIGABYTES_PER_PROC=6
 export MAX_MESSAGE_MB=1024
 export OUT_DIR="$(pwd)/bench_out"
@@ -92,6 +94,7 @@ sleep 2
 # Native gRPC (no problem/result JSON) and/or JSON round-trip client
 python -m cuopt_server.compat.compare_e2e_solve \
   --msgpack-file "$MSGPACK_FILE" \
+  --json-file "$JSON_FILE" \
   --time-limit 30 \
   --iterations 5 \
   --order client-native,client-json \
@@ -103,9 +106,10 @@ fuser -k 18601/tcp 2>/dev/null || true
 ```
 
 `client-native` is dict→DataModel→gRPC→Solution (no JSON). `client-json`
-adds result→legacy JSON encode (and problem JSON decode when the problem is
-small enough; huge LPs skip problem JSON to avoid OOM and still time the
-result JSON).
+uses `json.load` on `--json-file` for every iteration, converts that mapping
+to `DataModel`, and adds result→legacy JSON encoding. Without `--json-file`,
+small problems use an in-memory JSON body; huge LPs skip problem JSON to avoid
+OOM and still time the result JSON.
 
 ## Manual single-pass compare
 

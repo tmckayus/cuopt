@@ -43,6 +43,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import statistics
 import time
 import urllib.error
@@ -471,6 +472,7 @@ def run_grpc_client_json(
     payload: Dict[str, Any],
     *,
     json_body: Optional[bytes],
+    json_file: str,
     grpc_host: str,
     grpc_port: int,
     poll_timeout_s: float,
@@ -479,9 +481,9 @@ def run_grpc_client_json(
 ) -> Dict[str, Any]:
     """JSON→gRPC→JSON path approximating a cuopt_sh-style client.
 
-    If ``json_body`` is provided, each iteration times ``json.loads`` then
-    convert. Otherwise starts from the in-memory dict (problem JSON skipped
-    because it would be huge) and still times result map + ``json.dumps``.
+    If ``json_file`` is provided, each iteration times ``json.load`` directly
+    from that file. Otherwise, if ``json_body`` is provided, it times
+    ``json.loads``. As a last resort it starts from the in-memory msgpack dict.
 
     Stages timed into ``total_wall_ms``:
       [decode JSON] → convert → submit → wait → result → map → json.dumps
@@ -492,7 +494,9 @@ def run_grpc_client_json(
 
     name = "client-json"
     print(f"\n=== {name} (gRPC {grpc_host}:{grpc_port}) ===")
-    if json_body is not None:
+    if json_file:
+        print(f"  loading problem JSON file each iteration: {json_file}")
+    elif json_body is not None:
         print(
             f"  problem JSON size={len(json_body) / (1024 * 1024):.1f} MiB "
             "(pre-encoded once; decode timed per iteration)"
@@ -510,7 +514,13 @@ def run_grpc_client_json(
     timings: Dict[str, float] = {}
     t_all = time.perf_counter()
 
-    if json_body is not None:
+    if json_file:
+        t_dec = time.perf_counter()
+        with open(json_file, "r", encoding="utf-8") as f:
+            problem = json.load(f)
+        timings["decode_ms"] = (time.perf_counter() - t_dec) * 1000.0
+        print(f"  json.load_ms={timings['decode_ms']:.1f}")
+    elif json_body is not None:
         t_dec = time.perf_counter()
         problem = json.loads(json_body.decode("utf-8"))
         timings["decode_ms"] = (time.perf_counter() - t_dec) * 1000.0
@@ -518,6 +528,16 @@ def run_grpc_client_json(
     else:
         problem = payload
         timings["decode_ms"] = 0.0
+
+    # Apply the same per-run settings used by the msgpack-backed paths.
+    solver_config = problem.get("solver_config") or {}
+    if not isinstance(solver_config, dict):
+        solver_config = {}
+    solver_config = dict(solver_config)
+    solver_config["time_limit"] = payload["solver_config"]["time_limit"]
+    solver_config.setdefault("tolerances", {"optimality": 1e-4})
+    solver_config["log_to_console"] = False
+    problem["solver_config"] = solver_config
 
     t0 = time.perf_counter()
     data_model, settings = json_to_datamodel(problem, validate=validate)
@@ -915,6 +935,7 @@ def _run_one_order(
                 run_grpc_client_json(
                     data,
                     json_body=json_body if json_body else None,
+                    json_file=args.json_file,
                     grpc_host=args.grpc_host,
                     grpc_port=args.grpc_port,
                     poll_timeout_s=args.poll_timeout,
@@ -932,6 +953,14 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument(
         "--msgpack-file",
         default="/home/tmckay/create_data/L2CTA3D.numpy.msgpack",
+    )
+    p.add_argument(
+        "--json-file",
+        default="",
+        help=(
+            "Existing legacy problem JSON file for client-json. The file is "
+            "opened and parsed with json.load during every timed iteration."
+        ),
     )
     p.add_argument("--time-limit", type=float, default=30.0)
     p.add_argument("--legacy-url", default="")
@@ -1018,6 +1047,8 @@ def main(argv: Optional[list] = None) -> int:
     order = [x.strip() for x in args.order.split(",") if x.strip()]
     need_http_body = any(x in ("legacy", "shim") for x in order)
     need_json_body = any(x == "client-json" for x in order)
+    if args.json_file and not os.path.isfile(args.json_file):
+        raise SystemExit(f"--json-file does not exist: {args.json_file}")
     body = b""
     json_body = b""
     if need_http_body:
@@ -1028,7 +1059,13 @@ def main(argv: Optional[list] = None) -> int:
             f"  encoded {len(body) / (1024**2):.1f} MiB in "
             f"{(time.perf_counter() - t0) * 1000:.0f} ms"
         )
-    if need_json_body:
+    if need_json_body and args.json_file:
+        print(
+            f"client-json will json.load existing file each iteration: "
+            f"{args.json_file} "
+            f"({os.path.getsize(args.json_file) / (1024**2):.1f} MiB)"
+        )
+    elif need_json_body:
         est = _estimate_problem_json_bytes(data)
         print(f"client-json problem JSON estimate ≈ {est / (1024**2):.1f} MiB")
         if est > _MAX_PROBLEM_JSON_BYTES:
