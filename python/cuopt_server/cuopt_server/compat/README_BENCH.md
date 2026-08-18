@@ -1,7 +1,8 @@
 # HTTP ↔ gRPC shim + e2e bench (personal branch only)
 
 Experimental `cuopt_server.compat` package: legacy JSON validation/convert,
-thin HTTP→gRPC shim, and timed e2e compare (legacy / shim / client-direct).
+thin HTTP→gRPC shim, and timed e2e compare (legacy / shim / client-native /
+client-json).
 
 **Not intended for upstream PR.**
 
@@ -61,7 +62,8 @@ test -f "$MSGPACK_FILE"
 # --- knobs ---
 export ITERATIONS=5
 export TIME_LIMIT=30
-export ORDER=legacy,shim,client
+# Paths: legacy | shim | client-native (alias: client) | client-json
+export ORDER=legacy,shim,client-native,client-json
 export CUOPT_GIGABYTES_PER_PROC=6
 export MAX_MESSAGE_MB=1024
 export OUT_DIR="$(pwd)/bench_out"
@@ -87,17 +89,23 @@ export CUOPT_GIGABYTES_PER_PROC=6
 cuopt_grpc_server --port 18601 --workers 1 --max-message-mb 1024 &
 sleep 2
 
+# Native gRPC (no problem/result JSON) and/or JSON round-trip client
 python -m cuopt_server.compat.compare_e2e_solve \
   --msgpack-file "$MSGPACK_FILE" \
   --time-limit 30 \
   --iterations 5 \
-  --order client \
+  --order client-native,client-json \
   --grpc-host 127.0.0.1 --grpc-port 18601 \
   --csv ./bench_out/client_runs.csv \
   --csv-summary ./bench_out/client_avg.csv
 
 fuser -k 18601/tcp 2>/dev/null || true
 ```
+
+`client-native` is dict→DataModel→gRPC→Solution (no JSON). `client-json`
+adds result→legacy JSON encode (and problem JSON decode when the problem is
+small enough; huge LPs skip problem JSON to avoid OOM and still time the
+result JSON).
 
 ## Manual single-pass compare
 
