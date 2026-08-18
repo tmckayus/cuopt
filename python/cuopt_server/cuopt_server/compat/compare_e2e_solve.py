@@ -7,11 +7,14 @@ Measures wall time until a solution (or error) is available. Supports a timed
 loop with per-run and average CSVs.
 
 Paths:
-  legacy       — POST msgpack to cuopt_server, poll /cuopt/solution
-  shim         — POST msgpack to thin HTTP shim → gRPC, poll /cuopt/solution
+  legacy       — POST msgpack to cuopt_server, poll /cuopt/solution (Accept msgpack)
+  shim         — POST msgpack to thin HTTP shim → gRPC, poll /cuopt/solution (Accept msgpack)
   client /
   client-native — msgpack/dict → DataModel → Client.submit/wait/result
-                  (native gRPC; no problem JSON, no result JSON)
+                  (native gRPC; no problem JSON). Optional
+                  ``--client-map-solution`` adds Solution→legacy dict (map_ms).
+  client-native+map / client-map
+               — same as client-native, then Solution→legacy dict (no JSON dumps)
   client-json  — JSON text → parse → DataModel → gRPC → legacy JSON result
                   (approximates a cuopt_sh-style JSON in / JSON out client)
 
@@ -29,7 +32,7 @@ Example (loop + CSV)::
     --legacy-url http://127.0.0.1:18600 \\
     --shim-url http://127.0.0.1:18602 \\
     --grpc-host 127.0.0.1 --grpc-port 18601 \\
-    --order legacy,shim,client-native,client-json \\
+    --order legacy,shim,client-native+map,client-json \\
     --csv /tmp/e2e_runs.csv --csv-summary /tmp/e2e_avg.csv
 
 Warmup (default on) runs until the first successful solve per path and is
@@ -115,15 +118,43 @@ def _parse_timings_header(headers) -> Optional[Dict[str, float]]:
     return out
 
 
+MIME_MSGPACK = "application/vnd.msgpack"
+
+
+def _decode_response_body(
+    raw: bytes, content_type: Optional[str]
+) -> Dict[str, Any]:
+    if not raw:
+        return {}
+    ctype = (content_type or "").split(";", 1)[0].strip().lower()
+    if "msgpack" in ctype:
+        import msgpack
+        import msgpack_numpy
+
+        msgpack_numpy.patch()
+        data = msgpack.loads(raw, strict_map_key=False)
+        return data if isinstance(data, dict) else {"_payload": data}
+    if "zlib" in ctype:
+        import zlib
+
+        raw = zlib.decompress(raw)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+        return payload if isinstance(payload, dict) else {"_payload": payload}
+    except Exception:
+        return {"_raw": raw[:500].decode("utf-8", errors="replace")}
+
+
 def _http(
     method: str,
     url: str,
     *,
     body: Optional[bytes] = None,
     content_type: Optional[str] = None,
+    accept: str = MIME_MSGPACK,
     timeout: float = 3600.0,
 ) -> Tuple[int, Dict[str, Any], float, Dict[str, Any]]:
-    headers = {"Accept": "application/json"}
+    headers = {"Accept": accept}
     if content_type:
         headers["Content-Type"] = content_type
     req = urllib.request.Request(
@@ -151,15 +182,17 @@ def _http(
             meta["timings_ms"] = _parse_timings_header(e.headers)
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
     meta["response_bytes"] = len(raw) if raw else 0
-    try:
-        payload = json.loads(raw.decode("utf-8")) if raw else {}
-    except Exception:
-        payload = {"_raw": raw[:500].decode("utf-8", errors="replace")}
+    payload = _decode_response_body(raw, meta["content_type"])
     return status, payload, elapsed_ms, meta
 
 
 def _poll_legacy(
-    base: str, req_id: str, timeout_s: float, *, timings: bool = False
+    base: str,
+    req_id: str,
+    timeout_s: float,
+    *,
+    timings: bool = False,
+    accept: str = MIME_MSGPACK,
 ) -> Tuple[Dict[str, Any], float, Dict[str, Any]]:
     url = f"{base.rstrip('/')}/cuopt/solution/{req_id}"
     if timings:
@@ -170,7 +203,9 @@ def _poll_legacy(
     last_meta: Dict[str, Any] = {}
     last_get_ms = 0.0
     while time.perf_counter() < deadline:
-        status, last, last_get_ms, last_meta = _http("GET", url, timeout=600)
+        status, last, last_get_ms, last_meta = _http(
+            "GET", url, accept=accept, timeout=600
+        )
         if status >= 400:
             break
         # Done: full envelope, or FastAPI error detail.
@@ -195,10 +230,11 @@ def _poll_legacy(
 
 
 def _poll_shim(
-    base: str, req_id: str, timeout_s: float
+    base: str, req_id: str, timeout_s: float, *, accept: str = MIME_MSGPACK
 ) -> Tuple[Dict[str, Any], float, Dict[str, Any]]:
-    # Shim now returns the same legacy envelope as cuopt_server.
-    return _poll_legacy(base, req_id, timeout_s, timings=True)
+    # Shim returns the same legacy envelope as cuopt_server.
+    # Timings stay in X-Cuopt-Timings so Accept can remain msgpack.
+    return _poll_legacy(base, req_id, timeout_s, timings=True, accept=accept)
 
 
 def _extract_legacy_summary(result: Dict[str, Any]) -> Dict[str, Any]:
@@ -325,8 +361,14 @@ def run_path(
             parts.append(f"grpc_result={get_timings['result_ms']:.0f} ms")
         if get_timings.get("map_ms") is not None:
             parts.append(f"map={get_timings['map_ms']:.0f} ms")
-        if get_timings.get("json_encode_ms") is not None:
-            parts.append(f"json_encode={get_timings['json_encode_ms']:.0f} ms")
+        enc_ms = get_timings.get("encode_ms")
+        if enc_ms is None:
+            enc_ms = get_timings.get("json_encode_ms")
+        if enc_ms is not None:
+            parts.append(f"encode={enc_ms:.0f} ms")
+        ct = get_info.get("content_type")
+        if ct:
+            parts.append(f"ctype={ct}")
         print("  GET breakdown: " + "  ".join(parts))
     print(f"  summary={summary}")
 
@@ -394,16 +436,20 @@ def run_grpc_client_direct(
     delete: bool,
     validate: bool = False,
     name: str = "client-native",
+    map_solution: bool = False,
 ) -> Dict[str, Any]:
     """Native gRPC path: in-memory dict → DataModel → submit/wait/result.
 
     Does **not** encode the problem or solution as JSON. Use
     :func:`run_grpc_client_json` for a cuopt_sh-style JSON round-trip.
+    With ``map_solution``, times Solution→legacy dict as ``map_ms`` (no dumps).
     """
     from cuopt.grpc.linear_programming import Client, JobStatus
     from cuopt_server.compat.convert import json_to_datamodel
 
     print(f"\n=== {name} (gRPC {grpc_host}:{grpc_port}) ===")
+    if map_solution:
+        print("  map_solution=True (Solution → legacy dict after result)")
     try:
         client = Client(grpc_host, grpc_port, tls=False)
     except TypeError:
@@ -437,6 +483,30 @@ def run_grpc_client_direct(
         except Exception:
             summary["primal_objective"] = None
         print(f"  result_ms={timings['result_ms']:.1f}")
+        if map_solution:
+            from cuopt_server.compat.response import (
+                solution_to_legacy_response,
+            )
+
+            try:
+                total_solve_time = float(sol.get_solve_time())
+            except Exception:
+                total_solve_time = 0.0
+            t_map = time.perf_counter()
+            envelope = solution_to_legacy_response(
+                sol, req_id=job_id, total_solve_time=total_solve_time
+            )
+            timings["map_ms"] = (time.perf_counter() - t_map) * 1000.0
+            print(f"  map_ms={timings['map_ms']:.1f}")
+            try:
+                summary["primal_objective"] = envelope["response"][
+                    "solver_response"
+                ]["solution"].get("primal_objective")
+                summary["status"] = envelope["response"][
+                    "solver_response"
+                ].get("status", summary["status"])
+            except Exception:
+                pass
     elif status in (JobStatus.FAILED, JobStatus.CANCELLED):
         summary["error"] = f"job ended with {status.name}"
 
@@ -460,7 +530,9 @@ def run_grpc_client_direct(
         "req_id": job_id,
         "post_ms": timings.get("convert_ms", 0.0)
         + timings.get("submit_ms", 0.0),
-        "poll_ms": timings.get("wait_ms", 0.0) + timings.get("result_ms", 0.0),
+        "poll_ms": timings.get("wait_ms", 0.0)
+        + timings.get("result_ms", 0.0)
+        + timings.get("map_ms", 0.0),
         "total_wall_ms": total_ms,
         "server_timings_ms": timings,
         "get_timings_ms": {},
@@ -665,7 +737,11 @@ def flatten_result(result: Dict[str, Any], iteration: int) -> Dict[str, Any]:
     map_ms = gt.get("map_ms")
     if map_ms is None:
         map_ms = st.get("map_ms")
-    json_encode_ms = gt.get("json_encode_ms")
+    json_encode_ms = gt.get("encode_ms")
+    if json_encode_ms is None:
+        json_encode_ms = gt.get("json_encode_ms")
+    if json_encode_ms is None:
+        json_encode_ms = st.get("encode_ms")
     if json_encode_ms is None:
         json_encode_ms = st.get("json_encode_ms")
     response_bytes = gt.get("response_bytes")
@@ -688,6 +764,7 @@ def flatten_result(result: Dict[str, Any], iteration: int) -> Dict[str, Any]:
         "grpc_status_ms": gt.get("status_ms"),
         "grpc_result_ms": gt.get("result_ms"),
         "map_ms": map_ms,
+        # CSV column kept; value is response encode (msgpack or JSON).
         "json_encode_ms": json_encode_ms,
         "response_bytes": response_bytes,
         "total_wall_ms": result.get("total_wall_ms"),
@@ -822,9 +899,11 @@ def _print_comparison(results: List[Dict[str, Any]]) -> None:
         map_ms = gt.get("map_ms", st.get("map_ms"))
         if map_ms is not None:
             notes += f" map_ms={map_ms:.0f}"
-        json_encode_ms = gt.get("json_encode_ms", st.get("json_encode_ms"))
-        if json_encode_ms is not None:
-            notes += f" json_encode_ms={json_encode_ms:.0f}"
+        enc_ms = gt.get("encode_ms", st.get("encode_ms"))
+        if enc_ms is None:
+            enc_ms = gt.get("json_encode_ms", st.get("json_encode_ms"))
+        if enc_ms is not None:
+            notes += f" encode_ms={enc_ms:.0f}"
         response_bytes = gt.get("response_bytes", st.get("response_bytes"))
         if response_bytes is not None:
             notes += f" resp_MiB={float(response_bytes) / (1024 * 1024):.1f}"
@@ -912,10 +991,23 @@ def _run_one_order(
                     delete=not args.no_delete,
                 )
             )
-        elif name in ("client", "client-native", "client-direct"):
+        elif name in (
+            "client",
+            "client-native",
+            "client-direct",
+            "client-native+map",
+            "client-map",
+        ):
             if not args.grpc_port:
                 print(f"skip {name} (no --grpc-port)")
                 continue
+            map_solution = name in ("client-native+map", "client-map") or (
+                getattr(args, "client_map_solution", False)
+                and name in ("client", "client-native", "client-direct")
+            )
+            path_name = (
+                "client-native+map" if map_solution else "client-native"
+            )
             results.append(
                 run_grpc_client_direct(
                     data,
@@ -924,7 +1016,8 @@ def _run_one_order(
                     poll_timeout_s=args.poll_timeout,
                     delete=not args.no_delete,
                     validate=args.validate_client,
-                    name="client-native",
+                    name=path_name,
+                    map_solution=map_solution,
                 )
             )
         elif name == "client-json":
@@ -978,8 +1071,16 @@ def main(argv: Optional[list] = None) -> int:
         "--order",
         default="legacy,shim,client-native",
         help=(
-            "Comma list: legacy,shim,client-native|client,client-json "
-            "(client and client-direct are aliases of client-native)"
+            "Comma list: legacy,shim,client-native|client,"
+            "client-native+map|client-map,client-json"
+        ),
+    )
+    p.add_argument(
+        "--client-map-solution",
+        action="store_true",
+        help=(
+            "On client-native, also map Solution→legacy dict (map_ms). "
+            "Prefer --order client-native+map so both can run in one pass."
         ),
     )
     p.add_argument(

@@ -16,8 +16,9 @@
 #   ITERATIONS=5
 #   TIME_LIMIT=30
 #   ORDER=legacy,shim,client-native
-#     also: client (=client-native), client-json (JSON in/out via gRPC)
+#     also: client (=client-native), client-native+map, client-json
 #   JSON_FILE=""             # existing problem JSON for client-json
+#   CLIENT_MAP_SOLUTION=0    # 1: client-native maps Solution→dict (map_ms)
 #   CUOPT_GIGABYTES_PER_PROC=6
 #   MAX_MESSAGE_MB=1024
 #   LEGACY_PORT=18600 GRPC_PORT=18601 SHIM_PORT=18602
@@ -37,6 +38,7 @@ ITERATIONS="${ITERATIONS:-5}"
 TIME_LIMIT="${TIME_LIMIT:-30}"
 ORDER="${ORDER:-legacy,shim,client-native}"
 JSON_FILE="${JSON_FILE:-}"
+CLIENT_MAP_SOLUTION="${CLIENT_MAP_SOLUTION:-0}"
 CUOPT_GIGABYTES_PER_PROC="${CUOPT_GIGABYTES_PER_PROC:-6}"
 MAX_MESSAGE_MB="${MAX_MESSAGE_MB:-1024}"
 LEGACY_PORT="${LEGACY_PORT:-18600}"
@@ -170,10 +172,15 @@ run_path_loop() {
     shim)
       args+=(--shim-url "${SHIM_URL}" --grpc-host 127.0.0.1 --grpc-port "${GRPC_PORT}")
       ;;
-    client-native|client-json)
+    client-native|client-native+map|client-json)
       args+=(--grpc-host 127.0.0.1 --grpc-port "${GRPC_PORT}")
       if [[ "${path}" == "client-json" && -n "${JSON_FILE}" ]]; then
         args+=(--json-file "${JSON_FILE}")
+      fi
+      if [[ "${path}" == "client-native" ]]; then
+        case "${CLIENT_MAP_SOLUTION}" in
+          1|true|yes|YES|True) args+=(--client-map-solution) ;;
+        esac
       fi
       ;;
     *)
@@ -275,6 +282,10 @@ for raw in "${_ORDER_PARTS[@]}"; do
     client|client-native|client-direct)
       start_grpc
       run_path_loop client-native
+      ;;
+    client-native+map|client-map)
+      start_grpc
+      run_path_loop client-native+map
       ;;
     client-json)
       start_grpc
