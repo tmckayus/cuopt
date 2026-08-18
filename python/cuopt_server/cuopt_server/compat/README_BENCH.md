@@ -9,8 +9,11 @@ The shim speaks the legacy REST shape, so `cuopt_sh` / `CuOptServiceSelfHostClie
 work against it unchanged: `POST /cuopt/request` returns `{"reqId": ...}`,
 `GET /cuopt/solution/{id}` returns the full `response.solver_response` envelope
 (and a bare `{"reqId"}` while the job is pending). Add `?timings=1` to the POST
-to get server-side stage timings; it is off by default because clients treat a
-single-key `reqId` body as "still pending".
+to get server-side stage timings in the JSON body; add `?timings=1` to the GET
+to get result-path timings in the `X-Cuopt-Timings` header
+(`status_ms`, `result_ms`, `map_ms`, `json_encode_ms`, `response_bytes`).
+Timings are off by default because clients treat a single-key `reqId` POST body
+as "still pending".
 
 On a single GPU with large instances, the harness runs each path in
 `ORDER` **sequentially** (start servers → N iterations → tear down / free
