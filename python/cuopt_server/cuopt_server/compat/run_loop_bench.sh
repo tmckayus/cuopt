@@ -17,6 +17,7 @@
 #   TIME_LIMIT=30
 #   ORDER=legacy,shim,client-native
 #     also: client (=client-native), client-json (JSON in/out via gRPC)
+#   JSON_FILE=""             # existing problem JSON for client-json
 #   CUOPT_GIGABYTES_PER_PROC=6
 #   MAX_MESSAGE_MB=1024
 #   LEGACY_PORT=18600 GRPC_PORT=18601 SHIM_PORT=18602
@@ -35,6 +36,7 @@ MSGPACK_FILE="${MSGPACK_FILE:?Set MSGPACK_FILE to the numpy msgpack LP path}"
 ITERATIONS="${ITERATIONS:-5}"
 TIME_LIMIT="${TIME_LIMIT:-30}"
 ORDER="${ORDER:-legacy,shim,client-native}"
+JSON_FILE="${JSON_FILE:-}"
 CUOPT_GIGABYTES_PER_PROC="${CUOPT_GIGABYTES_PER_PROC:-6}"
 MAX_MESSAGE_MB="${MAX_MESSAGE_MB:-1024}"
 LEGACY_PORT="${LEGACY_PORT:-18600}"
@@ -170,6 +172,9 @@ run_path_loop() {
       ;;
     client-native|client-json)
       args+=(--grpc-host 127.0.0.1 --grpc-port "${GRPC_PORT}")
+      if [[ "${path}" == "client-json" && -n "${JSON_FILE}" ]]; then
+        args+=(--json-file "${JSON_FILE}")
+      fi
       ;;
     *)
       echo "ERROR: unknown path '${path}'" >&2
