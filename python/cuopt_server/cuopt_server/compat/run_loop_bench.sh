@@ -216,6 +216,12 @@ for row in rows:
         "wait_ms",
         "result_ms",
         "poll_ms",
+        "get_wall_ms",
+        "grpc_status_ms",
+        "grpc_result_ms",
+        "map_ms",
+        "json_encode_ms",
+        "response_bytes",
         "total_wall_ms",
         "primal_objective",
     ):

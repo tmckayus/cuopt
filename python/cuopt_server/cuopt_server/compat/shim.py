@@ -19,6 +19,7 @@ Run::
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import time
 from collections import OrderedDict
@@ -191,10 +192,19 @@ def create_app(
         return _LEGACY_STATUS.get(status, status.name.lower())
 
     @app.get("/cuopt/solution/{job_id}")
-    def get_solution(job_id: str):
-        """Full legacy solution envelope (or ``{"reqId"}`` while pending)."""
+    def get_solution(job_id: str, timings: bool = False):
+        """Full legacy solution envelope (or ``{"reqId"}`` while pending).
+
+        Pass ``?timings=1`` to get stage timings in the ``X-Cuopt-Timings``
+        header (JSON). Timings are kept out of the body so the response
+        stays legacy-shaped and we avoid a second encode of a large payload.
+        """
+        stage_ms: dict[str, float] = {}
+        t0 = time.perf_counter()
         try:
+            t_status = time.perf_counter()
             status = client().status(job_id)
+            stage_ms["status_ms"] = (time.perf_counter() - t_status) * 1000.0
             if status in (JobStatus.QUEUED, JobStatus.PROCESSING):
                 # Legacy polls with HTTP 200 and body {"reqId": ...} only.
                 return {"reqId": job_id}
@@ -204,7 +214,9 @@ def create_app(
                 raise HTTPException(
                     400, f"job {job_id} ended with {status.name}"
                 )
+            t_result = time.perf_counter()
             sol = client().result(job_id)
+            stage_ms["result_ms"] = (time.perf_counter() - t_result) * 1000.0
         except HTTPException:
             raise
         except GrpcError as exc:
@@ -218,11 +230,28 @@ def create_app(
         except Exception:
             total_solve_time = 0.0
 
-        return solution_to_legacy_response(
+        t_map = time.perf_counter()
+        envelope = solution_to_legacy_response(
             sol,
             req_id=job_id,
             warnings=job_warnings.get(job_id) or [],
             total_solve_time=total_solve_time,
+        )
+        stage_ms["map_ms"] = (time.perf_counter() - t_map) * 1000.0
+
+        if not timings:
+            return envelope
+
+        # Encode once so we can report both wall time and payload size.
+        t_enc = time.perf_counter()
+        raw = json.dumps(envelope).encode("utf-8")
+        stage_ms["json_encode_ms"] = (time.perf_counter() - t_enc) * 1000.0
+        stage_ms["response_bytes"] = float(len(raw))
+        stage_ms["total_ms"] = (time.perf_counter() - t0) * 1000.0
+        return Response(
+            content=raw,
+            media_type="application/json",
+            headers={"X-Cuopt-Timings": json.dumps(stage_ms)},
         )
 
     def _delete_job(job_id: str):

@@ -59,6 +59,12 @@ CSV_FIELDS = [
     "wait_ms",
     "result_ms",
     "poll_ms",
+    "get_wall_ms",
+    "grpc_status_ms",
+    "grpc_result_ms",
+    "map_ms",
+    "json_encode_ms",
+    "response_bytes",
     "total_wall_ms",
     "primal_objective",
     "status",
@@ -86,6 +92,25 @@ def _encode_msgpack(data: Dict[str, Any]) -> bytes:
     return msgpack.dumps(data)
 
 
+def _parse_timings_header(headers) -> Optional[Dict[str, float]]:
+    raw = headers.get("X-Cuopt-Timings") or headers.get("x-cuopt-timings")
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    out: Dict[str, float] = {}
+    for k, v in parsed.items():
+        try:
+            out[str(k)] = float(v)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def _http(
     method: str,
     url: str,
@@ -93,7 +118,7 @@ def _http(
     body: Optional[bytes] = None,
     content_type: Optional[str] = None,
     timeout: float = 3600.0,
-) -> Tuple[int, Dict[str, Any], float]:
+) -> Tuple[int, Dict[str, Any], float, Dict[str, Any]]:
     headers = {"Accept": "application/json"}
     if content_type:
         headers["Content-Type"] = content_type
@@ -101,30 +126,47 @@ def _http(
         url, data=body, headers=headers, method=method
     )
     t0 = time.perf_counter()
+    meta: Dict[str, Any] = {
+        "response_bytes": 0,
+        "content_type": None,
+        "timings_ms": None,
+    }
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
             status = resp.status
+            meta["content_type"] = resp.headers.get("Content-Type")
+            meta["timings_ms"] = _parse_timings_header(resp.headers)
     except urllib.error.HTTPError as e:
         raw = e.read()
         status = e.code
+        meta["content_type"] = (
+            e.headers.get("Content-Type") if e.headers else None
+        )
+        if e.headers:
+            meta["timings_ms"] = _parse_timings_header(e.headers)
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    meta["response_bytes"] = len(raw) if raw else 0
     try:
         payload = json.loads(raw.decode("utf-8")) if raw else {}
     except Exception:
         payload = {"_raw": raw[:500].decode("utf-8", errors="replace")}
-    return status, payload, elapsed_ms
+    return status, payload, elapsed_ms, meta
 
 
 def _poll_legacy(
-    base: str, req_id: str, timeout_s: float
-) -> Tuple[Dict[str, Any], float]:
+    base: str, req_id: str, timeout_s: float, *, timings: bool = False
+) -> Tuple[Dict[str, Any], float, Dict[str, Any]]:
     url = f"{base.rstrip('/')}/cuopt/solution/{req_id}"
+    if timings:
+        url += "?timings=1"
     t0 = time.perf_counter()
     deadline = t0 + timeout_s
     last: Dict[str, Any] = {}
+    last_meta: Dict[str, Any] = {}
+    last_get_ms = 0.0
     while time.perf_counter() < deadline:
-        status, last, _ = _http("GET", url, timeout=60)
+        status, last, last_get_ms, last_meta = _http("GET", url, timeout=600)
         if status >= 400:
             break
         # Done: full envelope, or FastAPI error detail.
@@ -139,14 +181,20 @@ def _poll_legacy(
             last["error"] = last["detail"]
             break
         time.sleep(0.25)
-    return last, (time.perf_counter() - t0) * 1000.0
+    info = {
+        "get_wall_ms": last_get_ms,
+        "response_bytes": last_meta.get("response_bytes"),
+        "content_type": last_meta.get("content_type"),
+        "timings_ms": last_meta.get("timings_ms") or {},
+    }
+    return last, (time.perf_counter() - t0) * 1000.0, info
 
 
 def _poll_shim(
     base: str, req_id: str, timeout_s: float
-) -> Tuple[Dict[str, Any], float]:
+) -> Tuple[Dict[str, Any], float, Dict[str, Any]]:
     # Shim now returns the same legacy envelope as cuopt_server.
-    return _poll_legacy(base, req_id, timeout_s)
+    return _poll_legacy(base, req_id, timeout_s, timings=True)
 
 
 def _extract_legacy_summary(result: Dict[str, Any]) -> Dict[str, Any]:
@@ -198,7 +246,7 @@ def run_path(
         # clients that treat a lone reqId as "pending".
         post_url += "?timings=1"
     t_all = time.perf_counter()
-    status, post_resp, post_ms = _http(
+    status, post_resp, post_ms, _post_meta = _http(
         "POST",
         post_url,
         body=body,
@@ -215,6 +263,7 @@ def run_path(
             "error": post_resp,
             "summary": {},
             "server_timings_ms": {},
+            "get_timings_ms": {},
         }
 
     req_id = post_resp.get("reqId")
@@ -227,23 +276,54 @@ def run_path(
             "error": post_resp,
             "summary": {},
             "server_timings_ms": {},
+            "get_timings_ms": {},
         }
 
     print(f"  reqId={req_id}")
     if post_resp.get("timings_ms"):
-        print(f"  server timings_ms={post_resp['timings_ms']}")
+        print(f"  server POST timings_ms={post_resp['timings_ms']}")
 
     if mode == "legacy":
-        result, poll_ms = _poll_legacy(base_url, req_id, poll_timeout_s)
+        result, poll_ms, get_info = _poll_legacy(
+            base_url, req_id, poll_timeout_s, timings=False
+        )
         summary = _extract_legacy_summary(result)
         del_url = f"{base_url.rstrip('/')}/cuopt/solution/{req_id}"
     else:
-        result, poll_ms = _poll_shim(base_url, req_id, poll_timeout_s)
+        result, poll_ms, get_info = _poll_shim(
+            base_url, req_id, poll_timeout_s
+        )
         summary = _extract_shim_summary(result)
         del_url = f"{base_url.rstrip('/')}/cuopt/solution/{req_id}"
 
+    get_timings = dict(get_info.get("timings_ms") or {})
+    if get_info.get("response_bytes") is not None:
+        get_timings.setdefault("response_bytes", get_info["response_bytes"])
+    if get_info.get("get_wall_ms") is not None:
+        get_timings["get_wall_ms"] = get_info["get_wall_ms"]
+
     total_ms = (time.perf_counter() - t_all) * 1000.0
     print(f"  poll_ms={poll_ms:.0f}  total_wall_ms={total_ms:.0f}")
+    if get_timings:
+        rb = get_timings.get("response_bytes")
+        rb_note = (
+            f"{rb / (1024 * 1024):.1f} MiB"
+            if isinstance(rb, (int, float)) and rb
+            else "n/a"
+        )
+        parts = [
+            f"wall={get_timings.get('get_wall_ms', float('nan')):.0f} ms",
+            f"bytes={rb_note}",
+        ]
+        if get_timings.get("status_ms") is not None:
+            parts.append(f"status={get_timings['status_ms']:.0f} ms")
+        if get_timings.get("result_ms") is not None:
+            parts.append(f"grpc_result={get_timings['result_ms']:.0f} ms")
+        if get_timings.get("map_ms") is not None:
+            parts.append(f"map={get_timings['map_ms']:.0f} ms")
+        if get_timings.get("json_encode_ms") is not None:
+            parts.append(f"json_encode={get_timings['json_encode_ms']:.0f} ms")
+        print("  GET breakdown: " + "  ".join(parts))
     print(f"  summary={summary}")
 
     if delete:
@@ -266,6 +346,7 @@ def run_path(
         "poll_ms": poll_ms,
         "total_wall_ms": total_ms,
         "server_timings_ms": post_resp.get("timings_ms") or {},
+        "get_timings_ms": get_timings,
         "summary": summary,
     }
 
@@ -349,6 +430,7 @@ def run_grpc_client_direct(
 
 def flatten_result(result: Dict[str, Any], iteration: int) -> Dict[str, Any]:
     st = result.get("server_timings_ms") or {}
+    gt = result.get("get_timings_ms") or {}
     summary = result.get("summary") or {}
     err = result.get("error")
     if isinstance(err, dict):
@@ -360,6 +442,11 @@ def flatten_result(result: Dict[str, Any], iteration: int) -> Dict[str, Any]:
     if wait_ms is None:
         wait_ms = result.get("poll_ms")
 
+    # Prefer client-direct result_ms; fall back to shim GET grpc result.
+    result_ms = st.get("result_ms")
+    if result_ms is None:
+        result_ms = gt.get("result_ms")
+
     return {
         "iteration": iteration,
         "path": result.get("name"),
@@ -370,8 +457,14 @@ def flatten_result(result: Dict[str, Any], iteration: int) -> Dict[str, Any]:
         "post_ms": result.get("post_ms"),
         "submit_ms": st.get("submit_ms"),
         "wait_ms": wait_ms,
-        "result_ms": st.get("result_ms"),
+        "result_ms": result_ms,
         "poll_ms": result.get("poll_ms"),
+        "get_wall_ms": gt.get("get_wall_ms"),
+        "grpc_status_ms": gt.get("status_ms"),
+        "grpc_result_ms": gt.get("result_ms"),
+        "map_ms": gt.get("map_ms"),
+        "json_encode_ms": gt.get("json_encode_ms"),
+        "response_bytes": gt.get("response_bytes"),
         "total_wall_ms": result.get("total_wall_ms"),
         "primal_objective": summary.get("primal_objective"),
         "status": summary.get("status"),
@@ -411,6 +504,12 @@ def write_summary_csv(path: str, rows: List[Dict[str, Any]]) -> None:
         "stdev_post_s",
         "mean_poll_s",
         "stdev_poll_s",
+        "mean_get_wall_ms",
+        "mean_grpc_status_ms",
+        "mean_grpc_result_ms",
+        "mean_map_ms",
+        "mean_json_encode_ms",
+        "mean_response_bytes",
         "mean_convert_ms",
         "mean_submit_ms",
         "mean_wait_ms",
@@ -458,6 +557,12 @@ def write_summary_csv(path: str, rows: List[Dict[str, Any]]) -> None:
                     "stdev_post_s": _stdev(posts),
                     "mean_poll_s": _mean(polls),
                     "stdev_poll_s": _stdev(polls),
+                    "mean_get_wall_ms": _mean(col("get_wall_ms")),
+                    "mean_grpc_status_ms": _mean(col("grpc_status_ms")),
+                    "mean_grpc_result_ms": _mean(col("grpc_result_ms")),
+                    "mean_map_ms": _mean(col("map_ms")),
+                    "mean_json_encode_ms": _mean(col("json_encode_ms")),
+                    "mean_response_bytes": _mean(col("response_bytes")),
                     "mean_convert_ms": _mean(col("convert_ms")),
                     "mean_submit_ms": _mean(col("submit_ms")),
                     "mean_wait_ms": _mean(col("wait_ms")),
@@ -476,6 +581,7 @@ def _print_comparison(results: List[Dict[str, Any]]) -> None:
     for r in results:
         notes = ""
         st = r.get("server_timings_ms") or {}
+        gt = r.get("get_timings_ms") or {}
         if "convert_ms" in st:
             notes += f" convert_ms={st['convert_ms']:.0f}"
         if "submit_ms" in st:
@@ -484,6 +590,16 @@ def _print_comparison(results: List[Dict[str, Any]]) -> None:
             notes += f" wait_ms={st['wait_ms']:.0f}"
         if "result_ms" in st:
             notes += f" result_ms={st['result_ms']:.0f}"
+        if gt.get("result_ms") is not None:
+            notes += f" grpc_result_ms={gt['result_ms']:.0f}"
+        if gt.get("map_ms") is not None:
+            notes += f" map_ms={gt['map_ms']:.0f}"
+        if gt.get("json_encode_ms") is not None:
+            notes += f" json_encode_ms={gt['json_encode_ms']:.0f}"
+        if gt.get("response_bytes") is not None:
+            notes += (
+                f" resp_MiB={float(gt['response_bytes']) / (1024 * 1024):.1f}"
+            )
         s = r.get("summary") or {}
         if s.get("solver_time") is not None:
             notes += f" solver_time={s['solver_time']}"
