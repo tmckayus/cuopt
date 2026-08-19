@@ -69,6 +69,28 @@ from the quick start (same constraint matrix and objective).
 :class:`~cuopt.linear_programming.problem.Problem`. Always call
 ``delete`` after you are done with the job so the server can release state.
 
+From a legacy REST JSON dict
+============================
+
+``dict_to_datamodel`` accepts the same LP/MILP JSON that ``cuopt_server``
+takes on POST ``/cuopt/request``. ``dict_from_solution`` maps a
+``Solution`` to the GET ``/cuopt/solution/{id}`` envelope (what ``cuopt_sh``
+clients expect)::
+
+   from cuopt.linear_programming import dict_from_solution, dict_to_datamodel
+   from cuopt.grpc.linear_programming import Client, JobStatus
+
+   dm, settings = dict_to_datamodel("problem.json")  # or a dict
+   client = Client("localhost", 5001)
+   job_id = client.submit(dm, settings)
+   try:
+       client.wait(job_id, timeout=120)
+       solution = client.result(job_id)
+       envelope = dict_from_solution(solution, req_id=job_id)
+       print(envelope["response"]["solver_response"]["status"])
+   finally:
+       client.delete(job_id)
+
 Variable Names
 ==============
 

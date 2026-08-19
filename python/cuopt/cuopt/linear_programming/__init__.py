@@ -3,6 +3,10 @@
 
 from cuopt.linear_programming import internals
 from cuopt.linear_programming.data_model import DataModel
+from cuopt.linear_programming.dict_convert import (
+    dict_from_solution,
+    dict_to_datamodel,
+)
 from cuopt.linear_programming.io import ParseMps, Read
 from cuopt.linear_programming.problem import Problem
 from cuopt.linear_programming.solution import Solution
