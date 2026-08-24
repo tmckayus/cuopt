@@ -239,6 +239,9 @@ message StatusRequest {
 // Request to get result
 message GetResultRequest {
   string job_id = 1;
+  // Keep the default false so requests from older clients retain the
+  // historical behavior of returning PDLP warm-start data.
+  bool skip_warm_start_data = 2;
 }
 
 // ResultArrayDescriptor and ChunkedResultHeader are defined in
@@ -246,6 +249,7 @@ message GetResultRequest {
 
 message StartChunkedDownloadRequest {
   string job_id = 1;
+  bool skip_warm_start_data = 2;
 }
 
 message StartChunkedDownloadResponse {

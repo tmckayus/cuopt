@@ -9,6 +9,78 @@
 #include "grpc_pipe_serialization.hpp"
 #include "grpc_server_types.hpp"
 
+namespace {
+
+bool is_warm_start_result_field(int32_t field_id)
+{
+  switch (static_cast<cuopt::remote::ResultFieldId>(field_id)) {
+    case cuopt::remote::RESULT_WS_CURRENT_PRIMAL_SOLUTION:
+    case cuopt::remote::RESULT_WS_CURRENT_DUAL_SOLUTION:
+    case cuopt::remote::RESULT_WS_INITIAL_PRIMAL_AVERAGE:
+    case cuopt::remote::RESULT_WS_INITIAL_DUAL_AVERAGE:
+    case cuopt::remote::RESULT_WS_CURRENT_ATY:
+    case cuopt::remote::RESULT_WS_SUM_PRIMAL_SOLUTIONS:
+    case cuopt::remote::RESULT_WS_SUM_DUAL_SOLUTIONS:
+    case cuopt::remote::RESULT_WS_LAST_RESTART_DUALITY_GAP_PRIMAL_SOLUTION:
+    case cuopt::remote::RESULT_WS_LAST_RESTART_DUALITY_GAP_DUAL_SOLUTION: return true;
+    default: return false;
+  }
+}
+
+void strip_warm_start_descriptors(cuopt::remote::ChunkedResultHeader* header)
+{
+  auto* arrays = header->mutable_arrays();
+  for (int i = arrays->size() - 1; i >= 0; --i) {
+    if (is_warm_start_result_field(arrays->Get(i).field_id())) { arrays->DeleteSubrange(i, 1); }
+  }
+  header->clear_ws_initial_primal_weight();
+  header->clear_ws_initial_step_size();
+  header->clear_ws_total_pdlp_iterations();
+  header->clear_ws_total_pdhg_iterations();
+  header->clear_ws_last_candidate_kkt_score();
+  header->clear_ws_last_restart_kkt_score();
+  header->clear_ws_sum_solution_weight();
+  header->clear_ws_iterations_since_last_restart();
+}
+
+int64_t result_size_without_warm_start(const JobInfo& job)
+{
+  int64_t bytes = job.result_size_bytes;
+  for (const auto& [field_id, data] : job.result_arrays) {
+    if (is_warm_start_result_field(field_id)) {
+      bytes -= std::min<int64_t>(bytes, static_cast<int64_t>(data.size()));
+    }
+  }
+  return bytes;
+}
+
+// Always-on so it shows next to worker [THROUGHPUT] lines. Confirms the RPC
+// response will not include stored PDLP restart vectors (even if CheckStatus
+// still reports the full stored size).
+void log_pdlp_warm_start_omitted(const char* phase, const std::string& job_id, const JobInfo& job)
+{
+  size_t omitted_arrays = 0;
+  int64_t omitted_bytes = 0;
+  for (const auto& [field_id, data] : job.result_arrays) {
+    if (is_warm_start_result_field(field_id)) {
+      ++omitted_arrays;
+      omitted_bytes += static_cast<int64_t>(data.size());
+    }
+  }
+  SERVER_LOG_INFO(
+    "[THROUGHPUT] phase=%s job=%s stored_bytes=%ld transferred_bytes=%ld "
+    "omitted_pdlp_warm_start_bytes=%ld omitted_pdlp_warm_start_arrays=%zu "
+    "pdlp_warm_start_included=false",
+    phase,
+    job_id.c_str(),
+    job.result_size_bytes,
+    result_size_without_warm_start(job),
+    omitted_bytes,
+    omitted_arrays);
+}
+
+}  // namespace
+
 class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::Service {
  public:
   // Unary submit: the entire problem fits in a single gRPC message.
@@ -348,7 +420,13 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
 
     // Guard against results that would exceed gRPC/protobuf message limits.
     // The client detects RESOURCE_EXHAUSTED and switches to chunked download.
-    int64_t total_result_bytes = it->second.result_size_bytes;
+    const bool skip_warm_start_data =
+      request->skip_warm_start_data() && it->second.problem_category == cuopt::remote::LP;
+    if (skip_warm_start_data) {
+      log_pdlp_warm_start_omitted("get_result_omit_pdlp_warm_start", job_id, it->second);
+    }
+    int64_t total_result_bytes = skip_warm_start_data ? result_size_without_warm_start(it->second)
+                                                      : it->second.result_size_bytes;
     const int64_t max_bytes    = server_max_message_bytes();
     if (max_bytes > 0 && total_result_bytes > max_bytes) {
       std::string msg = "Result size (~" + std::to_string(total_result_bytes) +
@@ -373,6 +451,7 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
       cuopt::remote::LPSolution lp_solution;
       cuopt::mathematical_optimization::build_lp_solution_proto<int, double>(
         it->second.result_header, it->second.result_arrays, &lp_solution);
+      if (skip_warm_start_data) { lp_solution.clear_warm_start_data(); }
       response->mutable_lp_solution()->Swap(&lp_solution);
     }
 
@@ -415,7 +494,18 @@ class CuOptRemoteServiceImpl final : public cuopt::remote::CuOptRemoteService::S
       state.problem_category = it->second.problem_category;
       state.created          = std::chrono::steady_clock::now();
       state.result_header    = it->second.result_header;
-      state.raw_arrays       = it->second.result_arrays;
+      const bool skip_warm_start_data =
+        request->skip_warm_start_data() && it->second.problem_category == cuopt::remote::LP;
+      if (skip_warm_start_data) {
+        log_pdlp_warm_start_omitted(
+          "start_chunked_download_omit_pdlp_warm_start", job_id, it->second);
+        strip_warm_start_descriptors(&state.result_header);
+        for (const auto& [field_id, data] : it->second.result_arrays) {
+          if (!is_warm_start_result_field(field_id)) { state.raw_arrays.emplace(field_id, data); }
+        }
+      } else {
+        state.raw_arrays = it->second.result_arrays;
+      }
     }
 
     response->mutable_header()->CopyFrom(state.result_header);

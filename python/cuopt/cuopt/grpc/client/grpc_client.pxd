@@ -202,7 +202,9 @@ cdef extern from "cuopt/grpc/cython_grpc_client.hpp" namespace "cuopt::cython":
             lp_solver_settings_t[int, double]* settings,
             bint enable_incumbents,
         ) except +
-        grpc_result_outcome_t result(const string& job_id) except +
+        grpc_result_outcome_t result(
+            const string& job_id, bint include_warm_start_data
+        ) except +
         grpc_logs_result_t fetch_logs(const string& job_id, long long from_byte) except +
         bint stream_logs(
             const string& job_id,

@@ -351,19 +351,27 @@ cdef class Client:
         if not self._client.get().delete_job(job_id.encode("utf-8"), error_out):
             raise GrpcError(error_out.decode("utf-8"))
 
-    def result(self, str job_id, variable_names=None):
+    def result(
+        self,
+        str job_id,
+        variable_names=None,
+        include_warm_start_data=True,
+    ):
         """
         Fetch the solution for a completed job, or ``None`` if not ready.
 
         LP vs MIP is determined from the server response (via
         ``grpc_client_t::get_result``). Pass ``variable_names`` (column order)
         to key ``solution.get_vars()`` by name. Raises :class:`GrpcError` if the job
-        failed or was cancelled.
+        failed or was cancelled. Set ``include_warm_start_data=False`` to omit
+        PDLP restart vectors from the result download.
         """
         cdef grpc_result_outcome_t outcome
         cdef unique_ptr[solver_ret_t] sol_ret
 
-        outcome = self._client.get().result(job_id.encode("utf-8"))
+        outcome = self._client.get().result(
+            job_id.encode("utf-8"), include_warm_start_data
+        )
         if outcome.not_ready:
             return None
         if not outcome.success:

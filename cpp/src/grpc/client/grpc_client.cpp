@@ -708,7 +708,8 @@ submit_result_t grpc_client_t::submit_mip(const cpu_optimization_problem_t<i_t, 
 }
 
 template <typename i_t, typename f_t>
-remote_lp_result_t<i_t, f_t> grpc_client_t::get_lp_result(const std::string& job_id)
+remote_lp_result_t<i_t, f_t> grpc_client_t::get_lp_result(const std::string& job_id,
+                                                          bool include_warm_start_data)
 {
   remote_lp_result_t<i_t, f_t> result;
 
@@ -718,7 +719,7 @@ remote_lp_result_t<i_t, f_t> grpc_client_t::get_lp_result(const std::string& job
   }
 
   downloaded_result_t dl;
-  if (!get_result_or_download(job_id, dl)) {
+  if (!get_result_or_download(job_id, dl, include_warm_start_data)) {
     result.error_message = last_error_;
     return result;
   }
@@ -735,7 +736,8 @@ remote_lp_result_t<i_t, f_t> grpc_client_t::get_lp_result(const std::string& job
 }
 
 template <typename i_t, typename f_t>
-remote_mip_result_t<i_t, f_t> grpc_client_t::get_mip_result(const std::string& job_id)
+remote_mip_result_t<i_t, f_t> grpc_client_t::get_mip_result(const std::string& job_id,
+                                                            bool include_warm_start_data)
 {
   remote_mip_result_t<i_t, f_t> result;
 
@@ -745,7 +747,7 @@ remote_mip_result_t<i_t, f_t> grpc_client_t::get_mip_result(const std::string& j
   }
 
   downloaded_result_t dl;
-  if (!get_result_or_download(job_id, dl)) {
+  if (!get_result_or_download(job_id, dl, include_warm_start_data)) {
     result.error_message = last_error_;
     return result;
   }
@@ -762,7 +764,8 @@ remote_mip_result_t<i_t, f_t> grpc_client_t::get_mip_result(const std::string& j
 }
 
 template <typename i_t, typename f_t>
-remote_result_t<i_t, f_t> grpc_client_t::get_result(const std::string& job_id)
+remote_result_t<i_t, f_t> grpc_client_t::get_result(const std::string& job_id,
+                                                    bool include_warm_start_data)
 {
   remote_result_t<i_t, f_t> result;
 
@@ -772,7 +775,7 @@ remote_result_t<i_t, f_t> grpc_client_t::get_result(const std::string& job_id)
   }
 
   downloaded_result_t dl;
-  if (!get_result_or_download(job_id, dl)) {
+  if (!get_result_or_download(job_id, dl, include_warm_start_data)) {
     result.error_message = last_error_;
     return result;
   }
@@ -1065,7 +1068,8 @@ bool grpc_client_t::upload_chunked_arrays(const cpu_optimization_problem_t<i_t, 
 }
 
 bool grpc_client_t::get_result_or_download(const std::string& job_id,
-                                           downloaded_result_t& result_out)
+                                           downloaded_result_t& result_out,
+                                           bool include_warm_start_data)
 {
   result_out = downloaded_result_t{};
 
@@ -1099,11 +1103,12 @@ bool grpc_client_t::get_result_or_download(const std::string& job_id,
                           << result_size_hint << " bytes, client_max=" << config_.max_message_bytes
                           << ", server_max=" << srv_max_msg << ", effective_max=" << effective_max);
 
-  if (result_size_hint > 0 && effective_max > 0 && result_size_hint > effective_max) {
+  if (include_warm_start_data && result_size_hint > 0 && effective_max > 0 &&
+      result_size_hint > effective_max) {
     GRPC_CLIENT_DEBUG_LOG(config_,
                           "[grpc_client] Using chunked download directly (result_size_hint="
                             << result_size_hint << " > effective_max=" << effective_max << ")");
-    return download_chunked_result(job_id, result_out);
+    return download_chunked_result(job_id, result_out, include_warm_start_data);
   }
 
   GRPC_CLIENT_DEBUG_LOG(config_,
@@ -1114,7 +1119,7 @@ bool grpc_client_t::get_result_or_download(const std::string& job_id,
 
   grpc::ClientContext context;
   set_rpc_deadline(context, kDefaultRpcTimeoutSeconds);
-  auto request  = build_get_result_request(job_id);
+  auto request  = build_get_result_request(job_id, include_warm_start_data);
   auto response = std::make_unique<cuopt::remote::ResultResponse>();
   auto status   = impl_->stub->GetResult(&context, request, response.get());
 
@@ -1137,7 +1142,7 @@ bool grpc_client_t::get_result_or_download(const std::string& job_id,
     GRPC_CLIENT_DEBUG_LOG(config_,
                           "[grpc_client] GetResult rejected (RESOURCE_EXHAUSTED), "
                           "falling back to chunked download");
-    return download_chunked_result(job_id, result_out);
+    return download_chunked_result(job_id, result_out, include_warm_start_data);
   }
 
   if (!status.ok()) {
@@ -1149,7 +1154,8 @@ bool grpc_client_t::get_result_or_download(const std::string& job_id,
 }
 
 bool grpc_client_t::download_chunked_result(const std::string& job_id,
-                                            downloaded_result_t& result_out)
+                                            downloaded_result_t& result_out,
+                                            bool include_warm_start_data)
 {
   result_out.was_chunked = true;
   result_out.chunked_arrays.clear();
@@ -1165,6 +1171,7 @@ bool grpc_client_t::download_chunked_result(const std::string& job_id,
     set_rpc_deadline(context, kDefaultRpcTimeoutSeconds);
     cuopt::remote::StartChunkedDownloadRequest request;
     request.set_job_id(job_id);
+    request.set_skip_warm_start_data(!include_warm_start_data);
 
     cuopt::remote::StartChunkedDownloadResponse response;
     auto status = impl_->stub->StartChunkedDownload(&context, request, &response);
@@ -1308,10 +1315,12 @@ template submit_result_t grpc_client_t::submit_mip(
   const cpu_optimization_problem_t<int32_t, float>& problem,
   const mip_solver_settings_t<int32_t, float>& settings,
   bool enable_incumbents);
-template remote_lp_result_t<int32_t, float> grpc_client_t::get_lp_result(const std::string& job_id);
+template remote_lp_result_t<int32_t, float> grpc_client_t::get_lp_result(
+  const std::string& job_id, bool include_warm_start_data);
 template remote_mip_result_t<int32_t, float> grpc_client_t::get_mip_result(
-  const std::string& job_id);
-template remote_result_t<int32_t, float> grpc_client_t::get_result(const std::string& job_id);
+  const std::string& job_id, bool include_warm_start_data);
+template remote_result_t<int32_t, float> grpc_client_t::get_result(const std::string& job_id,
+                                                                   bool include_warm_start_data);
 template bool grpc_client_t::upload_chunked_arrays(
   const cpu_optimization_problem_t<int32_t, float>& problem,
   const cuopt::remote::ChunkedProblemHeader& header,
@@ -1334,10 +1343,11 @@ template submit_result_t grpc_client_t::submit_mip(
   const mip_solver_settings_t<int32_t, double>& settings,
   bool enable_incumbents);
 template remote_lp_result_t<int32_t, double> grpc_client_t::get_lp_result(
-  const std::string& job_id);
+  const std::string& job_id, bool include_warm_start_data);
 template remote_mip_result_t<int32_t, double> grpc_client_t::get_mip_result(
-  const std::string& job_id);
-template remote_result_t<int32_t, double> grpc_client_t::get_result(const std::string& job_id);
+  const std::string& job_id, bool include_warm_start_data);
+template remote_result_t<int32_t, double> grpc_client_t::get_result(const std::string& job_id,
+                                                                    bool include_warm_start_data);
 template bool grpc_client_t::upload_chunked_arrays(
   const cpu_optimization_problem_t<int32_t, double>& problem,
   const cuopt::remote::ChunkedProblemHeader& header,

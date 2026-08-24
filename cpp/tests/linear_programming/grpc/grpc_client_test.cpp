@@ -928,6 +928,7 @@ TEST_F(GrpcClientTest, GetResultUnified_UnaryLP)
                  const cuopt::remote::GetResultRequest& req,
                  cuopt::remote::ResultResponse* resp) {
       EXPECT_EQ(req.job_id(), "unified-lp-unary");
+      EXPECT_FALSE(req.skip_warm_start_data());
       cuopt::remote::LPSolution solution;
       solution.add_primal_solution(1.5);
       solution.add_primal_solution(2.5);
@@ -997,15 +998,17 @@ TEST_F(GrpcClientTest, GetResultUnified_ChunkedLP_FallbackOnResourceExhausted)
 
   EXPECT_CALL(*mock_stub_, GetResult(_, _, _))
     .WillOnce([](grpc::ClientContext*,
-                 const cuopt::remote::GetResultRequest&,
+                 const cuopt::remote::GetResultRequest& req,
                  cuopt::remote::ResultResponse*) {
+      EXPECT_TRUE(req.skip_warm_start_data());
       return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED, "Too large");
     });
 
   EXPECT_CALL(*mock_stub_, StartChunkedDownload(_, _, _))
     .WillOnce([](grpc::ClientContext*,
-                 const cuopt::remote::StartChunkedDownloadRequest&,
+                 const cuopt::remote::StartChunkedDownloadRequest& req,
                  cuopt::remote::StartChunkedDownloadResponse* resp) {
+      EXPECT_TRUE(req.skip_warm_start_data());
       resp->set_download_id("dl-unified-lp");
       auto* h = resp->mutable_header();
       h->set_problem_category(cuopt::remote::LP);
@@ -1042,7 +1045,7 @@ TEST_F(GrpcClientTest, GetResultUnified_ChunkedLP_FallbackOnResourceExhausted)
       return grpc::Status::OK;
     });
 
-  auto result = client_->get_result<int32_t, double>("unified-lp-chunked");
+  auto result = client_->get_result<int32_t, double>("unified-lp-chunked", false);
 
   EXPECT_TRUE(result.success) << result.error_message;
   EXPECT_FALSE(result.is_mip);

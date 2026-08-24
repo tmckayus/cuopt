@@ -13,10 +13,14 @@ from cuopt.grpc.linear_programming import (
     JobStatus,
     TlsConfig,
 )
-from cuopt.linear_programming import Read, SolverSettings
+from cuopt.linear_programming import Read, SolverMethod, SolverSettings
 from cuopt.linear_programming.internals import GetSolutionCallback
 from cuopt.linear_programming.problem import INTEGER, MAXIMIZE, Problem
-from cuopt.linear_programming.solver.solver_parameters import CUOPT_TIME_LIMIT
+from cuopt.linear_programming.solver.solver_parameters import (
+    CUOPT_METHOD,
+    CUOPT_PRESOLVE,
+    CUOPT_TIME_LIMIT,
+)
 
 from grpc_server_fixtures import GRPC_PORT_OFFSET_CLIENT
 
@@ -124,6 +128,27 @@ class TestGrpcClient:
         assert vars_["y"] == pytest.approx(0.0, rel=1e-3)
 
         client.delete(job_id)
+
+    def test_result_can_omit_pdlp_warm_start_data(self, grpc_server):
+        settings = SolverSettings()
+        settings.set_parameter(CUOPT_METHOD, SolverMethod.PDLP)
+        settings.set_parameter(CUOPT_PRESOLVE, 0)
+        client = Client("localhost", grpc_server)
+
+        job_id = client.submit(_demo_lp_problem(), settings)
+        try:
+            assert client.wait(job_id, timeout=120) == JobStatus.COMPLETED
+            solution = client.result(
+                job_id,
+                _DEMO_LP_NAMES,
+                include_warm_start_data=False,
+            )
+            assert solution is not None
+            warm_start = solution.get_pdlp_warm_start_data()
+            assert warm_start.current_primal_solution is None
+            assert warm_start.current_dual_solution is None
+        finally:
+            client.delete(job_id)
 
     def test_submit_with_log_stream(self, grpc_server):
         problem = _demo_lp_problem()

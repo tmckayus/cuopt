@@ -476,7 +476,7 @@ def run_grpc_client_direct(
     summary: Dict[str, Any] = {"status": getattr(status, "name", str(status))}
     if status == JobStatus.COMPLETED:
         t3 = time.perf_counter()
-        sol = client.result(job_id)
+        sol = client.result(job_id, include_warm_start_data=False)
         timings["result_ms"] = (time.perf_counter() - t3) * 1000.0
         try:
             summary["primal_objective"] = float(sol.get_primal_objective())
@@ -629,7 +629,7 @@ def run_grpc_client_json(
     summary: Dict[str, Any] = {"status": getattr(status, "name", str(status))}
     if status == JobStatus.COMPLETED:
         t3 = time.perf_counter()
-        sol = client.result(job_id)
+        sol = client.result(job_id, include_warm_start_data=False)
         timings["result_ms"] = (time.perf_counter() - t3) * 1000.0
         print(f"  result_ms={timings['result_ms']:.1f}")
 

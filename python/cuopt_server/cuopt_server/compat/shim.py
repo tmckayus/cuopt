@@ -270,7 +270,9 @@ def create_app(
                     400, f"job {job_id} ended with {status.name}"
                 )
             t_result = time.perf_counter()
-            sol = client().result(job_id)
+            # The legacy GET response serves PDLP warm-start data from a
+            # separate endpoint, so do not transfer it through this proxy.
+            sol = client().result(job_id, include_warm_start_data=False)
             stage_ms["result_ms"] = (time.perf_counter() - t_result) * 1000.0
         except HTTPException:
             raise

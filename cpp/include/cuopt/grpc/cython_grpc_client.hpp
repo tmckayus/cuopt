@@ -150,7 +150,7 @@ class grpc_python_client_t {
    * Fetch the solution for a completed job. LP vs MIP is determined from the
    * server response via grpc_client_t::get_result().
    */
-  grpc_result_outcome_t result(const std::string& job_id);
+  grpc_result_outcome_t result(const std::string& job_id, bool include_warm_start_data = true);
 
   /**
    * @brief Submit a VRP problem (unary only). Reuse status/wait/delete/result_vrp.

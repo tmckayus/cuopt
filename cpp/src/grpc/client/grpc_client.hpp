@@ -352,10 +352,12 @@ class grpc_client_t {
   /**
    * @brief Get LP result for a completed job
    * @param job_id The job ID
+   * @param include_warm_start_data Whether to download PDLP restart vectors
    * @return Result containing solution if successful
    */
   template <typename i_t, typename f_t>
-  remote_lp_result_t<i_t, f_t> get_lp_result(const std::string& job_id);
+  remote_lp_result_t<i_t, f_t> get_lp_result(const std::string& job_id,
+                                             bool include_warm_start_data = true);
 
   /**
    * @brief Get MIP result for a completed job
@@ -363,7 +365,8 @@ class grpc_client_t {
    * @return Result containing solution if successful
    */
   template <typename i_t, typename f_t>
-  remote_mip_result_t<i_t, f_t> get_mip_result(const std::string& job_id);
+  remote_mip_result_t<i_t, f_t> get_mip_result(const std::string& job_id,
+                                               bool include_warm_start_data = true);
 
   /**
    * @brief Get result for a completed job; LP vs MIP comes from the server.
@@ -373,7 +376,8 @@ class grpc_client_t {
    * in a later change.
    */
   template <typename i_t, typename f_t>
-  remote_result_t<i_t, f_t> get_result(const std::string& job_id);
+  remote_result_t<i_t, f_t> get_result(const std::string& job_id,
+                                       bool include_warm_start_data = true);
 
   /**
    * @brief Submit a VRP problem without waiting (unary only; no chunking yet).
@@ -507,13 +511,17 @@ class grpc_client_t {
    * Returns a downloaded_result_t with either the unary ResultResponse or the
    * chunked header + arrays map populated.
    */
-  bool get_result_or_download(const std::string& job_id, downloaded_result_t& result_out);
+  bool get_result_or_download(const std::string& job_id,
+                              downloaded_result_t& result_out,
+                              bool include_warm_start_data = true);
 
   /**
    * @brief Download result via chunked unary RPCs (StartChunkedDownload +
    *        N × GetResultChunk + FinishChunkedDownload).
    */
-  bool download_chunked_result(const std::string& job_id, downloaded_result_t& result_out);
+  bool download_chunked_result(const std::string& job_id,
+                               downloaded_result_t& result_out,
+                               bool include_warm_start_data = true);
 
   // =========================================================================
   // Chunked Array Upload (for large problems)

@@ -188,7 +188,8 @@ bool grpc_python_client_t::delete_job(const std::string& job_id, std::string& er
   return true;
 }
 
-grpc_result_outcome_t grpc_python_client_t::result(const std::string& job_id)
+grpc_result_outcome_t grpc_python_client_t::result(const std::string& job_id,
+                                                   bool include_warm_start_data)
 {
   grpc_result_outcome_t out;
 
@@ -206,7 +207,7 @@ grpc_result_outcome_t grpc_python_client_t::result(const std::string& job_id)
     return out;
   }
 
-  auto remote = impl_->client.get_result<int, double>(job_id);
+  auto remote = impl_->client.get_result<int, double>(job_id, include_warm_start_data);
   if (!remote.success) {
     out.error_message = remote.error_message;
     return out;

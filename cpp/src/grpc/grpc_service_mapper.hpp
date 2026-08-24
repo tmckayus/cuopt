@@ -66,12 +66,15 @@ inline cuopt::remote::StatusRequest build_status_request(const std::string& job_
  * Simple helper to create a result retrieval request.
  *
  * @param job_id The job ID to get results for
+ * @param include_warm_start_data Whether to return PDLP restart vectors
  * @return GetResultRequest protobuf message
  */
-inline cuopt::remote::GetResultRequest build_get_result_request(const std::string& job_id)
+inline cuopt::remote::GetResultRequest build_get_result_request(const std::string& job_id,
+                                                                bool include_warm_start_data = true)
 {
   cuopt::remote::GetResultRequest request;
   request.set_job_id(job_id);
+  request.set_skip_warm_start_data(!include_warm_start_data);
   return request;
 }
 
