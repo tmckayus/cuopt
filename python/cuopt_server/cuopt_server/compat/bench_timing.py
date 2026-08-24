@@ -238,8 +238,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"payload: {source}  rows={nrows} cols={ncols} nnz={nnz}  {size_note}"
     )
 
-    from cuopt_server.compat.convert import json_to_datamodel, parse_lp_data
-    from cuopt_server.compat.validate import validate_lp_data
+    from cuopt.linear_programming import toDataModelAndSettings
+    from cuopt_server.compat.validate import parse_lp_data, validate_lp_data
+
+    def _convert(validate: bool):
+        problem = _maybe_copy(payload)
+        if validate:
+            lp = parse_lp_data(problem)
+            validate_lp_data(lp)
+        return toDataModelAndSettings(problem)
 
     if not args.skip_local:
         print("=== local library timings ===")
@@ -258,14 +265,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         _report("parse+validate", samples)
 
         samples = _time_it(
-            lambda: json_to_datamodel(_maybe_copy(payload), validate=False),
+            lambda: _convert(validate=False),
             args.warmup,
             args.repeats,
         )
         _report("json→DataModel (no val)", samples)
 
         samples = _time_it(
-            lambda: json_to_datamodel(_maybe_copy(payload), validate=True),
+            lambda: _convert(validate=True),
             args.warmup,
             args.repeats,
         )
@@ -305,7 +312,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         # Convert once, then time submit alone (isolates gRPC hop)
         print("  (building DataModel once for submit-only timing...)")
         t0 = time.perf_counter()
-        dm, settings = json_to_datamodel(_maybe_copy(payload), validate=True)
+        dm, settings = _convert(validate=True)
         convert_once_ms = (time.perf_counter() - t0) * 1000.0
         print(f"  one-shot convert+validate: {convert_once_ms:.1f} ms")
 

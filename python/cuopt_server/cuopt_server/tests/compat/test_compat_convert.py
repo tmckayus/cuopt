@@ -1,16 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for compat validate / convert (no gRPC server required)."""
+"""Unit tests for proxy validation with shared cuOpt converters."""
 
 import copy
 
 import numpy as np
 import pytest
 
-from cuopt_server.compat.convert import json_to_datamodel, parse_lp_data
+from cuopt.linear_programming import toDataModelAndSettings
 from cuopt_server.compat.validate import (
     LegacyJsonValidationError,
+    parse_lp_data,
     validate_lp_data,
 )
 from cuopt_server.utils.linear_programming.data_definition import (
@@ -39,18 +40,17 @@ def test_validate_rejects_bad_csr():
         validate_lp_data(lp)
 
 
-def test_json_to_datamodel_without_validate():
-    dm, settings = json_to_datamodel(
-        copy.deepcopy(lp_example_data), validate=False
-    )
+def test_shared_converter_without_validate():
+    dm, settings = toDataModelAndSettings(copy.deepcopy(lp_example_data))
     assert dm is not None
     assert settings is not None
     assert len(dm.get_objective_coefficients()) == 2
 
 
-def test_json_to_datamodel_with_validate():
-    dm, settings = json_to_datamodel(
-        copy.deepcopy(lp_example_data), validate=True
-    )
+def test_shared_converter_after_proxy_validation():
+    data = copy.deepcopy(lp_example_data)
+    lp = parse_lp_data(data)
+    validate_lp_data(lp)
+    dm, settings = toDataModelAndSettings(data)
     assert dm is not None
     assert settings is not None

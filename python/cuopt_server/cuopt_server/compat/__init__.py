@@ -3,25 +3,22 @@
 
 """Legacy JSON compatibility helpers for LP/MILP.
 
-Three separable pieces:
+The package contains three server-specific pieces:
 
 1. :mod:`cuopt_server.compat.validate` — essential structural checks
-2. :mod:`cuopt_server.compat.convert` — JSON/dict → DataModel + SolverSettings
+2. :mod:`cuopt_server.compat.codec` — legacy HTTP payload encoding
 3. :mod:`cuopt_server.compat.shim` — thin HTTP→gRPC FastAPI pass-through
 
-Client-side Python callers can use :func:`json_to_datamodel` without
-validation; the HTTP shim validates by default.
+The shared DataModel/SolverSettings/Solution converters are public APIs in
+``cuopt.linear_programming``. The HTTP shim validates by default, then calls
+those same converters.
 """
 
 from cuopt_server.compat.codec import decode_request_body, encode_payload
-from cuopt_server.compat.convert import (
-    json_to_datamodel,
-    lp_data_to_datamodel,
-    parse_lp_data,
-)
 from cuopt_server.compat.normalize import normalize_lp_dict
 from cuopt_server.compat.validate import (
     LegacyJsonValidationError,
+    parse_lp_data,
     validate_lp_data,
     validate_lp_dict,
 )
@@ -30,8 +27,6 @@ __all__ = [
     "LegacyJsonValidationError",
     "decode_request_body",
     "encode_payload",
-    "json_to_datamodel",
-    "lp_data_to_datamodel",
     "normalize_lp_dict",
     "parse_lp_data",
     "validate_lp_data",

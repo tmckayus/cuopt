@@ -30,6 +30,10 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
 from cuopt.grpc.linear_programming import Client, GrpcError, JobStatus
+from cuopt.linear_programming import (
+    toDataModelAndSettings,
+    toDictFromSolution,
+)
 
 from cuopt_server.compat.codec import (
     decode_request_body,
@@ -37,10 +41,9 @@ from cuopt_server.compat.codec import (
     normalize_content_type,
     unwrap_managed_envelope,
 )
-from cuopt_server.compat.convert import lp_data_to_datamodel, parse_lp_data
-from cuopt_server.compat.response import solution_to_legacy_response
 from cuopt_server.compat.validate import (
     LegacyJsonValidationError,
+    parse_lp_data,
     validate_lp_data,
 )
 from cuopt_server.utils.job_queue import (
@@ -160,10 +163,7 @@ def create_app(
                 stage_ms["validate_ms"] = (time.perf_counter() - t2) * 1000.0
 
             t3 = time.perf_counter()
-            data_model, settings, convert_warnings = lp_data_to_datamodel(
-                lp_data, return_warnings=True
-            )
-            warnings.extend(convert_warnings)
+            data_model, settings = toDataModelAndSettings(body)
             stage_ms["convert_ms"] = (time.perf_counter() - t3) * 1000.0
 
             t4 = time.perf_counter()
@@ -282,18 +282,11 @@ def create_app(
                 {"reqId": job_id}, accept=accept, timings=False
             )
 
-        try:
-            total_solve_time = float(sol.get_solve_time())
-        except Exception:
-            total_solve_time = 0.0
-
         t_map = time.perf_counter()
-        envelope = solution_to_legacy_response(
-            sol,
-            req_id=job_id,
-            warnings=job_warnings.get(job_id) or [],
-            total_solve_time=total_solve_time,
-        )
+        envelope = toDictFromSolution(sol)
+        envelope["reqId"] = job_id
+        if job_warnings.get(job_id):
+            envelope["warnings"] = job_warnings[job_id]
         stage_ms["map_ms"] = (time.perf_counter() - t_map) * 1000.0
 
         return _encode_body(

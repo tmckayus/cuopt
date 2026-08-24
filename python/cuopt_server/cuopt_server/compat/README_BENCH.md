@@ -1,10 +1,10 @@
-# HTTP ↔ gRPC shim + e2e bench (personal branch only)
+# HTTP ↔ gRPC proxy + e2e bench
 
-Experimental `cuopt_server.compat` package: legacy JSON validation/convert,
+Experimental `cuopt_server.compat` package: legacy JSON validation,
 thin HTTP→gRPC shim, and timed e2e compare (legacy / shim / client-native /
-client-json).
-
-**Not intended for upstream PR.**
+client-json). Problem and solution conversion uses the public
+`cuopt.linear_programming.toDataModelAndSettings` and
+`toDictFromSolution` APIs shared with native clients.
 
 The shim speaks the legacy REST shape, so `cuopt_sh` / `CuOptServiceSelfHostClient`
 work against it unchanged: `POST /cuopt/request` returns `{"reqId": ...}`,
@@ -25,9 +25,6 @@ Each path does an **untimed warmup** until the first successful solve, then
 records only successful timed iterations (failures are retried / skipped,
 not written to CSV).
 
- Keep on a personal fork branch
-(`feature/http-grpc-shim` on `github.com/tmckayus/cuopt`).
-
 ## Prerequisites
 
 - Working cuOpt install with `cuopt_grpc_server` and Python packages
@@ -45,13 +42,13 @@ not written to CSV).
 # --- once: get the branch ---
 git clone git@github.com:tmckayus/cuopt.git
 cd cuopt
-git fetch origin feature/http-grpc-shim
-git checkout feature/http-grpc-shim
+git fetch origin feature/http-grpc-proxy
+git checkout feature/http-grpc-proxy
 
 # Activate your cuOpt env (example)
 # conda activate cuopt   # or: source /path/to/.cuopt_env2/bin/activate
 
-# Prefer this tree's cuopt_server (compat + bool coerce) over site-packages
+# Prefer this tree's cuopt_server proxy package over site-packages.
 export PYTHONPATH="$(pwd)/python/cuopt_server:${PYTHONPATH:-}"
 export PATH="$(dirname $(which python)):${PATH}"   # ensure cuopt_grpc_server is found
 

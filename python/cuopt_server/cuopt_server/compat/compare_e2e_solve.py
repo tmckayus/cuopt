@@ -445,7 +445,11 @@ def run_grpc_client_direct(
     With ``map_solution``, times Solution→legacy dict as ``map_ms`` (no dumps).
     """
     from cuopt.grpc.linear_programming import Client, JobStatus
-    from cuopt_server.compat.convert import json_to_datamodel
+    from cuopt.linear_programming import (
+        toDataModelAndSettings,
+        toDictFromSolution,
+    )
+    from cuopt_server.compat.validate import validate_lp_dict
 
     print(f"\n=== {name} (gRPC {grpc_host}:{grpc_port}) ===")
     if map_solution:
@@ -459,7 +463,9 @@ def run_grpc_client_direct(
     t_all = time.perf_counter()
 
     t0 = time.perf_counter()
-    data_model, settings = json_to_datamodel(payload, validate=validate)
+    if validate:
+        validate_lp_dict(payload)
+    data_model, settings = toDataModelAndSettings(payload)
     timings["convert_ms"] = (time.perf_counter() - t0) * 1000.0
     print(f"  convert_ms={timings['convert_ms']:.1f} (validate={validate})")
 
@@ -484,18 +490,8 @@ def run_grpc_client_direct(
             summary["primal_objective"] = None
         print(f"  result_ms={timings['result_ms']:.1f}")
         if map_solution:
-            from cuopt_server.compat.response import (
-                solution_to_legacy_response,
-            )
-
-            try:
-                total_solve_time = float(sol.get_solve_time())
-            except Exception:
-                total_solve_time = 0.0
             t_map = time.perf_counter()
-            envelope = solution_to_legacy_response(
-                sol, req_id=job_id, total_solve_time=total_solve_time
-            )
+            envelope = toDictFromSolution(sol)
             timings["map_ms"] = (time.perf_counter() - t_map) * 1000.0
             print(f"  map_ms={timings['map_ms']:.1f}")
             try:
@@ -561,8 +557,11 @@ def run_grpc_client_json(
       [decode JSON] → convert → submit → wait → result → map → json.dumps
     """
     from cuopt.grpc.linear_programming import Client, JobStatus
-    from cuopt_server.compat.convert import json_to_datamodel
-    from cuopt_server.compat.response import solution_to_legacy_response
+    from cuopt.linear_programming import (
+        toDataModelAndSettings,
+        toDictFromSolution,
+    )
+    from cuopt_server.compat.validate import validate_lp_dict
 
     name = "client-json"
     print(f"\n=== {name} (gRPC {grpc_host}:{grpc_port}) ===")
@@ -612,7 +611,9 @@ def run_grpc_client_json(
     problem["solver_config"] = solver_config
 
     t0 = time.perf_counter()
-    data_model, settings = json_to_datamodel(problem, validate=validate)
+    if validate:
+        validate_lp_dict(problem)
+    data_model, settings = toDataModelAndSettings(problem)
     timings["convert_ms"] = (time.perf_counter() - t0) * 1000.0
     print(f"  convert_ms={timings['convert_ms']:.1f} (validate={validate})")
 
@@ -633,15 +634,8 @@ def run_grpc_client_json(
         timings["result_ms"] = (time.perf_counter() - t3) * 1000.0
         print(f"  result_ms={timings['result_ms']:.1f}")
 
-        try:
-            total_solve_time = float(sol.get_solve_time())
-        except Exception:
-            total_solve_time = 0.0
-
         t_map = time.perf_counter()
-        envelope = solution_to_legacy_response(
-            sol, req_id=job_id, total_solve_time=total_solve_time
-        )
+        envelope = toDictFromSolution(sol)
         timings["map_ms"] = (time.perf_counter() - t_map) * 1000.0
 
         t_enc = time.perf_counter()

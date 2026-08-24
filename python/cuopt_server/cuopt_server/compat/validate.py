@@ -16,6 +16,21 @@ class LegacyJsonValidationError(ValueError):
     """Raised when legacy JSON fails essential structural checks."""
 
 
+def parse_lp_data(data: Mapping[str, Any] | LPData) -> LPData:
+    """Parse and normalize a legacy LP/MILP payload for validation."""
+    if isinstance(data, LPData):
+        lp_data = data
+    else:
+        try:
+            lp_data = LPData.parse_obj(dict(data))
+        except Exception as exc:  # pydantic ValidationError / TypeError
+            raise LegacyJsonValidationError(str(exc)) from exc
+
+    from cuopt_server.compat.normalize import normalize_lp_data
+
+    return normalize_lp_data(lp_data)
+
+
 def _is_empty(value) -> bool:
     return value is None or len(value) == 0
 
@@ -179,14 +194,6 @@ def validate_lp_dict(
             "validate_lp_dict(parse=False) requires an LPData instance"
         )
 
-    try:
-        lp_data = LPData.parse_obj(dict(data))
-    except Exception as exc:  # pydantic ValidationError / TypeError
-        raise LegacyJsonValidationError(str(exc)) from exc
-
-    # Semantic checks need arrays; normalize lightly for inf/ninf lists.
-    from cuopt_server.compat.normalize import normalize_lp_data
-
-    normalize_lp_data(lp_data)
+    lp_data = parse_lp_data(data)
     validate_lp_data(lp_data)
     return lp_data
