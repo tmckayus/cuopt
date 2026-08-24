@@ -110,6 +110,15 @@ def test_to_data_model_defaults_without_solver_config():
     assert settings.settings_dict == {}
 
 
+def test_to_data_model_coerces_boolean_solver_parameters_for_grpc():
+    payload = copy.deepcopy(LP_EXAMPLE)
+    payload["solver_config"]["log_to_console"] = False
+    payload["solver_config"]["mip_scaling"] = True
+    _dm, settings = toDataModelAndSettings(payload)
+    assert settings.settings_dict["log_to_console"] == 0
+    assert settings.settings_dict["mip_scaling"] == 1
+
+
 def test_to_data_model_from_json_file():
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False

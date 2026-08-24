@@ -375,6 +375,8 @@ def _fill_solver_settings(payload, warmstart_data=None):
         else:
             param_value = solver_config.get(param)
         if param_value is not None and param_value != "":
+            if isinstance(param_value, bool):
+                param_value = int(param_value)
             solver_settings.set_parameter(param, param_value)
 
     if warmstart_data is not None:
