@@ -163,10 +163,6 @@ def create_solver(LP_data, warmstart_data):
             else:
                 param_value = getattr(solver_config, param, None)
             if param_value is not None and param_value != "":
-                if isinstance(param_value, bool):
-                    # C++ set_parameter expects 0/1 for flag-like params;
-                    # Pydantic SolverConfig defaults are Python bools.
-                    param_value = int(param_value)
                 solver_settings.set_parameter(param, param_value)
 
     if LP_data.solver_config is not None:
