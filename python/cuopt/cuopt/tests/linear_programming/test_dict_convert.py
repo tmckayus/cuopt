@@ -1,21 +1,29 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for dict_to_datamodel / dict_from_solution."""
+"""Unit tests for toDict / toDataModelAndSettings / toDictFromSolution."""
 
 import copy
 import json
 import os
 import tempfile
+import zlib
 from types import SimpleNamespace
 
+import msgpack
+import msgpack_numpy
 import numpy as np
 
-from cuopt.linear_programming.dict_convert import (
-    dict_from_solution,
-    dict_to_datamodel,
+from cuopt.linear_programming.io import (
+    toDataModelAndSettings,
+    toDict,
+    toDictFromDataModel,
+    toDictFromSolution,
 )
-from cuopt.linear_programming.solution.solution import LPTerminationStatus
+from cuopt.linear_programming.solution.solution import (
+    LPTerminationStatus,
+    ProblemCategory,
+)
 
 LP_EXAMPLE = {
     "csr_constraint_matrix": {
@@ -42,10 +50,6 @@ LP_EXAMPLE = {
 }
 
 
-class _FakeCategory:
-    name = "LP"
-
-
 class _FakeSol:
     def get_termination_status(self):
         return LPTerminationStatus.Optimal
@@ -54,7 +58,7 @@ class _FakeSol:
         return "Optimal"
 
     def get_problem_category(self):
-        return _FakeCategory()
+        return ProblemCategory.LP
 
     def get_primal_solution(self):
         return np.array([1.0, 2.0])
@@ -86,41 +90,116 @@ class _FakeSol:
     def get_milp_stats(self):
         return None
 
-    def get_pdlp_warm_start_data(self):
-        return SimpleNamespace(current_primal_solution=[1.0])
 
-
-def test_dict_to_datamodel_from_mapping():
-    dm, settings = dict_to_datamodel(copy.deepcopy(LP_EXAMPLE))
+def test_to_data_model_from_mapping():
+    dm, settings = toDataModelAndSettings(copy.deepcopy(LP_EXAMPLE))
     assert len(dm.get_objective_coefficients()) == 2
     assert np.allclose(dm.get_objective_coefficients(), [0.2, 0.1])
     assert np.isinf(dm.get_variable_upper_bounds()).all()
     assert np.isneginf(dm.get_constraint_lower_bounds()).all()
-    names = dm.get_variable_names()
-    assert list(names) == ["x", "y"]
+    assert list(dm.get_variable_names()) == ["x", "y"]
     assert settings.get_parameter("time_limit") == 5
     assert settings.get_parameter("absolute_primal_tolerance") == 0.0001
 
 
-def test_dict_to_datamodel_from_json_file():
+def test_to_data_model_defaults_without_solver_config():
+    payload = copy.deepcopy(LP_EXAMPLE)
+    del payload["solver_config"]
+    dm, settings = toDataModelAndSettings(payload)
+    assert len(dm.get_objective_coefficients()) == 2
+    assert settings.settings_dict == {}
+
+
+def test_to_data_model_from_json_file():
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False
     ) as fh:
         json.dump(LP_EXAMPLE, fh)
         path = fh.name
     try:
-        dm, _settings = dict_to_datamodel(path)
+        dm, _settings = toDataModelAndSettings(path)
         assert len(dm.get_objective_coefficients()) == 2
     finally:
         os.unlink(path)
 
 
-def test_dict_from_solution_envelope():
-    body = dict_from_solution(_FakeSol(), req_id="abc", total_solve_time=0.02)
-    assert body["reqId"] == "abc"
+def test_to_data_model_from_msgpack_file():
+    payload = copy.deepcopy(LP_EXAMPLE)
+    payload["objective_data"]["coefficients"] = np.array([0.2, 0.1])
+    with tempfile.NamedTemporaryFile(suffix=".msgpack", delete=False) as fh:
+        fh.write(msgpack.dumps(payload, default=msgpack_numpy.encode))
+        path = fh.name
+    try:
+        dm, settings = toDataModelAndSettings(path)
+        assert np.allclose(dm.get_objective_coefficients(), [0.2, 0.1])
+        assert settings.get_parameter("time_limit") == 5
+    finally:
+        os.unlink(path)
+
+
+def test_to_data_model_from_zlib_file():
+    with tempfile.NamedTemporaryFile(suffix=".zlib", delete=False) as fh:
+        fh.write(zlib.compress(json.dumps(LP_EXAMPLE).encode()))
+        path = fh.name
+    try:
+        dm, settings = toDataModelAndSettings(path)
+        assert np.allclose(dm.get_objective_coefficients(), [0.2, 0.1])
+        assert settings.get_parameter("time_limit") == 5
+    finally:
+        os.unlink(path)
+
+
+def test_to_dict_round_trip_json_true_and_false():
+    """A DataModel survives toDict -> toDataModelAndSettings for every schema field."""
+    payload = copy.deepcopy(LP_EXAMPLE)
+    payload["initial_solution"] = {"primal": [0.1, 0.2], "dual": [0.0, 1.0]}
+    dm, _settings = toDataModelAndSettings(payload)
+
+    for as_json in (True, False):
+        encoded = toDict(dm, json=as_json)
+        assert "solver_config" not in encoded
+        dm2, _settings2 = toDataModelAndSettings(encoded)
+        assert np.allclose(
+            dm.get_objective_coefficients(), dm2.get_objective_coefficients()
+        )
+        assert np.allclose(
+            dm.get_variable_lower_bounds(), dm2.get_variable_lower_bounds()
+        )
+        assert np.isinf(dm2.get_variable_upper_bounds()).all()
+        assert np.isneginf(dm2.get_constraint_lower_bounds()).all()
+        assert list(dm2.get_variable_names()) == ["x", "y"]
+        assert np.allclose(dm2.initial_primal_solution, [0.1, 0.2])
+        assert np.allclose(dm2.initial_dual_solution, [0.0, 1.0])
+
+
+def test_to_dict_emits_only_the_starts_that_are_set():
+    payload = copy.deepcopy(LP_EXAMPLE)
+    payload["initial_solution"] = {"primal": [0.1, 0.2]}
+    dm, _settings = toDataModelAndSettings(payload)
+    for as_json in (True, False):
+        initial = toDict(dm, json=as_json)["initial_solution"]
+        assert np.allclose(initial["primal"], [0.1, 0.2])
+        assert "dual" not in initial
+
+
+def test_to_dict_omits_initial_solution_when_model_has_none():
+    dm, _settings = toDataModelAndSettings(copy.deepcopy(LP_EXAMPLE))
+    assert "initial_solution" not in toDict(dm, json=True)
+    assert "initial_solution" not in toDict(dm, json=False)
+
+
+def test_to_dict_from_data_model_is_to_dict():
+    dm, _settings = toDataModelAndSettings(copy.deepcopy(LP_EXAMPLE))
+    assert toDictFromDataModel(dm, json=True) == toDict(dm, json=True)
+
+
+def test_to_dict_from_solution_envelope():
+    body = toDictFromSolution(_FakeSol())
+    assert body["reqId"] is None
+    assert body["warnings"] is None
+    assert body["response"]["total_solve_time"] is None
     solver = body["response"]["solver_response"]
     assert solver["status"] == "Optimal"
-    assert body["response"]["total_solve_time"] == 0.02
     sol = solver["solution"]
     assert sol["primal_objective"] == 3.0
     assert sol["primal_solution"] == [1.0, 2.0]
