@@ -186,20 +186,44 @@ class TestGrpcClient:
         client.delete(job_id)
 
     def test_mip_start_over_grpc(self, grpc_server):
+        class IncumbentCollector(GetSolutionCallback):
+            def __init__(self):
+                super().__init__()
+                self.entries = []
+
+            def get_solution(
+                self, solution, solution_cost, solution_bound, user_data
+            ):
+                self.entries.append(float(solution_cost[0]))
+
+        # Feasible but suboptimal start: (10, 0) has objective 10.
+        # The unique optimum is (5, 5) = 15. If the start reaches the
+        # solver it is the first incumbent; without it the first reported
+        # cost is not 10.
         problem = Problem("grpc_mip_start")
         x = problem.addVariable(lb=0, ub=10, vtype=INTEGER, name="x")
         y = problem.addVariable(lb=0, ub=10, vtype=INTEGER, name="y")
         problem.addConstraint(x + y <= 10, name="c1")
         problem.addConstraint(x - y >= 0, name="c2")
         problem.setObjective(x + 2 * y, sense=MAXIMIZE)
-        x.setMIPStart(5)
-        y.MIPStart = 5.0
+        x.setMIPStart(10)
+        y.MIPStart = 0.0
+
+        collector = IncumbentCollector()
+        settings = SolverSettings()
+        settings.set_mip_callback(collector, None)
+        settings.set_parameter("time_limit", 30)
 
         client = Client("localhost", grpc_server)
-        job_id = client.submit(problem, SolverSettings())
+        job_id = client.submit(problem, settings)
         try:
-            assert client.wait(job_id, timeout=120) == JobStatus.COMPLETED
+            client.start_incumbent_stream(job_id, settings=settings)
+            terminal = _poll_until_complete(client, job_id, _MIP_NAMES)
+            assert terminal == JobStatus.COMPLETED
+            client.join_incumbent_stream(job_id)
 
+            assert collector.entries
+            assert collector.entries[0] == pytest.approx(10.0, rel=1e-3)
             solution = client.result(job_id, _MIP_NAMES)
             assert solution is not None
             assert solution.get_primal_objective() == pytest.approx(
