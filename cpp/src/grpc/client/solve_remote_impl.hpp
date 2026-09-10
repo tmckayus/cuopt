@@ -9,6 +9,7 @@
 
 #include <cuopt/mathematical_optimization/cpu_optimization_problem.hpp>
 #include <cuopt/mathematical_optimization/mip/solver_settings.hpp>
+#include <cuopt/mathematical_optimization/pdlp/solver_settings.hpp>
 
 namespace cuopt::mathematical_optimization {
 
@@ -32,5 +33,26 @@ namespace cuopt::mathematical_optimization {
 template <typename i_t, typename f_t>
 bool should_disable_unsupported(const cpu_optimization_problem_t<i_t, f_t>& problem,
                                 const mip_solver_settings_t<i_t, f_t>& settings);
+
+/**
+ * @brief Whether MIP/PDLP settings hold an initial solution that gRPC does not serialize.
+ *
+ * map_mip_settings_to_proto / map_pdlp_settings_to_proto omit these device arrays.
+ * A remote solve therefore silently drops a start that only lives on settings.
+ * solve_lp_remote / solve_mip_remote log a warning when this is true.
+ */
+template <typename i_t, typename f_t>
+inline bool mip_settings_have_unsent_initial_solutions(
+  const mip_solver_settings_t<i_t, f_t>& settings)
+{
+  return !settings.initial_solutions.empty();
+}
+
+template <typename i_t, typename f_t>
+inline bool pdlp_settings_have_unsent_initial_solutions(
+  const pdlp_solver_settings_t<i_t, f_t>& settings)
+{
+  return settings.has_initial_primal_solution() || settings.has_initial_dual_solution();
+}
 
 }  // namespace cuopt::mathematical_optimization

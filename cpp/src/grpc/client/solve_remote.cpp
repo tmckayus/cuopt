@@ -85,6 +85,11 @@ std::unique_ptr<lp_solution_interface_t<i_t, f_t>> solve_lp_remote(
   init_logger_t log(settings.log_file, settings.log_to_console);
 
   CUOPT_LOG_INFO("Using remote GPU backend");
+  if (pdlp_settings_have_unsent_initial_solutions(settings)) {
+    CUOPT_LOG_WARN(
+      "Initial primal/dual solutions on PDLP solver settings are not sent over gRPC "
+      "and will be ignored on remote solves");
+  }
 
   // Build gRPC client configuration
   grpc_client_config_t config;
@@ -145,6 +150,11 @@ std::unique_ptr<mip_solution_interface_t<i_t, f_t>> solve_mip_remote(
   init_logger_t log(settings.log_file, settings.log_to_console);
 
   CUOPT_LOG_INFO("Using remote GPU backend");
+  if (mip_settings_have_unsent_initial_solutions(settings)) {
+    CUOPT_LOG_WARN(
+      "Initial solutions on MIP solver settings are not sent over gRPC "
+      "and will be ignored on remote solves");
+  }
 
   // Build gRPC client configuration
   grpc_client_config_t config;

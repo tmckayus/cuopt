@@ -2911,3 +2911,35 @@ TEST(SolveMipRemoteCallbacks, EmptyVariableListKeepsCallbacksEnabled)
   settings.set_mip_callback(&callback, nullptr);
   EXPECT_FALSE(should_disable_unsupported(problem, settings));
 }
+
+TEST(RemoteDroppedInitialSolutions, EmptyMipAndPdlpSettingsAreSent)
+{
+  mip_solver_settings_t<int, double> mip;
+  EXPECT_FALSE(mip_settings_have_unsent_initial_solutions(mip));
+  pdlp_solver_settings_t<int, double> pdlp;
+  EXPECT_FALSE(pdlp_settings_have_unsent_initial_solutions(pdlp));
+}
+
+TEST(RemoteDroppedInitialSolutions, MipAddInitialSolutionIsUnsent)
+{
+  mip_solver_settings_t<int, double> mip;
+  const double start[] = {1.0, 2.0};
+  mip.add_initial_solution(start, 2);
+  EXPECT_TRUE(mip_settings_have_unsent_initial_solutions(mip));
+}
+
+TEST(RemoteDroppedInitialSolutions, PdlpSetInitialPrimalIsUnsent)
+{
+  pdlp_solver_settings_t<int, double> pdlp;
+  const double start[] = {1.0, 2.0};
+  pdlp.set_initial_primal_solution(start, 2);
+  EXPECT_TRUE(pdlp_settings_have_unsent_initial_solutions(pdlp));
+}
+
+TEST(RemoteDroppedInitialSolutions, PdlpSetInitialDualIsUnsent)
+{
+  pdlp_solver_settings_t<int, double> pdlp;
+  const double dual[] = {0.5};
+  pdlp.set_initial_dual_solution(dual, 1);
+  EXPECT_TRUE(pdlp_settings_have_unsent_initial_solutions(pdlp));
+}
