@@ -40,6 +40,7 @@
 #include <grpcpp/grpcpp.h>
 
 #include <map>
+#include <span>
 
 using namespace cuopt::mathematical_optimization;
 using namespace ::testing;
@@ -2868,6 +2869,37 @@ TEST(PopulateFromDataModelView, CopiesInitialSolutions)
   populate_from_data_model_view(&problem, &data_model);
   EXPECT_EQ(problem.get_initial_primal_solution_host(), primal);
   EXPECT_EQ(problem.get_initial_dual_solution_host(), dual);
+}
+
+TEST(PopulateFromDataModelView, EmptySpansClearPriorInitialSolutions)
+{
+  cpu_optimization_problem_t<int32_t, double> problem;
+  std::vector<double> primal = {1.5, 2.5};
+  std::vector<double> dual   = {0.25};
+  copy_initial_solutions_to_cpu_problem(
+    &problem, std::span<const double>{primal}, std::span<const double>{dual});
+  ASSERT_EQ(problem.get_initial_primal_solution_host(), primal);
+  ASSERT_EQ(problem.get_initial_dual_solution_host(), dual);
+
+  copy_initial_solutions_to_cpu_problem(
+    &problem, std::span<const double>{}, std::span<const double>{});
+  EXPECT_TRUE(problem.get_initial_primal_solution_host().empty());
+  EXPECT_TRUE(problem.get_initial_dual_solution_host().empty());
+}
+
+TEST(PopulateFromDataModelView, EmptyPrimalClearsOnlyPrimal)
+{
+  cpu_optimization_problem_t<int32_t, double> problem;
+  std::vector<double> primal = {1.5, 2.5};
+  std::vector<double> dual   = {0.25, 0.5};
+  copy_initial_solutions_to_cpu_problem(
+    &problem, std::span<const double>{primal}, std::span<const double>{dual});
+
+  std::vector<double> new_dual = {9.0};
+  copy_initial_solutions_to_cpu_problem(
+    &problem, std::span<const double>{}, std::span<const double>{new_dual});
+  EXPECT_TRUE(problem.get_initial_primal_solution_host().empty());
+  EXPECT_EQ(problem.get_initial_dual_solution_host(), new_dual);
 }
 
 TEST(ApplyInitialSolutions, CopiesPrimalToMipSettings)
